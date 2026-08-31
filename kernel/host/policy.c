@@ -81,7 +81,7 @@ static const char *const yz_dir_load_perms[] = {
 };
 
 static const char *const yz_tmpfs_load_perms[] = {
-	"read", "write", "open", "getattr", "map", "execute",
+	"read", "open", "getattr", "map", "execute",
 };
 
 static const char *const yz_tmpfs_receive_perms[] = {
@@ -880,6 +880,10 @@ yz_policy_base_get_file_load_keys(
 		cls = yz_symtab_search(&db->p_classes, "file");
 		if (!cls || cls->value > U16_MAX)
 			return -ENOENT;
+		if (tmpfs_type == tcontext->type) {
+			/* The tmpfs role is a superset; acquire the key only once. */
+			keys->file_required_av = 0;
+		}
 		keys->tmpfs.src_type = scontext->type;
 		keys->tmpfs.tgt_type = tmpfs_type;
 		keys->tmpfs.tclass = (u16)cls->value;

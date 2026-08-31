@@ -1505,7 +1505,7 @@ static int zp_stage_fd(const char *path, const char *name,
 	void *buf;
 	loff_t sz, pos;
 	ssize_t r;
-	int fd;
+	int fd, ret;
 
 	/* Read payload with the host-provided privileged credential. */
 	old_cred = yz_host_override_creds();
@@ -1550,14 +1550,6 @@ static int zp_stage_fd(const char *path, const char *name,
 		return r < 0 ? (int)r : -EIO;
 	}
 
-	if (policy_state) {
-		int ret =
-		    yz_host_file_load_policy_allow_current(src, policy_state);
-		if (ret)
-			pr_info("zygote_probe: [2c-3b] load policy allow %s "
-				"failed: %d\n",
-				path, ret);
-	}
 	yz_file_close(src, NULL);
 
 	mfd = shmem_file_setup(name, sz, 0);
@@ -1574,7 +1566,10 @@ static int zp_stage_fd(const char *path, const char *name,
 	/* shmem_file_setup lacks FMODE_PREAD/PWRITE by default. */
 	mfd->f_mode |= FMODE_PREAD | FMODE_PWRITE | FMODE_LSEEK;
 	pos = 0;
+	old_cred = yz_host_override_creds();
 	r = yz_kernel_write(mfd, buf, sz, &pos);
+	yz_host_revert_creds(old_cred);
+	old_cred = NULL;
 	kvfree(buf);
 	if (r != sz) {
 		pr_info("zygote_probe: [2c-3b] write staged %s short: "
@@ -1588,10 +1583,19 @@ static int zp_stage_fd(const char *path, const char *name,
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
-		if (policy_state)
-			zp_restore_native_policy_state(policy_state);
 		fput(mfd);
 		return fd;
+	}
+	if (policy_state) {
+		ret = yz_host_file_load_policy_allow_current(mfd, policy_state);
+		if (ret) {
+			pr_info("zygote_probe: [2c-3b] staged policy allow %s "
+				"failed: %d\n",
+				path, ret);
+			put_unused_fd(fd);
+			fput(mfd);
+			return ret;
+		}
 	}
 	fd_install(fd, mfd); /* consumes the shmem reference */
 
@@ -1632,10 +1636,13 @@ static int zp_stage_file_fd(const char *path,
 	if (policy_state) {
 		ret =
 		    yz_host_file_load_policy_allow_current(file, policy_state);
-		if (ret)
+		if (ret) {
 			pr_info("zygote_probe: [2c-3b] load policy allow %s "
 				"failed: %d\n",
 				path, ret);
+			yz_file_close(file, NULL);
+			return ret;
+		}
 	}
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
@@ -1688,6 +1695,7 @@ static void zp_close_early_packet_state(struct zp_early_packet_state *state)
 
 static int zp_install_packet_fd(const void *buf, size_t size)
 {
+	const struct cred *old_cred;
 	struct file *mfd;
 	loff_t pos = 0;
 	ssize_t w;
@@ -1697,7 +1705,9 @@ static int zp_install_packet_fd(const void *buf, size_t size)
 	if (IS_ERR(mfd))
 		return PTR_ERR(mfd);
 	mfd->f_mode |= FMODE_PREAD | FMODE_PWRITE | FMODE_LSEEK;
+	old_cred = yz_host_override_creds();
 	w = yz_kernel_write(mfd, buf, size, &pos);
+	yz_host_revert_creds(old_cred);
 	if (w != (ssize_t)size) {
 		fput(mfd);
 		return w < 0 ? (int)w : -EIO;
@@ -1714,7 +1724,6 @@ static int zp_install_packet_fd(const void *buf, size_t size)
 
 static int
 zp_stage_early_native_packet(u8 target_type, const char *target, bool compat,
-			     struct yz_file_load_policy *policy_state,
 			     struct zp_early_packet_state *state)
 {
 	struct yz_early_native_entry *matches;
@@ -1775,8 +1784,7 @@ zp_stage_early_native_packet(u8 target_type, const char *target, bool compat,
 	hdr->entry_size = sizeof(*entries);
 
 	for (i = 0; i < match_count; i++) {
-		int fd =
-		    zp_stage_fd(matches[i].lib_path, ZP_VMA_NAME, policy_state);
+		int fd = zp_stage_fd(matches[i].lib_path, ZP_VMA_NAME, NULL);
 
 		if (fd < 0) {
 			pr_info(
@@ -2180,7 +2188,7 @@ static void zp_inject_tw_func(struct callback_head *cb)
 		if (native && tw->early_native) {
 			int ret = zp_stage_early_native_packet(
 			    tw->native_target_type, tw->label, compat,
-			    &native_policy, &early_packet);
+			    &early_packet);
 
 			if (ret < 0 || early_packet.packet_fd < 0 ||
 			    early_packet.packet_fd >= 0xffff) {
