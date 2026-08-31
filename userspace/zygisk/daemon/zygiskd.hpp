@@ -33,6 +33,8 @@ enum class Request : uint8_t {
   ReportNativeInjection = 18,
   GetRuntimeGeneration = 21,
   WriteLog = 22,
+  OpenHyosControlSession = 23,
+  ReportHyosCallback = 24,
 };
 
 enum class LogLevel : uint8_t {

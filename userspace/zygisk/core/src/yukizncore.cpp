@@ -7,6 +7,7 @@
  * Author: Anatdx
  */
 
+#include "hyos_runtime.hpp"
 #include "inline_hook.hpp"
 #include "log.hpp"
 #include "solist.hpp"
@@ -14,6 +15,7 @@
 #include "zygiskd.hpp"
 
 #include "uapi/yukizygisk.h"
+#include "zygisk_next_api.h"
 
 #include "lsplt.hpp"
 
@@ -22,6 +24,7 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <link.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
@@ -30,6 +33,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -57,73 +62,6 @@ extern "C" uint32_t xz_crc32(const uint8_t *buf, size_t size, uint32_t crc) {
   return ~crc;
 }
 
-namespace {
-
-#define LOGE(...) ZLOGE(__VA_ARGS__)
-#define LOGI(...) ZLOGI(__VA_ARGS__)
-
-constexpr int kApiVersion3 = 3;
-constexpr int kApiVersion4 = 4;
-constexpr int kSuccess = 0;
-constexpr int kFailed = 1;
-constexpr uint32_t kHandleMagic = 0x595a4e31u;
-constexpr size_t kMaxGnuDebugDataSize = 32U * 1024U * 1024U;
-
-struct ZnSymbolResolver;
-struct ZygiskNextRuntime;
-
-struct ZygiskNextAPI {
-  int (*pltHook)(void *base_addr, const char *symbol, void *hook_handler,
-                 void **original);
-  int (*inlineHook)(void *target, void *addr, void **original);
-  int (*inlineUnhook)(void *target);
-  ZnSymbolResolver *(*newSymbolResolver)(const char *path, void *base_addr);
-  void (*freeSymbolResolver)(ZnSymbolResolver *resolver);
-  void *(*getBaseAddress)(ZnSymbolResolver *resolver);
-  void *(*symbolLookup)(ZnSymbolResolver *resolver, const char *name,
-                        bool prefix, size_t *size);
-  void (*forEachSymbols)(ZnSymbolResolver *resolver,
-                         bool (*callback)(const char *name, void *addr,
-                                          size_t size, void *data),
-                         void *data);
-  int (*connectCompanion)(void *handle);
-  const ZygiskNextRuntime *(*getRuntime)();
-};
-
-struct ZygiskNextModule {
-  int target_api_version;
-  void (*onModuleLoaded)(void *self_handle, const ZygiskNextAPI *api);
-};
-
-enum class ZdRequest : uint8_t {
-  GetConfig = 6,
-  Log = 10,
-  PatchText = 11,
-  GetNativeModuleCount = 13,
-  GetNativeModuleInfo = 14,
-  GetNativeModuleFd = 15,
-  ConnectNativeCompanion = 16,
-  RestoreNativeLoadPolicy = 17,
-  ReportNativeInjection = 18,
-  GetRuntimeGeneration = 21,
-};
-
-struct ModuleHandle {
-  uint32_t magic = kHandleMagic;
-  uint32_t index = 0;
-  void *so = nullptr;
-  std::string module_id;
-  bool yuki_loaded = false;
-  bool early = false;
-  bool has_companion = false;
-  bool reported = false;
-};
-
-struct InlineHookRecord {
-  void *target = nullptr;
-  yuki::ihook::Hook hook{};
-};
-
 struct ResolvedSymbol {
   std::string name;
   void *addr = nullptr;
@@ -136,6 +74,53 @@ struct ZnSymbolResolver {
   std::vector<ResolvedSymbol> symbols;
 };
 
+namespace {
+
+#define LOGE(...) ZLOGE(__VA_ARGS__)
+#define LOGI(...) ZLOGI(__VA_ARGS__)
+
+constexpr int kApiVersion3 = 3;
+constexpr int kApiVersion4 = ZYGISK_NEXT_API_VERSION;
+constexpr int kSuccess = ZN_SUCCESS;
+constexpr int kFailed = ZN_FAILED;
+constexpr uint32_t kHandleMagic = 0x595a4e31u;
+constexpr size_t kMaxGnuDebugDataSize = 32U * 1024U * 1024U;
+constexpr int kHyosSessionTimeoutMs = 2000;
+constexpr int kHyosProbeTimeoutMs = 7000;
+constexpr int kHyosProbeRetryMs = 50;
+
+enum class ZdRequest : uint8_t {
+  GetConfig = 6,
+  Log = 10,
+  PatchText = 11,
+  GetNativeModuleCount = 13,
+  GetNativeModuleInfo = 14,
+  GetNativeModuleFd = 15,
+  ConnectNativeCompanion = 16,
+  RestoreNativeLoadPolicy = 17,
+  ReportNativeInjection = 18,
+  GetRuntimeGeneration = 21,
+  OpenHyosControlSession = 23,
+  ReportHyosCallback = 24,
+};
+
+struct ModuleHandle {
+  uint32_t magic = kHandleMagic;
+  uint32_t index = 0;
+  void *so = nullptr;
+  std::string module_id;
+  bool yuki_loaded = false;
+  bool early = false;
+  bool has_companion = false;
+  bool reported = false;
+  bool hyos_registered = false;
+};
+
+struct InlineHookRecord {
+  void *target = nullptr;
+  yuki::ihook::Hook hook{};
+};
+
 std::vector<InlineHookRecord> g_inline_hooks;
 std::vector<ModuleHandle *> g_loaded_modules;
 yz_config g_yz_config{};
@@ -145,6 +130,7 @@ uintptr_t g_self_base = 0;
 size_t g_self_size = 0;
 bool g_loader_unmap_safe = false;
 int g_early_packet_fd = -1;
+bool g_hyos_probe_complete = false;
 
 bool read_all(int fd, void *buf, size_t n) {
   auto *p = static_cast<uint8_t *>(buf);
@@ -170,7 +156,7 @@ bool write_all(int fd, const void *buf, size_t n) {
   return true;
 }
 
-int recv_fd(int sock) {
+int recv_fd(int sock, bool *message_received = nullptr) {
   char data = 0;
   char cbuf[CMSG_SPACE(sizeof(int))] = {};
   iovec io{&data, 1};
@@ -179,8 +165,14 @@ int recv_fd(int sock) {
   msg.msg_iovlen = 1;
   msg.msg_control = cbuf;
   msg.msg_controllen = sizeof(cbuf);
-  if (recvmsg(sock, &msg, 0) <= 0)
+  ssize_t result;
+  do {
+    result = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+  } while (result < 0 && errno == EINTR);
+  if (result <= 0)
     return -1;
+  if (message_received != nullptr)
+    *message_received = true;
   for (cmsghdr *c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c))
     if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
       int fd = -1;
@@ -206,6 +198,130 @@ int connect_zygiskd() {
   return fd;
 }
 
+using HyosClock = std::chrono::steady_clock;
+using HyosDeadline = HyosClock::time_point;
+
+HyosDeadline make_hyos_deadline(int timeout_ms = kHyosSessionTimeoutMs) {
+  return HyosClock::now() + std::chrono::milliseconds(timeout_ms);
+}
+
+bool wait_socket_event_until(int fd, short event,
+                             const HyosDeadline &deadline) {
+  for (;;) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                              HyosClock::now());
+    if (remaining.count() <= 0)
+      return false;
+    pollfd descriptor{fd, event, 0};
+    const int result =
+        poll(&descriptor, 1,
+             static_cast<int>(std::max<int64_t>(1, remaining.count())));
+    if (result < 0 && errno == EINTR)
+      continue;
+    return result == 1 && (descriptor.revents & event) != 0;
+  }
+}
+
+bool send_packet_until(int fd, const void *buffer, size_t size,
+                       const HyosDeadline &deadline) {
+  const auto *data = static_cast<const uint8_t *>(buffer);
+  while (size > 0) {
+    const ssize_t sent = send(fd, data, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent > 0) {
+      data += sent;
+      size -= static_cast<size_t>(sent);
+      continue;
+    }
+    if (sent < 0 && errno == EINTR)
+      continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+        wait_socket_event_until(fd, POLLOUT, deadline))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+bool receive_byte_until(int fd, uint8_t *value, const HyosDeadline &deadline) {
+  for (;;) {
+    const ssize_t received = recv(fd, value, sizeof(*value), MSG_DONTWAIT);
+    if (received == sizeof(*value))
+      return true;
+    if (received < 0 && errno == EINTR)
+      continue;
+    if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+        wait_socket_event_until(fd, POLLIN, deadline))
+      continue;
+    return false;
+  }
+}
+
+int recv_fd_until(int sock, const HyosDeadline &deadline,
+                  bool *message_received = nullptr) {
+  for (;;) {
+    char data = 0;
+    char control[CMSG_SPACE(sizeof(int))] = {};
+    iovec io{&data, sizeof(data)};
+    msghdr message{};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    const ssize_t result =
+        recvmsg(sock, &message, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+    if (result > 0) {
+      if (message_received != nullptr)
+        *message_received = true;
+      for (cmsghdr *header = CMSG_FIRSTHDR(&message); header != nullptr;
+           header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET ||
+            header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len < CMSG_LEN(sizeof(int)))
+          continue;
+        int received_fd = -1;
+        memcpy(&received_fd, CMSG_DATA(header), sizeof(received_fd));
+        return received_fd;
+      }
+      return -1;
+    }
+    if (result < 0 && errno == EINTR)
+      continue;
+    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+        wait_socket_event_until(sock, POLLIN, deadline))
+      continue;
+    return -1;
+  }
+}
+
+int connect_zygiskd_for_hyos(const HyosDeadline &deadline) {
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  if (fd < 0)
+    return -1;
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const size_t length = std::strlen(zygiskd::kSocketName);
+  memcpy(address.sun_path + 1, zygiskd::kSocketName, length);
+  const auto address_length =
+      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + length);
+  if (connect(fd, reinterpret_cast<sockaddr *>(&address), address_length) !=
+      0) {
+    if ((errno != EINPROGRESS && errno != EAGAIN) ||
+        !wait_socket_event_until(fd, POLLOUT, deadline)) {
+      close(fd);
+      return -1;
+    }
+    int error = 0;
+    socklen_t error_length = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_length) != 0 ||
+        error != 0) {
+      close(fd);
+      return -1;
+    }
+  }
+  return fd;
+}
+
 int request_fd(ZdRequest req, uint32_t arg) {
   int sock = connect_zygiskd();
   if (sock < 0)
@@ -215,6 +331,93 @@ int request_fd(ZdRequest req, uint32_t arg) {
   int fd = ok ? recv_fd(sock) : -1;
   close(sock);
   return fd;
+}
+
+int open_hyos_control_session_once(const HyosDeadline &outer_deadline) {
+  const HyosDeadline deadline = std::min(outer_deadline, make_hyos_deadline());
+  const int socket = connect_zygiskd_for_hyos(deadline);
+  if (socket < 0)
+    return -1;
+  const uint8_t op = static_cast<uint8_t>(ZdRequest::OpenHyosControlSession);
+  const int session = send_packet_until(socket, &op, sizeof(op), deadline)
+                          ? recv_fd_until(socket, deadline)
+                          : -1;
+  close(socket);
+  return session;
+}
+
+int open_hyos_control_session() {
+  if (g_hyos_probe_complete)
+    return open_hyos_control_session_once(make_hyos_deadline());
+
+  using Clock = std::chrono::steady_clock;
+  const auto deadline =
+      Clock::now() + std::chrono::milliseconds(kHyosProbeTimeoutMs);
+  for (;;) {
+    const int session = open_hyos_control_session_once(deadline);
+    if (session >= 0) {
+      g_hyos_probe_complete = true;
+      return session;
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                              Clock::now());
+    if (remaining.count() <= 0)
+      return -1;
+    const int delay = static_cast<int>(
+        std::min<int64_t>(remaining.count(), kHyosProbeRetryMs));
+    int result;
+    do {
+      result = poll(nullptr, 0, delay);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0)
+      return -1;
+  }
+}
+
+int request_fd_from_hyos_session(ZdRequest request, uint32_t argument) {
+  if (!yukizygisk::hyos::in_specialized_child())
+    return -1;
+  uint8_t frame[sizeof(uint8_t) + sizeof(argument)];
+  frame[0] = static_cast<uint8_t>(request);
+  memcpy(frame + sizeof(uint8_t), &argument, sizeof(argument));
+  yukizygisk::hyos::lock_child_control_session();
+  const int session = yukizygisk::hyos::child_control_session();
+  if (session < 0) {
+    yukizygisk::hyos::unlock_child_control_session();
+    return -1;
+  }
+  const HyosDeadline deadline = make_hyos_deadline();
+  bool response_received = false;
+  const bool sent = send_packet_until(session, frame, sizeof(frame), deadline);
+  const int fd =
+      sent ? recv_fd_until(session, deadline, &response_received) : -1;
+  if (!sent || !response_received)
+    yukizygisk::hyos::invalidate_child_control_session();
+  yukizygisk::hyos::unlock_child_control_session();
+  return fd;
+}
+
+bool report_hyos_callback(uint32_t module_index) {
+  if (!yukizygisk::hyos::in_specialized_child())
+    return false;
+  uint8_t frame[sizeof(uint8_t) + sizeof(module_index)];
+  frame[0] = static_cast<uint8_t>(ZdRequest::ReportHyosCallback);
+  memcpy(frame + sizeof(uint8_t), &module_index, sizeof(module_index));
+  yukizygisk::hyos::lock_child_control_session();
+  const int session = yukizygisk::hyos::child_control_session();
+  if (session < 0) {
+    yukizygisk::hyos::unlock_child_control_session();
+    return false;
+  }
+  const HyosDeadline deadline = make_hyos_deadline();
+  uint8_t ack = 0;
+  const bool sent = send_packet_until(session, frame, sizeof(frame), deadline);
+  const bool received = sent && receive_byte_until(session, &ack, deadline);
+  if (!sent || !received)
+    yukizygisk::hyos::invalidate_child_control_session();
+  yukizygisk::hyos::unlock_child_control_session();
+  return received && ack != 0;
 }
 
 void load_config() {
@@ -344,7 +547,8 @@ ModuleHandle *find_loaded_module(std::string_view module_id) {
 
 bool has_pending_early_report() {
   for (auto *h : g_loaded_modules) {
-    if (h != nullptr && h->early && !h->reported)
+    if (h != nullptr && h->early && !h->reported &&
+        (!yukizygisk::hyos::available() || h->hyos_registered))
       return true;
   }
   return false;
@@ -352,7 +556,9 @@ bool has_pending_early_report() {
 
 bool map_from_base(void *base_addr, lsplt::MapInfo *out) {
   uintptr_t base = reinterpret_cast<uintptr_t>(base_addr);
-  auto maps = lsplt::MapInfo::Scan();
+  auto maps = yukizygisk::hyos::in_specialized_child()
+                  ? lsplt::MapInfo::ScanCached()
+                  : lsplt::MapInfo::Scan();
   if (base == 0) {
     std::string exe = self_exe_path();
     for (const auto &m : maps) {
@@ -413,7 +619,9 @@ bool find_library_map(const char *path, void *base_addr, lsplt::MapInfo *out,
     }
   }
 
-  auto maps = lsplt::MapInfo::Scan();
+  auto maps = yukizygisk::hyos::in_specialized_child()
+                  ? lsplt::MapInfo::ScanCached()
+                  : lsplt::MapInfo::Scan();
   for (const auto &m : maps) {
     if (m.inode == 0 || m.offset != 0)
       continue;
@@ -632,7 +840,9 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
          symbol);
     return kFailed;
   }
-  bool ok = lsplt::CommitHook();
+  const bool ok = yukizygisk::hyos::in_specialized_child()
+                      ? lsplt::CommitHookCached()
+                      : lsplt::CommitHook();
   LOGI("plt hook: path=%s symbol=%s result=%u", info.path.c_str(), symbol,
        ok ? 0U : 1U);
   return ok ? kSuccess : kFailed;
@@ -751,12 +961,18 @@ int api_connect_companion(void *handle) {
          h->module_id.c_str());
     return -1;
   }
-  int fd = request_fd(ZdRequest::ConnectNativeCompanion, h->index);
-  LOGI("connect companion: idx=%u fd=%d", h->index, fd);
+  const bool hyos_child = yukizygisk::hyos::in_specialized_child();
+  int fd = hyos_child ? request_fd_from_hyos_session(
+                            ZdRequest::ConnectNativeCompanion, h->index)
+                      : request_fd(ZdRequest::ConnectNativeCompanion, h->index);
+  if (!hyos_child)
+    LOGI("connect companion: idx=%u fd=%d", h->index, fd);
   return fd;
 }
 
-const ZygiskNextRuntime *api_get_runtime() { return nullptr; }
+const ZygiskNextRuntime *api_get_runtime() {
+  return yukizygisk::hyos::runtime();
+}
 
 const ZygiskNextAPI g_api = {
     .pltHook = api_plt_hook,
@@ -888,7 +1104,13 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
   g_loaded_modules.push_back(handle);
   LOGI("native module onModuleLoaded: %s early=%u", module_id.c_str(),
        early ? 1U : 0U);
+  const size_t registrations_before =
+      yukizygisk::hyos::registered_module_count();
+  yukizygisk::hyos::begin_module_registration(&handle->index);
   mod->onModuleLoaded(handle, &g_api);
+  yukizygisk::hyos::end_module_registration();
+  handle->hyos_registered =
+      yukizygisk::hyos::registered_module_count() > registrations_before;
   if (!yuki_loaded) {
     int hidden = yuki::solist::drop_lib_containing(
         reinterpret_cast<uintptr_t>(mod->onModuleLoaded),
@@ -897,7 +1119,7 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
          module_id.c_str(), fallback_anonymized, hidden);
   }
   LOGI("native module loaded: %s early=%u", module_id.c_str(), early ? 1U : 0U);
-  if (!early)
+  if (!early && !yukizygisk::hyos::available())
     handle->reported = report_native_injection(idx);
   return true;
 }
@@ -1001,7 +1223,7 @@ void load_matching_modules() {
       loaded->has_companion = info.has_companion != 0;
       LOGI("native core: duplicate skipped id=%s idx=%u early=%u",
            module_id.c_str(), i, loaded->early ? 1U : 0U);
-      if (loaded->early && !loaded->reported)
+      if (loaded->early && !loaded->reported && !yukizygisk::hyos::available())
         loaded->reported = report_native_injection(i);
       continue;
     }
@@ -1026,6 +1248,8 @@ bool sync_early_native_reports_once() {
   bool all_reported = true;
   for (auto *h : g_loaded_modules) {
     if (h == nullptr || !h->early || h->reported)
+      continue;
+    if (yukizygisk::hyos::available() && !h->hyos_registered)
       continue;
 
     bool found = false;
@@ -1216,10 +1440,22 @@ bool rebind_self_dl_iterate_slot(uintptr_t load_bias) {
 
 void core_start() {
   run_ctors_once();
+  g_inline_hooks.reserve(YZ_NATIVE_TARGET_MAX);
   g_runtime_generation = request_runtime_generation();
   load_config();
+  (void)yukizygisk::hyos::initialize(open_hyos_control_session,
+                                     report_hyos_callback);
   load_early_modules();
   load_matching_modules();
+  if (yukizygisk::hyos::available()) {
+    if (!yukizygisk::hyos::install_registered_hooks()) {
+      LOGE("native core: HyperOS Rust Runtime bridge unavailable");
+      restore_native_load_policy();
+      return;
+    }
+    restore_native_load_policy();
+    return;
+  }
   maybe_start_deferred_native_sync();
   restore_native_load_policy();
 }
@@ -1258,6 +1494,34 @@ extern "C" bool yz_patch_text(uintptr_t addr, const void *bytes,
                               unsigned int len) {
   if (bytes == nullptr || len == 0 || len > YZ_PATCH_TEXT_MAX)
     return false;
+  if (yukizygisk::hyos::in_specialized_child()) {
+    uint8_t frame[sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) +
+                  YZ_PATCH_TEXT_MAX];
+    size_t offset = 0;
+    frame[offset++] = static_cast<uint8_t>(ZdRequest::PatchText);
+    const uint64_t address = addr;
+    const uint32_t length = len;
+    memcpy(frame + offset, &address, sizeof(address));
+    offset += sizeof(address);
+    memcpy(frame + offset, &length, sizeof(length));
+    offset += sizeof(length);
+    memcpy(frame + offset, bytes, len);
+    offset += len;
+    uint8_t ack = 0;
+    yukizygisk::hyos::lock_child_control_session();
+    const int session = yukizygisk::hyos::child_control_session();
+    if (session < 0) {
+      yukizygisk::hyos::unlock_child_control_session();
+      return false;
+    }
+    const HyosDeadline deadline = make_hyos_deadline();
+    const bool sent = send_packet_until(session, frame, offset, deadline);
+    const bool received = sent && receive_byte_until(session, &ack, deadline);
+    if (!sent || !received)
+      yukizygisk::hyos::invalidate_child_control_session();
+    yukizygisk::hyos::unlock_child_control_session();
+    return received && ack != 0;
+  }
   int s = connect_zygiskd();
   if (s < 0)
     return false;

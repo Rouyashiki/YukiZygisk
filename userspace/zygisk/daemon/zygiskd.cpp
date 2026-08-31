@@ -621,8 +621,7 @@ bool write_exact(int fd, const void *buf, size_t n) {
   return true;
 }
 
-/* Send one fd via SCM_RIGHTS. */
-bool send_fd(int sock, int fd) {
+bool send_fd_with_flags(int sock, int fd, int flags) {
   msghdr msg{};
   iovec io{};
   char dummy = '!';
@@ -641,8 +640,26 @@ bool send_fd(int sock, int fd) {
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
   }
-  return sendmsg(sock, &msg, MSG_NOSIGNAL) >
-         0; // EPIPE not SIGPIPE on dead client
+  ssize_t result;
+  do {
+    result = sendmsg(sock, &msg, MSG_NOSIGNAL | flags);
+  } while (result < 0 && errno == EINTR);
+  return result == 1;
+}
+
+/* Send one fd via SCM_RIGHTS. */
+bool send_fd(int sock, int fd) { return send_fd_with_flags(sock, fd, 0); }
+
+bool send_fd_nonblocking(int sock, int fd) {
+  return send_fd_with_flags(sock, fd, MSG_DONTWAIT);
+}
+
+bool send_hyos_response(int session, uint8_t value) {
+  ssize_t result;
+  do {
+    result = send(session, &value, sizeof(value), MSG_DONTWAIT | MSG_NOSIGNAL);
+  } while (result < 0 && errno == EINTR);
+  return result == sizeof(value);
 }
 
 int copy_file_to_memfd(const std::string &path) {
@@ -763,7 +780,11 @@ int recv_fd(int sock) {
   msg.msg_iovlen = 1;
   msg.msg_control = cbuf;
   msg.msg_controllen = sizeof(cbuf);
-  if (recvmsg(sock, &msg, 0) <= 0)
+  ssize_t result;
+  do {
+    result = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+  } while (result < 0 && errno == EINTR);
+  if (result <= 0)
     return -1;
   for (cmsghdr *c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c))
     if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
@@ -830,52 +851,132 @@ struct Companion {
   pid_t pid = -1;
   int ctrl = -1;
   bool has_entry = false;
+  bool starting = false;
+  std::chrono::steady_clock::time_point ready_deadline;
 };
 std::vector<Companion> g_companions; // indexed like g_modules, spawned lazily
+std::vector<pid_t> g_terminating_companions;
 constexpr int kCompanionReadyMs = 5000; // bound on a companion's startup
+bool g_hyos_catalog_frozen = false;
+bool g_hyos_bridge_admitted = false;
+
+void reset_companion(Companion &companion, bool terminate) {
+  if (companion.ctrl >= 0)
+    close(companion.ctrl);
+  if (companion.pid > 0) {
+    pid_t result;
+    do {
+      result = waitpid(companion.pid, nullptr, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0) {
+      if (terminate)
+        (void)kill(companion.pid, SIGKILL);
+      g_terminating_companions.push_back(companion.pid);
+    }
+  }
+  companion = {};
+}
+
+bool refresh_companion(uint32_t index) {
+  Companion &companion = g_companions[index];
+  if (companion.pid <= 0)
+    return false;
+  pid_t result;
+  do {
+    result = waitpid(companion.pid, nullptr, WNOHANG);
+  } while (result < 0 && errno == EINTR);
+  if (result == companion.pid || (result < 0 && errno == ECHILD)) {
+    reset_companion(companion, false);
+    return false;
+  }
+  pollfd descriptor{companion.ctrl, POLLIN, 0};
+  const int ready = poll(&descriptor, 1, 0);
+  if (ready == 1 && (descriptor.revents & POLLIN) != 0 && companion.starting) {
+    uint8_t value = 0;
+    const ssize_t received =
+        recv(companion.ctrl, &value, sizeof(value), MSG_DONTWAIT);
+    if (received == sizeof(value)) {
+      companion.starting = false;
+      companion.has_entry = value == 1;
+      DLOGI("companion for '%s' pid=%d entry=%d", g_modules[index].name.c_str(),
+            companion.pid, companion.has_entry);
+    }
+  }
+  if ((ready == 1 &&
+       (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) ||
+      (companion.starting &&
+       std::chrono::steady_clock::now() >= companion.ready_deadline)) {
+    DLOGE("companion for '%s' pid=%d failed", g_modules[index].name.c_str(),
+          companion.pid);
+    reset_companion(companion, true);
+    return false;
+  }
+  return companion.pid > 0 && (companion.starting || companion.has_entry);
+}
+
+bool start_companion(uint32_t index) {
+  Companion &companion = g_companions[index];
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+    return false;
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(sockets[0]);
+    close(sockets[1]);
+    return false;
+  }
+  if (pid == 0) {
+    close(sockets[0]);
+    companion_main(g_modules[index].lib_path, sockets[1]);
+  }
+  close(sockets[1]);
+  companion.pid = pid;
+  companion.ctrl = sockets[0];
+  companion.has_entry = false;
+  companion.starting = true;
+  companion.ready_deadline = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(kCompanionReadyMs);
+  return true;
+}
 
 bool ensure_companion(uint32_t idx) {
   if (idx >= g_modules.size())
     return false;
   if (g_companions.size() != g_modules.size())
     g_companions.resize(g_modules.size());
-  Companion &c = g_companions[idx];
-  if (c.pid > 0)
-    return c.has_entry;
-
-  int sv[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
+  if (refresh_companion(idx))
+    return true;
+  if (g_companions[idx].pid > 0)
     return false;
-  pid_t pid = fork();
-  if (pid < 0) {
-    close(sv[0]);
-    close(sv[1]);
-    return false;
-  }
-  if (pid == 0) {
-    close(sv[0]);
-    companion_main(g_modules[idx].lib_path, sv[1]); // never returns
-  }
-  close(sv[1]);
+  return start_companion(idx);
+}
 
-  pollfd pfd{sv[0], POLLIN, 0};
-  uint8_t ready = 0;
-  if (poll(&pfd, 1, kCompanionReadyMs) != 1 || !(pfd.revents & POLLIN) ||
-      !read_exact(sv[0], &ready, 1)) {
-    DLOGE("companion for '%s' pid=%d not ready in %dms; killing",
-          g_modules[idx].name.c_str(), pid, kCompanionReadyMs);
-    kill(pid, SIGKILL);
-    waitpid(pid, nullptr, 0);
-    close(sv[0]);
-    return false;
+void send_companion_connection(int client, uint32_t idx) {
+  const bool ready = ensure_companion(idx);
+  if (!ready) {
+    send_fd(client, -1);
+    return;
   }
-
-  c.pid = pid;
-  c.ctrl = sv[0];
-  c.has_entry = (ready == 1);
-  DLOGI("companion for '%s' pid=%d entry=%d", g_modules[idx].name.c_str(), pid,
-        c.has_entry);
-  return c.has_entry;
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+    send_fd(client, -1);
+    return;
+  }
+  bool delivered = send_fd_nonblocking(g_companions[idx].ctrl, sockets[1]);
+  if (!delivered) {
+    reset_companion(g_companions[idx], true);
+    delivered = start_companion(idx) &&
+                send_fd_nonblocking(g_companions[idx].ctrl, sockets[1]);
+  }
+  if (!delivered) {
+    close(sockets[0]);
+    close(sockets[1]);
+    send_fd(client, -1);
+    return;
+  }
+  close(sockets[1]);
+  send_fd(client, sockets[0]);
+  close(sockets[0]);
 }
 
 struct ZygiskNextCompanionModule {
@@ -940,48 +1041,190 @@ void *native_companion_thread(void *p) {
 
 std::vector<Companion> g_native_companions;
 
+bool native_module_targets_hyos(uint32_t index) {
+  if (index >= g_native_modules.size())
+    return false;
+  const NativeModule &module = g_native_modules[index];
+  return (module.target_type == YZ_NATIVE_TARGET_PATH &&
+          module.target == "/system_ext/bin/hyos_spawner") ||
+         (module.target_type == YZ_NATIVE_TARGET_NAME &&
+          module.target == "hyos_spawner");
+}
+
+void reset_native_companion(Companion &companion, bool terminate) {
+  if (companion.ctrl >= 0)
+    close(companion.ctrl);
+  if (companion.pid > 0) {
+    pid_t result;
+    do {
+      result = waitpid(companion.pid, nullptr, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0) {
+      if (terminate)
+        (void)kill(companion.pid, SIGKILL);
+      g_terminating_companions.push_back(companion.pid);
+    }
+  }
+  companion = {};
+}
+
+bool start_native_companion(uint32_t index);
+
+bool restart_native_companion_after_failure(uint32_t index) {
+  if (native_module_targets_hyos(index) && !g_hyos_bridge_admitted)
+    return false;
+  return start_native_companion(index);
+}
+
+bool refresh_native_companion(uint32_t index) {
+  Companion &companion = g_native_companions[index];
+  if (companion.pid <= 0)
+    return false;
+
+  pid_t result;
+  do {
+    result = waitpid(companion.pid, nullptr, WNOHANG);
+  } while (result < 0 && errno == EINTR);
+  if (result == companion.pid || (result < 0 && errno == ECHILD)) {
+    reset_native_companion(companion, false);
+    return false;
+  }
+  pollfd descriptor{companion.ctrl, POLLIN, 0};
+  const int ready = poll(&descriptor, 1, 0);
+  if (!companion.starting) {
+    if (ready == 1 &&
+        (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      reset_native_companion(companion, true);
+      return false;
+    }
+    return companion.has_entry;
+  }
+
+  if (ready == 1 && (descriptor.revents & POLLIN) != 0) {
+    uint8_t value = 0;
+    const ssize_t received =
+        recv(companion.ctrl, &value, sizeof(value), MSG_DONTWAIT);
+    if (received == sizeof(value)) {
+      companion.starting = false;
+      companion.has_entry = value == 1;
+      DLOGI("native companion for '%s' pid=%d entry=%d",
+            g_native_modules[index].module_id.c_str(), companion.pid,
+            companion.has_entry);
+    }
+  }
+  if ((ready == 1 &&
+       (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) ||
+      std::chrono::steady_clock::now() >= companion.ready_deadline) {
+    DLOGE("native companion for '%s' pid=%d failed during async startup",
+          g_native_modules[index].module_id.c_str(), companion.pid);
+    reset_native_companion(companion, true);
+  }
+  return companion.pid > 0 && !companion.starting && companion.has_entry;
+}
+
+bool start_native_companion(uint32_t index) {
+  Companion &companion = g_native_companions[index];
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+    return false;
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(sockets[0]);
+    close(sockets[1]);
+    return false;
+  }
+  if (pid == 0) {
+    close(sockets[0]);
+    native_companion_main(g_native_modules[index].lib_path, sockets[1]);
+  }
+  close(sockets[1]);
+  companion.pid = pid;
+  companion.ctrl = sockets[0];
+  companion.has_entry = false;
+  companion.starting = true;
+  companion.ready_deadline = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(kCompanionReadyMs);
+  return true;
+}
+
 bool ensure_native_companion(uint32_t idx) {
   if (idx >= g_native_modules.size() || !g_native_modules[idx].has_companion)
     return false;
   if (g_native_companions.size() != g_native_modules.size())
     g_native_companions.resize(g_native_modules.size());
-  Companion &c = g_native_companions[idx];
-  if (c.pid > 0)
-    return c.has_entry;
+  if (refresh_native_companion(idx))
+    return true;
+  if (g_native_companions[idx].pid > 0)
+    return g_native_companions[idx].starting;
+  return start_native_companion(idx);
+}
 
-  int sv[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
-    return false;
-  pid_t pid = fork();
-  if (pid < 0) {
-    close(sv[0]);
-    close(sv[1]);
-    return false;
+void prewarm_hyos_native_companions() {
+  bool found_hyos_target = false;
+  for (uint32_t index = 0; index < g_native_modules.size(); ++index) {
+    found_hyos_target |= native_module_targets_hyos(index);
   }
-  if (pid == 0) {
-    close(sv[0]);
-    native_companion_main(g_native_modules[idx].lib_path, sv[1]);
+  if (!found_hyos_target)
+    return;
+  g_hyos_catalog_frozen = true;
+  if (g_native_companions.size() != g_native_modules.size())
+    g_native_companions.resize(g_native_modules.size());
+  for (uint32_t index = 0; index < g_native_modules.size(); ++index) {
+    if (native_module_targets_hyos(index) &&
+        g_native_modules[index].has_companion)
+      (void)ensure_native_companion(index);
   }
-  close(sv[1]);
+}
 
-  pollfd pfd{sv[0], POLLIN, 0};
-  uint8_t ready = 0;
-  if (poll(&pfd, 1, kCompanionReadyMs) != 1 || !(pfd.revents & POLLIN) ||
-      !read_exact(sv[0], &ready, 1)) {
-    DLOGE("native companion for '%s' pid=%d not ready in %dms; killing",
-          g_native_modules[idx].module_id.c_str(), pid, kCompanionReadyMs);
-    kill(pid, SIGKILL);
-    waitpid(pid, nullptr, 0);
-    close(sv[0]);
-    return false;
+bool hyos_companion_prewarm_ready() {
+  for (uint32_t index = 0; index < g_native_modules.size(); ++index) {
+    if (!native_module_targets_hyos(index) ||
+        !g_native_modules[index].has_companion)
+      continue;
+    if (index >= g_native_companions.size())
+      return false;
+    (void)refresh_native_companion(index);
+    const Companion &companion = g_native_companions[index];
+    if (companion.starting || companion.pid <= 0 || !companion.has_entry)
+      return false;
   }
+  return true;
+}
 
-  c.pid = pid;
-  c.ctrl = sv[0];
-  c.has_entry = (ready == 1);
-  DLOGI("native companion for '%s' pid=%d entry=%d",
-        g_native_modules[idx].module_id.c_str(), pid, c.has_entry);
-  return c.has_entry;
+bool send_native_companion_connection(int client, uint32_t idx,
+                                      bool nonblocking = false) {
+  const auto send_result = [client, nonblocking](int fd) {
+    return nonblocking ? send_fd_nonblocking(client, fd) : send_fd(client, fd);
+  };
+  const bool ready = ensure_native_companion(idx);
+  if (!ready) {
+    return send_result(-1);
+  }
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+    return send_result(-1);
+  }
+  bool delivered =
+      nonblocking
+          ? send_fd_nonblocking(g_native_companions[idx].ctrl, sockets[1])
+          : send_fd(g_native_companions[idx].ctrl, sockets[1]);
+  if (!delivered) {
+    reset_native_companion(g_native_companions[idx], true);
+    delivered =
+        restart_native_companion_after_failure(idx) &&
+        (nonblocking
+             ? send_fd_nonblocking(g_native_companions[idx].ctrl, sockets[1])
+             : send_fd(g_native_companions[idx].ctrl, sockets[1]));
+  }
+  if (!delivered) {
+    close(sockets[0]);
+    close(sockets[1]);
+    return send_result(-1);
+  }
+  close(sockets[1]);
+  const bool sent = send_result(sockets[0]);
+  close(sockets[0]);
+  return sent;
 }
 
 yz_config g_yz_config{1, 0, 0, 0};
@@ -1085,6 +1328,261 @@ uint32_t runtime_generation(pid_t pid, uint8_t kind) {
   }
   return generation;
 }
+
+bool native_companion_peer_allowed(int client, uint32_t index) {
+  if (index >= g_native_modules.size())
+    return false;
+  struct ucred credentials{};
+  socklen_t credentials_length = sizeof(credentials);
+  if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &credentials,
+                 &credentials_length) != 0 ||
+      credentials.pid <= 0)
+    return false;
+  const NativeModule &module = g_native_modules[index];
+  const RuntimeSnapshot snapshot = query_runtime_snapshot();
+  for (const auto &record : snapshot.records) {
+    if (record.pid != static_cast<uint32_t>(credentials.pid) ||
+        record.kind != YZ_RUNTIME_KIND_NATIVE || record.abi != kRuntimeAbi ||
+        record.module_id[0] != '\0' ||
+        (record.state != YZ_RUNTIME_STATE_REDIRECTED &&
+         record.state != YZ_RUNTIME_STATE_INJECTED) ||
+        record.target_type != module.target_type)
+      continue;
+    if (strncmp(record.target, module.target.c_str(), sizeof(record.target)) ==
+        0)
+      return true;
+  }
+  return false;
+}
+
+bool patch_text_for_pid(pid_t pid, uint64_t address, uint32_t length,
+                        const uint8_t *bytes) {
+  if (pid <= 0 || bytes == nullptr || length == 0 || length > YZ_PATCH_TEXT_MAX)
+    return false;
+  yz_patch_text_cmd command{};
+  command.pid = static_cast<uint32_t>(pid);
+  command.len = length;
+  command.addr = address;
+  memcpy(command.bytes, bytes, length);
+  return yzhost::ctl(YZ_IOCTL_PATCH_TEXT, &command) == 0;
+}
+
+ssize_t receive_hyos_session_packet(int session, uint8_t *buffer,
+                                    size_t capacity,
+                                    struct ucred *credentials) {
+  char control[CMSG_SPACE(sizeof(struct ucred))] = {};
+  iovec io{buffer, capacity};
+  msghdr message{};
+  message.msg_iov = &io;
+  message.msg_iovlen = 1;
+  message.msg_control = control;
+  message.msg_controllen = sizeof(control);
+  ssize_t size;
+  do {
+    size = recvmsg(session, &message, 0);
+  } while (size < 0 && errno == EINTR);
+  if (size <= 0 || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0)
+    return -1;
+  for (cmsghdr *header = CMSG_FIRSTHDR(&message); header != nullptr;
+       header = CMSG_NXTHDR(&message, header)) {
+    if (header->cmsg_level != SOL_SOCKET ||
+        header->cmsg_type != SCM_CREDENTIALS ||
+        header->cmsg_len < CMSG_LEN(sizeof(*credentials)))
+      continue;
+    memcpy(credentials, CMSG_DATA(header), sizeof(*credentials));
+    return size;
+  }
+  return -1;
+}
+
+struct HyosControlSessionContext {
+  int session;
+  pid_t parent_pid;
+  uint32_t parent_generation;
+  pid_t child_pid = -1;
+};
+
+std::vector<HyosControlSessionContext> g_hyos_sessions;
+
+pid_t process_parent_pid(pid_t pid) {
+  char path[64];
+  const int length =
+      snprintf(path, sizeof(path), "/proc/%d/status", static_cast<int>(pid));
+  if (length <= 0 || length >= static_cast<int>(sizeof(path)))
+    return -1;
+  FILE *file = fopen(path, "r");
+  if (file == nullptr)
+    return -1;
+  char line[128];
+  pid_t parent = -1;
+  while (fgets(line, sizeof(line), file) != nullptr) {
+    if (strncmp(line, "PPid:", 5) != 0)
+      continue;
+    char *end = nullptr;
+    errno = 0;
+    const long value = strtol(line + 5, &end, 10);
+    if (errno == 0 && end != line + 5 && value > 0 && value <= INT_MAX)
+      parent = static_cast<pid_t>(value);
+    break;
+  }
+  (void)fclose(file);
+  return parent;
+}
+
+bool bind_hyos_session_child(HyosControlSessionContext &context,
+                             pid_t sender_pid) {
+  if (context.child_pid > 0)
+    return context.child_pid == sender_pid;
+  if (runtime_generation(context.parent_pid, YZ_RUNTIME_KIND_NATIVE) !=
+          context.parent_generation ||
+      process_parent_pid(sender_pid) != context.parent_pid)
+    return false;
+  context.child_pid = sender_pid;
+  return true;
+}
+
+bool handle_hyos_control_session(HyosControlSessionContext &context) {
+  const int session = context.session;
+  constexpr size_t kFrameCapacity =
+      sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + YZ_PATCH_TEXT_MAX;
+  uint8_t frame[kFrameCapacity];
+  struct ucred credentials{};
+  const ssize_t size =
+      receive_hyos_session_packet(session, frame, sizeof(frame), &credentials);
+  if (size <= 0 || credentials.pid <= 0 ||
+      !bind_hyos_session_child(context, credentials.pid))
+    return false;
+  const auto request = static_cast<zygiskd::Request>(frame[0]);
+  if (request == zygiskd::Request::ConnectNativeCompanion) {
+    if (size != static_cast<ssize_t>(sizeof(uint8_t) + sizeof(uint32_t)))
+      return false;
+    uint32_t index = 0;
+    memcpy(&index, frame + sizeof(uint8_t), sizeof(index));
+    return native_module_targets_hyos(index)
+               ? send_native_companion_connection(session, index, true)
+               : send_fd_nonblocking(session, -1);
+  }
+  if (request == zygiskd::Request::PatchText) {
+    constexpr size_t kHeaderSize =
+        sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t);
+    if (size < static_cast<ssize_t>(kHeaderSize))
+      return false;
+    uint64_t address = 0;
+    uint32_t length = 0;
+    memcpy(&address, frame + sizeof(uint8_t), sizeof(address));
+    memcpy(&length, frame + sizeof(uint8_t) + sizeof(address), sizeof(length));
+    const bool valid_size = length > 0 && length <= YZ_PATCH_TEXT_MAX &&
+                            size == static_cast<ssize_t>(kHeaderSize + length);
+    const uint8_t ok =
+        valid_size && patch_text_for_pid(credentials.pid, address, length,
+                                         frame + kHeaderSize)
+            ? 1
+            : 0;
+    return send_hyos_response(session, ok);
+  }
+  if (request == zygiskd::Request::ReportHyosCallback) {
+    if (size != static_cast<ssize_t>(sizeof(uint8_t) + sizeof(uint32_t)))
+      return false;
+    uint32_t index = 0;
+    memcpy(&index, frame + sizeof(uint8_t), sizeof(index));
+    const bool valid_module = native_module_targets_hyos(index);
+    const uint8_t ok =
+        valid_module &&
+                report_runtime(context.parent_pid, YZ_RUNTIME_KIND_NATIVE,
+                               context.parent_generation,
+                               g_native_modules[index].module_id.c_str())
+            ? 1
+            : 0;
+    DLOGI("HyperOS callback report: parent=%d child=%d module=%s ok=%u",
+          context.parent_pid, context.child_pid,
+          valid_module ? g_native_modules[index].module_id.c_str()
+                       : "<invalid>",
+          ok ? 1U : 0U);
+    return send_hyos_response(session, ok);
+  }
+  return false;
+}
+
+void open_hyos_control_session(int client, pid_t parent_pid,
+                               uint32_t parent_generation) {
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
+    send_fd(client, -1);
+    return;
+  }
+  const int enabled = 1;
+  if (setsockopt(sockets[0], SOL_SOCKET, SO_PASSCRED, &enabled,
+                 sizeof(enabled)) != 0) {
+    close(sockets[0]);
+    close(sockets[1]);
+    send_fd(client, -1);
+    return;
+  }
+  g_hyos_sessions.push_back({sockets[0], parent_pid, parent_generation, -1});
+  g_hyos_catalog_frozen = true;
+  const bool sent = send_fd_nonblocking(client, sockets[1]);
+  close(sockets[1]);
+  if (!sent) {
+    close(sockets[0]);
+    g_hyos_sessions.pop_back();
+  }
+}
+
+bool rescan_modules_for_reload() {
+  if (g_hyos_catalog_frozen)
+    return false;
+  for (auto &companion : g_companions)
+    reset_companion(companion, true);
+  for (auto &companion : g_native_companions)
+    reset_native_companion(companion, true);
+  g_companions.clear();
+  g_native_companions.clear();
+  rescan_modules();
+  return true;
+}
+
+void reap_terminating_companions() {
+  for (size_t index = g_terminating_companions.size(); index > 0; --index) {
+    pid_t result;
+    do {
+      result = waitpid(g_terminating_companions[index - 1], nullptr, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0)
+      continue;
+    g_terminating_companions.erase(g_terminating_companions.begin() +
+                                   static_cast<ptrdiff_t>(index - 1));
+  }
+}
+
+bool hyos_control_peer_allowed(int client, pid_t *parent_pid,
+                               uint32_t *parent_generation) {
+  struct ucred credentials{};
+  socklen_t credentials_length = sizeof(credentials);
+  if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &credentials,
+                 &credentials_length) != 0 ||
+      credentials.pid <= 0 || credentials.uid != 0)
+    return false;
+  char proc_path[64];
+  const int proc_length =
+      snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", credentials.pid);
+  if (proc_length <= 0 || proc_length >= static_cast<int>(sizeof(proc_path)))
+    return false;
+  char executable[512];
+  const ssize_t length =
+      readlink(proc_path, executable, sizeof(executable) - 1);
+  if (length <= 0)
+    return false;
+  executable[length] = '\0';
+  const uint32_t generation =
+      runtime_generation(credentials.pid, YZ_RUNTIME_KIND_NATIVE);
+  if (strcmp(executable, "/system_ext/bin/hyos_spawner") != 0 ||
+      generation == 0)
+    return false;
+  *parent_pid = credentials.pid;
+  *parent_generation = generation;
+  return true;
+}
+
 void handle_client(int client) {
 #if defined(YUKIZYGISK_RUNTIME_LOG)
   const ClientReader reader(client);
@@ -1123,25 +1621,11 @@ void handle_client(int client) {
   }
   case zygiskd::Request::ConnectCompanion: {
     uint32_t idx = 0;
-    if (!read_client(&idx, sizeof(idx)) || !ensure_companion(idx)) {
+    if (!read_client(&idx, sizeof(idx))) {
       send_fd(client, -1);
       break;
     }
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
-      send_fd(client, -1);
-      break;
-    }
-    // companion services sv[1] on a thread; caller talks over sv[0]
-    if (!send_fd(g_companions[idx].ctrl, sv[1])) {
-      close(sv[0]);
-      close(sv[1]);
-      send_fd(client, -1);
-      break;
-    }
-    close(sv[1]);
-    send_fd(client, sv[0]);
-    close(sv[0]);
+    send_companion_connection(client, idx);
     break;
   }
   case zygiskd::Request::GetModuleDir: {
@@ -1247,16 +1731,11 @@ void handle_client(int client) {
       break;
     struct ucred cr{};
     socklen_t crlen = sizeof(cr);
-    uint8_t ok = 0;
-    if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cr, &crlen) == 0 &&
-        cr.pid > 0) {
-      yz_patch_text_cmd pcmd{};
-      pcmd.pid = static_cast<uint32_t>(cr.pid);
-      pcmd.len = len;
-      pcmd.addr = addr;
-      memcpy(pcmd.bytes, bytes, len);
-      ok = yzhost::ctl(YZ_IOCTL_PATCH_TEXT, &pcmd) == 0 ? 1 : 0;
-    }
+    const uint8_t ok =
+        getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cr, &crlen) == 0 &&
+                patch_text_for_pid(cr.pid, addr, len, bytes)
+            ? 1
+            : 0;
     write_exact(client, &ok, sizeof(ok));
     break;
   }
@@ -1361,24 +1840,33 @@ void handle_client(int client) {
   }
   case zygiskd::Request::ConnectNativeCompanion: {
     uint32_t idx = 0;
-    if (!read_client(&idx, sizeof(idx)) || !ensure_native_companion(idx)) {
+    if (!read_client(&idx, sizeof(idx)) ||
+        !native_companion_peer_allowed(client, idx)) {
       send_fd(client, -1);
       break;
     }
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
+    (void)send_native_companion_connection(client, idx);
+    break;
+  }
+  case zygiskd::Request::OpenHyosControlSession: {
+    pid_t parent_pid;
+    uint32_t parent_generation;
+    const bool peer_allowed =
+        hyos_control_peer_allowed(client, &parent_pid, &parent_generation);
+    if (peer_allowed && !g_hyos_catalog_frozen)
+      prewarm_hyos_native_companions();
+    const bool runtime_ready =
+        g_hyos_bridge_admitted || hyos_companion_prewarm_ready();
+    if (peer_allowed && runtime_ready) {
+      const bool first_admission = !g_hyos_bridge_admitted;
+      open_hyos_control_session(client, parent_pid, parent_generation);
+      g_hyos_bridge_admitted = true;
+      if (first_admission)
+        DLOGI("HyperOS control session admitted: pid=%d generation=%u",
+              parent_pid, parent_generation);
+    } else {
       send_fd(client, -1);
-      break;
     }
-    if (!send_fd(g_native_companions[idx].ctrl, sv[1])) {
-      close(sv[0]);
-      close(sv[1]);
-      send_fd(client, -1);
-      break;
-    }
-    close(sv[1]);
-    send_fd(client, sv[0]);
-    close(sv[0]);
     break;
   }
   case zygiskd::Request::RestoreNativeLoadPolicy: {
@@ -1480,10 +1968,12 @@ void nl_drain(int fd) {
 #if defined(YUKIZYGISK_RUNTIME_LOG)
         read_yzconfig();
         DLOGI("reload event");
-        rescan_modules();
+        if (!rescan_modules_for_reload())
+          DLOGI("module rescan deferred until zygiskd restart");
 #else
         DLOGI("reload event");
-        rescan_modules();
+        if (!rescan_modules_for_reload())
+          DLOGI("module rescan deferred until zygiskd restart");
         read_yzconfig();
 #endif
         (void)yzpolicy::refresh(true);
@@ -1677,9 +2167,65 @@ int run_daemon() {
         yzhost::config_path().c_str(), yzpolicy::source_name());
   notify_ready(ready_fd, true);
 
-  pollfd pfds[2] = {{srv, POLLIN, 0}, {nlfd, POLLIN, 0}};
   for (;;) {
-    if (poll(pfds, 2, -1) < 0) {
+    reap_terminating_companions();
+    std::vector<pollfd> poll_fds;
+    std::vector<uint32_t> module_companion_indices;
+    std::vector<uint32_t> native_companion_indices;
+    poll_fds.reserve(2 + g_hyos_sessions.size() + g_companions.size() +
+                     g_native_companions.size());
+    module_companion_indices.reserve(g_companions.size());
+    native_companion_indices.reserve(g_native_companions.size());
+    poll_fds.push_back({srv, POLLIN, 0});
+    poll_fds.push_back({nlfd, POLLIN, 0});
+    for (const auto &session : g_hyos_sessions)
+      poll_fds.push_back({session.session, POLLIN, 0});
+    int poll_timeout = -1;
+    const auto now = std::chrono::steady_clock::now();
+    const size_t module_companion_offset = poll_fds.size();
+    for (uint32_t index = 0; index < g_companions.size(); ++index) {
+      const Companion &companion = g_companions[index];
+      if (companion.pid <= 0 || companion.ctrl < 0)
+        continue;
+      module_companion_indices.push_back(index);
+      poll_fds.push_back({companion.ctrl, POLLIN, 0});
+      if (!companion.starting)
+        continue;
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              companion.ready_deadline - now)
+              .count();
+      const int timeout =
+          remaining <= 0
+              ? 0
+              : static_cast<int>(std::min<int64_t>(remaining, INT_MAX));
+      poll_timeout =
+          poll_timeout < 0 ? timeout : std::min(poll_timeout, timeout);
+    }
+    const size_t native_companion_offset = poll_fds.size();
+    for (uint32_t index = 0; index < g_native_companions.size(); ++index) {
+      const Companion &companion = g_native_companions[index];
+      if (companion.pid <= 0 || companion.ctrl < 0)
+        continue;
+      native_companion_indices.push_back(index);
+      poll_fds.push_back({companion.ctrl, POLLIN, 0});
+      if (!companion.starting)
+        continue;
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              companion.ready_deadline - now)
+              .count();
+      const int timeout =
+          remaining <= 0
+              ? 0
+              : static_cast<int>(std::min<int64_t>(remaining, INT_MAX));
+      poll_timeout =
+          poll_timeout < 0 ? timeout : std::min(poll_timeout, timeout);
+    }
+    if (!g_terminating_companions.empty())
+      poll_timeout = poll_timeout < 0 ? 1000 : std::min(poll_timeout, 1000);
+
+    if (poll(poll_fds.data(), poll_fds.size(), poll_timeout) < 0) {
       if (errno == EINTR)
         continue;
       DLOGE("poll failed: %s; exiting", strerror(errno));
@@ -1688,21 +2234,47 @@ int run_daemon() {
 #endif // #if defined(__LP64__)
       return 1;
     }
-    if ((pfds[0].revents | pfds[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
+    if ((poll_fds[0].revents | poll_fds[1].revents) &
+        (POLLERR | POLLHUP | POLLNVAL)) {
       DLOGE("daemon channel failed; exiting");
 #if defined(__LP64__)
       stop_compat_daemon(compat_pid);
 #endif // #if defined(__LP64__)
       return 1;
     }
-    if (pfds[0].revents & POLLIN) {
+
+    for (size_t index = g_hyos_sessions.size(); index > 0; --index) {
+      const short events = poll_fds[index + 1].revents;
+      bool keep = (events & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+      if (keep && (events & POLLIN) != 0)
+        keep = handle_hyos_control_session(g_hyos_sessions[index - 1]);
+      if (keep)
+        continue;
+      close(g_hyos_sessions[index - 1].session);
+      g_hyos_sessions.erase(g_hyos_sessions.begin() +
+                            static_cast<ptrdiff_t>(index - 1));
+    }
+
+    for (size_t index = 0; index < module_companion_indices.size(); ++index) {
+      const short events = poll_fds[module_companion_offset + index].revents;
+      if (events != 0 || g_companions[module_companion_indices[index]].starting)
+        (void)refresh_companion(module_companion_indices[index]);
+    }
+    for (size_t index = 0; index < native_companion_indices.size(); ++index) {
+      const short events = poll_fds[native_companion_offset + index].revents;
+      if (events != 0 ||
+          g_native_companions[native_companion_indices[index]].starting)
+        (void)refresh_native_companion(native_companion_indices[index]);
+    }
+
+    if (poll_fds[0].revents & POLLIN) {
       int client = accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
       if (client >= 0) {
-        handle_client(client); // TODO: concurrency once companions exist
+        handle_client(client);
         close(client);
       }
     }
-    if (pfds[1].revents & POLLIN)
+    if (poll_fds[1].revents & POLLIN)
       nl_drain(nlfd);
   }
 }
