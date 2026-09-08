@@ -273,6 +273,9 @@ static int yz_lsm_hook_apply(struct yz_host_lsm_hook *hook)
 	if (ret)
 		goto out_unlock;
 
+	/* Readers can enter the replacement as soon as its slot is patched. */
+	WRITE_ONCE(hook->original, selected_origin);
+	smp_wmb();
 	if (yz_lsm_hook_patch_slot(selected_slot, hook->replacement)) {
 		pr_err("yukizygisk: lsm_hook failed to patch %s\n",
 		       hook->head_name ?: "unknown");
@@ -293,7 +296,6 @@ static int yz_lsm_hook_apply(struct yz_host_lsm_hook *hook)
 
 	hook->entry = selected_entry;
 	hook->scall = selected_scall;
-	hook->original = selected_origin;
 	pr_info("yukizygisk: lsm_hook patched %s slot %px from %px to %px\n",
 		hook->head_name ?: "unknown", selected_slot, selected_origin,
 		hook->replacement);
@@ -390,6 +392,8 @@ static int yz_lsm_hook_apply(struct yz_host_lsm_hook *hook)
 	if (ret)
 		goto out_unlock;
 
+	WRITE_ONCE(hook->original, selected_origin);
+	smp_wmb();
 	ret = yz_lsm_hook_patch_slot(selected_slot, hook->replacement);
 	if (ret) {
 		pr_err("yukizygisk: lsm_hook failed to patch %s\n",
@@ -399,7 +403,6 @@ static int yz_lsm_hook_apply(struct yz_host_lsm_hook *hook)
 	}
 
 	hook->entry = selected_entry;
-	hook->original = selected_origin;
 	pr_info("yukizygisk: lsm_hook patched %s slot %px from %px to %px\n",
 		hook->head_name ?: "unknown", selected_slot, selected_origin,
 		hook->replacement);
