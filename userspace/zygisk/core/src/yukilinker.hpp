@@ -39,8 +39,4 @@ bool has_active_tls();
 // Disable process-wide services before the containing DSO is unmapped.
 bool shutdown();
 
-// Enumerate system images followed by images owned by this loader.
-int dl_iterate_phdr_hook(int (*callback)(struct dl_phdr_info *, size_t, void *),
-                         void *data);
-
 } // namespace yukilinker

@@ -384,7 +384,6 @@ struct ImageState {
   Lifecycle lifecycle;
   Dependency *dependencies = nullptr;
   TlsTemplate tls;
-  const char *display_name = "";
   ImageState *previous = nullptr;
   ImageState *next = nullptr;
 #if YUKILINKER_FULL
@@ -1759,8 +1758,6 @@ SymbolResolution resolve_symbol(ImageState *image, uint32_t symbol_index) {
   const char *name = image->symbols.strings + symbol->st_name;
 
   if (symbol->st_shndx == SHN_UNDEF) {
-    if (strcmp(name, "dl_iterate_phdr") == 0)
-      return {reinterpret_cast<uintptr_t>(&dl_iterate_phdr_hook), true};
     if (strcmp(name, "__cxa_atexit") == 0)
       return {reinterpret_cast<uintptr_t>(&module_cxa_atexit), true};
     if (strcmp(name, "__cxa_finalize") == 0)
@@ -2156,7 +2153,6 @@ SoHandle *dlopen_memfd(int memfd, const char *vma_name, bool file_backed) {
   }
   handle->private_state = image;
   image->public_handle = handle;
-  image->display_name = "";
 
   if (!create_address_space(memfd, static_cast<const uint8_t *>(source),
                             file_size, layout, file_backed, &image->memory)) {
@@ -2310,84 +2306,6 @@ extern "C" void __cxa_finalize(void *);
 extern "C" __attribute__((visibility("hidden"))) void *__dso_handle;
 
 void finalize_self_dso() { __cxa_finalize(&__dso_handle); }
-
-using SystemIterateFunction = int (*)(int (*)(struct dl_phdr_info *, size_t,
-                                              void *),
-                                      void *);
-
-SystemIterateFunction resolve_system_iterator() {
-  // Build the symbol name at runtime so the compiler cannot introduce a direct
-  // import to the function being wrapped.
-  constexpr uint8_t encoded[] = {0xdf, 0xd7, 0xe4, 0xd2, 0xcf, 0xde,
-                                 0xc9, 0xda, 0xcf, 0xde, 0xe4, 0xcb,
-                                 0xd3, 0xdf, 0xc9, 0x00};
-  char name[sizeof(encoded)];
-  for (size_t i = 0; i + 1 < sizeof(encoded); ++i)
-    name[i] = static_cast<char>(encoded[i] ^ 0xbb);
-  name[sizeof(encoded) - 1] = '\0';
-  return reinterpret_cast<SystemIterateFunction>(::dlsym(RTLD_DEFAULT, name));
-}
-
-struct PhdrSnapshot {
-  struct dl_phdr_info info;
-  uintptr_t tls_generation;
-};
-
-int dl_iterate_phdr_hook(int (*callback)(struct dl_phdr_info *, size_t, void *),
-                         void *data) {
-  if (callback == nullptr)
-    return 0;
-  static SystemIterateFunction system_iterator = resolve_system_iterator();
-  int result = system_iterator == nullptr ? 0 : system_iterator(callback, data);
-  if (result != 0)
-    return result;
-
-  registry_lock();
-  size_t image_count = 0;
-  for (ImageState *image = g_first_image; image != nullptr; image = image->next)
-    ++image_count;
-  size_t snapshot_bytes;
-  if (multiply_overflow(image_count, sizeof(PhdrSnapshot), &snapshot_bytes)) {
-    registry_unlock();
-    return 0;
-  }
-  auto *snapshot = static_cast<PhdrSnapshot *>(
-      snapshot_bytes == 0 ? nullptr : malloc(snapshot_bytes));
-  if (snapshot_bytes != 0 && snapshot == nullptr) {
-    registry_unlock();
-    return 0;
-  }
-  size_t snapshot_index = 0;
-  for (ImageState *image = g_first_image; image != nullptr;
-       image = image->next) {
-    PhdrSnapshot &entry = snapshot[snapshot_index++];
-    struct dl_phdr_info &info = entry.info;
-    memset(&info, 0, sizeof(info));
-    info.dlpi_addr = reinterpret_cast<ElfW(Addr)>(image->memory.bias);
-    info.dlpi_name = image->display_name;
-    info.dlpi_phdr = image->memory.program_headers;
-    info.dlpi_phnum =
-        static_cast<ElfW(Half)>(image->memory.program_header_count);
-    if (image->tls.active) {
-      info.dlpi_tls_modid = image->tls.module_id;
-      entry.tls_generation = image->tls.generation;
-    } else {
-      entry.tls_generation = 0;
-    }
-  }
-  registry_unlock();
-
-  for (size_t i = 0; i < image_count; ++i) {
-    PhdrSnapshot &entry = snapshot[i];
-    entry.info.dlpi_tls_data = current_thread_tls_data(
-        entry.info.dlpi_tls_modid, entry.tls_generation);
-    result = callback(&entry.info, sizeof(entry.info), data);
-    if (result != 0)
-      break;
-  }
-  free(snapshot);
-  return result;
-}
 
 } // namespace yukilinker
 
