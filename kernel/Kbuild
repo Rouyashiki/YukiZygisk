@@ -22,6 +22,7 @@ yukizygisk-objs := \
 	host/lsm.o \
 	host/adapter.o \
 	feature/zygote_probe.o \
+	feature/tango.o \
 	feature/zygote_orch.o \
 	feature/zygote_nl.o \
 	feature/zygote_ctl.o

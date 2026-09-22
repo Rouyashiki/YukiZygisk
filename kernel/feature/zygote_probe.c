@@ -49,6 +49,7 @@
 #include "uapi/yukizygisk.h"
 #include "zygote_nl.h"
 #include "zygote_probe.h"
+#include "tango.h"
 
 static const char app_process[] = "app_process";
 
@@ -369,9 +370,11 @@ int yz_zygote_probe_allow_module_policy(pid_t tgid, struct file *dir,
 	ret = yz_host_file_load_policy_allow_cred(dir, cred, &state);
 	if (ret)
 		goto out_unlock;
-	ret = yz_host_file_load_policy_allow_execmem_cred(cred, &state);
-	if (ret)
-		goto out_restore;
+	if (S_ISDIR(file_inode(dir)->i_mode)) {
+		ret = yz_host_file_load_policy_allow_execmem_cred(cred, &state);
+		if (ret)
+			goto out_restore;
+	}
 	if (!zp_native_policy_has_additions(&state))
 		goto out_unlock;
 
@@ -1069,7 +1072,7 @@ int yz_zygote_probe_get_runtime(struct yz_runtime_record *entries, u32 capacity,
 	zp_copy_name(query->safe_mode_zygote, sizeof(query->safe_mode_zygote),
 		     zp_safemode_zygote);
 	spin_unlock_irqrestore(&zp_safemode_lock, flags);
-	query->reserved = 0;
+	query->capabilities = YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY;
 	return 0;
 }
 
@@ -2005,6 +2008,13 @@ static void zp_inject_tw_func(struct callback_head *cb)
 	u32 runtime_flags = native && tw->early_native ?
 				YZ_RUNTIME_F_EARLY_NATIVE : 0;
 
+	if (!native && yz_tango_is_process()) {
+		pr_info("yukizygisk: Tango host exec pid=%d; waiting for guest "
+			"RELRO\n",
+			current->tgid);
+		goto out;
+	}
+
 #ifdef CONFIG_COMPAT
 	compat = is_compat_task();
 #endif // #ifdef CONFIG_COMPAT
@@ -2445,6 +2455,9 @@ void yz_zygote_probe_init(void)
 		return;
 	}
 
+	ret = yz_tango_enable();
+	if (ret)
+		pr_warn("yukizygisk: Tango hook unavailable err=%d\n", ret);
 	ret = yz_host_register_lsm_hook(&zygote_probe_hook);
 
 	if (ret)
@@ -2461,9 +2474,94 @@ void yz_zygote_probe_init(void)
 
 void yz_zygote_probe_exit(void)
 {
+	yz_tango_disable();
 	zp_cleanup_module_policies();
 #if ZP_ENABLE_LSM_INJECTOR
 	if (zp_enable_lsm_injector)
 		yz_host_unregister_lsm_hook(&zygote_probe_hook);
 #endif // #if ZP_ENABLE_LSM_INJECTOR
+}
+
+bool yz_tango_active(void)
+{
+	return READ_ONCE(zp_enable_lsm_injector);
+}
+
+void yz_tango_linker_offsets(u64 *dlopen, u64 *dlsym)
+{
+	*dlopen = READ_ONCE(zp_dlopen32_off);
+	*dlsym = READ_ONCE(zp_dlsym32_off);
+}
+
+int yz_tango_prepare(u32 *generation)
+{
+	struct yz_file_load_policy policy = {};
+	char socket_name[YZ_ZYGOTE_NAME_MAX];
+	char process[YZ_RUNTIME_PROCESS_MAX];
+	int fd;
+
+	if (!yz_tango_active() ||
+	    !zp_parse_zygote_args(current->mm, socket_name,
+				  sizeof(socket_name)))
+		return -EINVAL;
+	zp_runtime_read_process(current->mm, process, sizeof(process));
+	*generation =
+	    zp_runtime_begin(YZ_RUNTIME_KIND_ZYGOTE, YZ_RUNTIME_ABI_32, 0, 0,
+			     process, socket_name);
+	if (zp_zygote_safemode_should_skip(socket_name)) {
+		zp_runtime_set_state(current->tgid, *generation,
+				     YZ_RUNTIME_STATE_SAFEMODE);
+		return -ECANCELED;
+	}
+	fd = zp_stage_fd(ZP_CORE32_PATH, ZP_VMA_NAME, &policy);
+	if (fd < 0) {
+		zp_restore_native_policy_state(&policy);
+		zp_runtime_set_state(current->tgid, *generation,
+				     YZ_RUNTIME_STATE_FAILED);
+		return fd;
+	}
+	if (yz_host_file_load_policy_allow_execmem_current(&policy)) {
+		zp_close_current_fd(fd);
+		zp_restore_native_policy_state(&policy);
+		zp_runtime_set_state(current->tgid, *generation,
+				     YZ_RUNTIME_STATE_FAILED);
+		return -EACCES;
+	}
+	zp_publish_native_policy_state(current->tgid, &policy);
+	return fd;
+}
+
+void yz_tango_finish(u32 generation, int fd, bool redirected)
+{
+	if (!redirected) {
+		zp_close_current_fd(fd);
+		yz_zygote_probe_restore_native_policy(current->tgid);
+	}
+	zp_runtime_set_state(current->tgid, generation,
+			     redirected ? YZ_RUNTIME_STATE_REDIRECTED
+					: YZ_RUNTIME_STATE_FAILED);
+}
+
+bool yz_zygote_probe_is_native_runtime(pid_t pid, u64 start_boottime)
+{
+	bool found = false;
+	u32 i;
+
+	mutex_lock(&zp_runtime_lock);
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		const struct zp_runtime_entry *slot = &zp_runtime_records[i];
+		const struct yz_runtime_record *record = &slot->record;
+
+		if (record->pid == (u32)pid &&
+		    slot->start_boottime == start_boottime &&
+		    record->kind == YZ_RUNTIME_KIND_NATIVE &&
+		    !record->module_id[0] &&
+		    (record->state == YZ_RUNTIME_STATE_REDIRECTED ||
+		     record->state == YZ_RUNTIME_STATE_INJECTED)) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&zp_runtime_lock);
+	return found;
 }

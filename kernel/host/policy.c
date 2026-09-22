@@ -815,6 +815,7 @@ yz_policy_base_get_file_load_keys(
 
 	switch (tmpfs_access) {
 	case YZ_POLICY_TMPFS_NONE:
+	case YZ_POLICY_FILE_RECEIVE:
 		break;
 	case YZ_POLICY_TMPFS_LOAD:
 		tmpfs_perms = yz_tmpfs_load_perms;
@@ -859,8 +860,12 @@ yz_policy_base_get_file_load_keys(
 	keys->file.src_type = scontext->type;
 	keys->file.tgt_type = tcontext->type;
 	keys->file.tclass = (u16)cls->value;
-	keys->file_required_av = yz_policy_required_av(
-		cls, yz_file_load_perms, ARRAY_SIZE(yz_file_load_perms));
+	keys->file_required_av =
+	    tmpfs_access == YZ_POLICY_FILE_RECEIVE
+		? yz_policy_required_av(cls, yz_tmpfs_receive_perms,
+					ARRAY_SIZE(yz_tmpfs_receive_perms))
+		: yz_policy_required_av(cls, yz_file_load_perms,
+					ARRAY_SIZE(yz_file_load_perms));
 
 	if (include_dir) {
 		cls = yz_symtab_search(&db->p_classes, "dir");

@@ -490,6 +490,9 @@ int native_module_elf_class(const std::string &path) {
 
 #if defined(__LP64__)
 bool needs_compat_daemon() {
+  if (access("/system_ext/bin/tango_translator", X_OK) == 0 &&
+      access("/system/bin/app_process32", X_OK) == 0)
+    return true;
   char zygote[PROP_VALUE_MAX]{};
   if (__system_property_get("ro.zygote", zygote) > 0 &&
       strstr(zygote, "32") != nullptr)
@@ -660,6 +663,40 @@ bool send_hyos_response(int session, uint8_t value) {
     result = send(session, &value, sizeof(value), MSG_DONTWAIT | MSG_NOSIGNAL);
   } while (result < 0 && errno == EINTR);
   return result == sizeof(value);
+}
+
+bool send_module_image(int client, int fd) {
+  if (fd < 0)
+    return send_fd(client, -1);
+  yz_runtime_query_cmd runtime{};
+  if (yzhost::ctl(YZ_IOCTL_GET_RUNTIME, &runtime) != 0) {
+    DLOGE("module image: kernel capabilities unavailable");
+    return send_fd(client, -1);
+  }
+  struct ucred peer{};
+  socklen_t length = sizeof(peer);
+  if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0 ||
+      length != sizeof(peer) || peer.pid <= 0) {
+    DLOGE("module image: peer credentials unavailable");
+    return send_fd(client, -1);
+  }
+  yz_module_load_policy_cmd cmd{};
+  cmd.pid = static_cast<uint32_t>(peer.pid);
+  cmd.dirfd = fd;
+  // Older kernels lack image authorization; unadvertised backports may have it.
+  const int ret = yzhost::ctl(YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY, &cmd);
+  if (ret != 0 &&
+      (runtime.capabilities & YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY) != 0) {
+    DLOGE("module image policy: pid=%d fd=%d ret=%d", peer.pid, fd, ret);
+    return send_fd(client, -1);
+  }
+  const bool sent = send_fd(client, fd);
+  if (!sent && ret == 0) {
+    yz_native_load_policy_cmd restore{};
+    restore.pid = cmd.pid;
+    (void)yzhost::ctl(YZ_IOCTL_RESTORE_NATIVE_LOAD_POLICY, &restore);
+  }
+  return sent;
 }
 
 int copy_file_to_memfd(const std::string &path) {
@@ -1614,7 +1651,7 @@ void handle_client(int client) {
     // anonymous loading, this avoids an SCM_RIGHTS SELinux check against a
     // module that was installed with adb_data_file context.
     int fd = copy_file_to_memfd(g_modules[idx].lib_path);
-    send_fd(client, fd);
+    send_module_image(client, fd);
     if (fd >= 0)
       close(fd);
     break;
@@ -1688,34 +1725,6 @@ void handle_client(int client) {
       yz_umount_pid_cmd cmd{};
       cmd.pid = static_cast<uint32_t>(cr.pid);
       ok = yzhost::ctl(YZ_IOCTL_UMOUNT_PID, &cmd) == 0 ? 1 : 0;
-    }
-    write_exact(client, &ok, sizeof(ok));
-    break;
-  }
-  case zygiskd::Request::SelfDestruct: {
-    uint8_t n = 0;
-    if (!read_client(&n, sizeof(n)) || n == 0 || n > YZ_MAX_UNMAP_SEGS)
-      break;
-    struct ucred cr{};
-    socklen_t crlen = sizeof(cr);
-    uint8_t ok = 0;
-    if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cr, &crlen) == 0 &&
-        cr.pid > 0) {
-      yz_unmap_pid_cmd ucmd{};
-      ucmd.pid = static_cast<uint32_t>(cr.pid);
-      ucmd.n_segs = n;
-      bool good = true;
-      for (uint8_t i = 0; i < n; ++i)
-        if (!read_client(&ucmd.addr[i], sizeof(ucmd.addr[i])) ||
-            !read_client(&ucmd.size[i], sizeof(ucmd.size[i]))) {
-          good = false;
-          break;
-        }
-      if (good) {
-        yz_umount_pid_cmd mcmd{};
-        mcmd.pid = ucmd.pid;
-        ok = yzhost::ctl(YZ_IOCTL_UMOUNT_PID, &mcmd) == 0 ? 1 : 0;
-      }
     }
     write_exact(client, &ok, sizeof(ok));
     break;
@@ -1833,7 +1842,7 @@ void handle_client(int client) {
     }
     const std::string &path = g_native_modules[idx].lib_path;
     int fd = copy_file_to_memfd(path);
-    send_fd(client, fd);
+    send_module_image(client, fd);
     if (fd >= 0)
       close(fd);
     break;

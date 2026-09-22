@@ -9,6 +9,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/fs.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 
@@ -321,6 +322,9 @@ int yz_host_policy_allow_file_current(struct file *file,
 int yz_host_policy_allow_file_cred(struct file *file, const struct cred *cred,
 				   struct yz_file_load_policy *state)
 {
+	if (file && !S_ISDIR(file_inode(file)->i_mode))
+		return yz_host_policy_allow_file(file, cred, false,
+						 YZ_POLICY_FILE_RECEIVE, state);
 	return yz_host_policy_allow_file(file, cred, true,
 					 YZ_POLICY_TMPFS_RECEIVE, state);
 }

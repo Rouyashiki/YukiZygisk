@@ -31,6 +31,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -65,6 +66,7 @@ struct Module {
   void *handle = nullptr;
   uintptr_t linker_anchor = 0;
   bool yuki_loaded = false;
+  bool has_plt_hooks = false;
   uint32_t option = 0; // zygisk::Option bits set via setOption
   CoreApiTable api{};  // per-module, filled by RegisterModuleImpl
 };
@@ -83,12 +85,15 @@ bool g_module_policy_armed = false;
 
 void api_hook_jni_native_methods(JNIEnv *env, const char *cls,
                                  JNINativeMethod *methods, int n) {
-  zygisk_hook_jni_methods(env, cls, methods, n);
+  if (g_cur != nullptr)
+    zygisk_hook_jni_methods(env, cls, methods, n, g_cur->id);
 }
 
 void api_plt_hook_register(dev_t dev, ino_t inode, const char *symbol,
                            void *new_func, void **old_func) {
-  zygisk_plt_hook_register(dev, inode, symbol, new_func, old_func);
+  if (zygisk_plt_hook_register(dev, inode, symbol, new_func, old_func) &&
+      g_cur != nullptr)
+    g_cur->has_plt_hooks = true;
 }
 
 /* v1/v2 path-regex PLT hook. */
@@ -103,7 +108,7 @@ void api_plt_hook_register_byname(const char *path_regex, const char *symbol,
     if (map.offset != 0 || !(map.perms & PROT_READ) || map.inode == 0)
       continue;
     if (regexec(&re, map.path.c_str(), 0, nullptr, 0) == 0)
-      zygisk_plt_hook_register(map.dev, map.inode, symbol, new_func, old_func);
+      api_plt_hook_register(map.dev, map.inode, symbol, new_func, old_func);
   }
   regfree(&re);
 }
@@ -178,7 +183,7 @@ enum class ZdRequest : uint8_t {
   GetModuleDir = 5,
   GetConfig = 6,
   RevertMount = 8,
-  SelfDestruct = 9,
+  // 9 reserved
   Log = 10,
   PatchText = 11,
   ReportZygote = 12,
@@ -623,15 +628,27 @@ void *app_args_for(const Module &m, zygisk::AppSpecializeArgs *v5,
   return m.version <= 2 ? static_cast<void *>(v1) : static_cast<void *>(v5);
 }
 
-void unload_requested_modules() {
-  for (auto &m : g_modules) {
+void unload_requested_modules(JNIEnv *env) {
+  for (auto it = g_modules.rbegin(); it != g_modules.rend(); ++it) {
+    auto &m = *it;
     if (m.handle == nullptr ||
         !(m.option & (1u << zygisk::DLCLOSE_MODULE_LIBRARY)))
       continue;
-    if (m.yuki_loaded)
-      g_yuki_dlclose(m.handle); // yukilinker-loaded: munmap its segments
-    else
-      dlclose(m.handle); // android_dlopen_ext path
+    if (m.has_plt_hooks || !zygisk_restore_module_hooks(env, m.id)) {
+      LOGE("module %d unload blocked by active hooks", m.id);
+      continue;
+    }
+    if (m.yuki_loaded) {
+      g_yuki_dlclose(m.handle);
+      if (static_cast<yukilinker::SoHandle *>(m.handle)->private_state !=
+          nullptr) {
+        LOGE("module %d mapping release failed", m.id);
+        continue;
+      }
+    } else if (dlclose(m.handle) != 0) {
+      LOGE("module %d dlclose failed", m.id);
+      continue;
+    }
     m.handle = nullptr;
     m.abi = nullptr;
     LOGI("module %d DLCLOSE'd after post-specialize", m.id);
@@ -679,7 +696,7 @@ static void yz_revert_self_mounts() {
   close(s);
 }
 
-void run_app_post_impl(const zygisk::AppSpecializeArgs *args) {
+void run_app_post_impl(JNIEnv *env, const zygisk::AppSpecializeArgs *args) {
   auto *mut = const_cast<zygisk::AppSpecializeArgs *>(args);
   AppSpecializeArgs_v1 v1args(mut);
   for (auto &m : g_modules)
@@ -690,7 +707,7 @@ void run_app_post_impl(const zygisk::AppSpecializeArgs *args) {
                            app_args_for(m, mut, &v1args)));
     }
   g_cur = nullptr;
-  unload_requested_modules();
+  unload_requested_modules(env);
   hide_injection();
   yz_drop_runtime_header_pages();
 }
@@ -712,7 +729,8 @@ void run_server_pre_impl(zygisk::ServerSpecializeArgs *args) {
   zd_restore_module_load_policy();
 }
 
-void run_server_post_impl(const zygisk::ServerSpecializeArgs *args) {
+void run_server_post_impl(JNIEnv *env,
+                          const zygisk::ServerSpecializeArgs *args) {
   LOGI("run_server_post: %zu module(s)", g_modules.size());
   for (auto &m : g_modules)
     if (m.abi != nullptr && m.abi->postServerSpecialize != nullptr) {
@@ -721,7 +739,7 @@ void run_server_post_impl(const zygisk::ServerSpecializeArgs *args) {
       m.abi->postServerSpecialize(m.abi->impl, args);
     }
   g_cur = nullptr;
-  unload_requested_modules();
+  unload_requested_modules(env);
   hide_injection();
 }
 
@@ -1085,9 +1103,119 @@ zygisk_core_entry(const char *self_path, void *loader_self, void *core_base,
     LOGI("loader handoff is complete; first-stage mapping may be unmapped");
 }
 
+extern "C" [[gnu::visibility("default")]] bool
+zygisk_bootstrap_handoff_complete() {
+  return g_loader_unmap_safe;
+}
+
 extern "C" [[gnu::visibility("default")]] void
 zygisk_core_entry_direct(int /*core_fd*/) {
   core_start(nullptr);
+}
+
+namespace {
+uintptr_t g_tango_stub = 0;
+uint32_t g_tango_stub_size = 0;
+} // namespace
+
+#if defined(__arm__)
+struct TangoCoreImage {
+  uintptr_t anchor = 0;
+  uintptr_t base = 0;
+  size_t size = 0;
+};
+
+static int find_tango_core_image(dl_phdr_info *info, size_t, void *data) {
+  if (info == nullptr || info->dlpi_phdr == nullptr)
+    return 0;
+  auto &image = *static_cast<TangoCoreImage *>(data);
+  uintptr_t low = UINTPTR_MAX;
+  uintptr_t high = 0;
+  bool contains_entry = false;
+  for (size_t i = 0; i < info->dlpi_phnum; ++i) {
+    const auto &ph = info->dlpi_phdr[i];
+    if (ph.p_type == PT_TLS && ph.p_memsz != 0)
+      return 0;
+    if (ph.p_type != PT_LOAD || ph.p_memsz == 0)
+      continue;
+    if (ph.p_vaddr > UINTPTR_MAX - info->dlpi_addr)
+      return 0;
+    const uintptr_t start = info->dlpi_addr + ph.p_vaddr;
+    if (ph.p_memsz > UINTPTR_MAX - start)
+      return 0;
+    const uintptr_t end = start + ph.p_memsz;
+    low = std::min(start, low);
+    high = std::max(end, high);
+    if ((ph.p_flags & PF_X) != 0 && image.anchor >= start && image.anchor < end)
+      contains_entry = true;
+  }
+  const auto page_size = static_cast<uintptr_t>(getpagesize());
+  if (!contains_entry || page_size == 0 || (page_size & (page_size - 1)) != 0 ||
+      high > UINTPTR_MAX - (page_size - 1))
+    return 0;
+  image.base = low & ~(page_size - 1);
+  image.size = ((high + page_size - 1) & ~(page_size - 1)) - image.base;
+  return 1;
+}
+
+static void prepare_tango_core_unmap(uintptr_t entry) {
+  const uintptr_t anchor = entry & ~uintptr_t{1};
+  TangoCoreImage image{anchor};
+  if (dl_iterate_phdr(find_tango_core_image, &image) != 1 || image.base == 0 ||
+      image.size == 0) {
+    LOGE("Tango core bounds unavailable; retaining system linker mapping");
+    return;
+  }
+  // Remove linker ownership while keeping this executing image mapped.
+  if (yuki::solist::release_lib_containing(anchor) != 1) {
+    LOGE("Tango core linker detach failed; retaining mapping");
+    return;
+  }
+  TangoCoreImage remaining{anchor};
+  if (dl_iterate_phdr(find_tango_core_image, &remaining) != 0) {
+    LOGE("Tango core linker still owns the image; retaining mapping");
+    return;
+  }
+  g_self_base = image.base;
+  g_self_size = image.size;
+}
+
+extern "C" [[gnu::visibility("default")]] void
+zygisk_core_entry_tango(uint32_t got, uint32_t original, uint32_t stub,
+                        uint32_t size) {
+  if (got != 0 && original != 0 && stub != 0 && size == 176 &&
+      yz_patch_text(got, &original, sizeof(original))) {
+    g_tango_stub = stub;
+    g_tango_stub_size = size;
+  } else {
+    LOGE("Tango GOT restore failed; retaining guest trampoline");
+  }
+  LOGI("Tango guest core start");
+  core_start(nullptr);
+  if (g_tango_stub != 0)
+    prepare_tango_core_unmap(
+        reinterpret_cast<uintptr_t>(zygisk_core_entry_tango));
+}
+#endif
+
+void zygisk_cleanup_tango_stub() {
+  if (g_tango_stub == 0)
+    return;
+  const uint8_t zeros[64]{};
+  while (g_tango_stub_size != 0) {
+    const auto size = g_tango_stub_size < sizeof(zeros)
+                          ? g_tango_stub_size
+                          : static_cast<uint32_t>(sizeof(zeros));
+    if (!yz_patch_text(g_tango_stub, zeros, size)) {
+      LOGE("Tango trampoline cleanup failed");
+      return;
+    }
+    __builtin___clear_cache(reinterpret_cast<char *>(g_tango_stub),
+                            reinterpret_cast<char *>(g_tango_stub + size));
+    g_tango_stub += size;
+    g_tango_stub_size -= size;
+  }
+  g_tango_stub = 0;
 }
 
 /* Remove the first-stage soinfo; retain its mapping if handoff is incomplete.
@@ -1133,39 +1261,6 @@ static bool yz_find_self_range(uintptr_t *base, size_t *size) {
   return true;
 }
 
-/* Report self-unmap segments to zygiskd. */
-static bool yz_report_self_unmap() {
-  uint64_t addr[YZ_MAX_UNMAP_SEGS];
-  uint64_t size[YZ_MAX_UNMAP_SEGS];
-  int n = 0;
-  uintptr_t cbase = 0;
-  size_t csize = 0;
-  if (yz_find_self_range(&cbase, &csize) && cbase != 0 && csize != 0) {
-    addr[n] = cbase;
-    size[n] = csize;
-    n++;
-  }
-  if (n == 0)
-    return false;
-  int sock = connect_zygiskd();
-  if (sock < 0)
-    return false;
-  uint8_t req = static_cast<uint8_t>(ZdRequest::SelfDestruct);
-  uint8_t n8 = static_cast<uint8_t>(n);
-  uint8_t ack = 0;
-  bool ok = write(sock, &req, 1) == 1 && write(sock, &n8, 1) == 1;
-  for (int i = 0; ok && i < n; ++i)
-    ok = write(sock, &addr[i], sizeof(addr[i])) ==
-             static_cast<ssize_t>(sizeof(addr[i])) &&
-         write(sock, &size[i], sizeof(size[i])) ==
-             static_cast<ssize_t>(sizeof(size[i]));
-  if (ok)
-    ok = read_all(sock, &ack, 1) && ack != 0;
-  close(sock);
-  LOGI("self-unmap: reported %d seg(s) to zygiskd ok=%d", n, (int)ok);
-  return ok;
-}
-
 extern "C" [[noreturn]] void yz_self_unmap_tail(void *base, size_t size);
 
 // Non-weak so __cxa_finalize targets only this DSO.
@@ -1185,11 +1280,8 @@ void zygisk_self_destruct(JNIEnv *env, bool isolated, bool revert_mounts) {
     yuki::solist::hide_from_solist("libzygisk");
     yuki::solist::hide_from_solist("libyukilinker");
   }
-  if (revert_mounts) {
-    bool reverted = yz_report_self_unmap();
-    if (!reverted)
-      yz_revert_self_mounts();
-  }
+  if (revert_mounts)
+    yz_revert_self_mounts();
   if (!fully_inline_hooked)
     LOGE("self-unmap unavailable: specialize used RegisterNatives fallback");
   if (!hooks_removed)
@@ -1201,9 +1293,17 @@ void zygisk_self_destruct(JNIEnv *env, bool isolated, bool revert_mounts) {
     can_unmap = false;
   }
   if (have_range && can_unmap) {
-    yukilinker::shutdown();
+    if (!yukilinker::shutdown()) {
+      LOGE("self-unmap blocked: loader cleanup incomplete");
+      return;
+    }
+    std::vector<Module>().swap(g_modules);
+    g_cur = nullptr;
+    g_loading = nullptr;
     yz_finalize_self_dso();
-    yz_self_unmap_tail(reinterpret_cast<void *>(cbase), csize); // [[noreturn]]
+    LOGI("self-unmap handoff: base=%p size=%zu",
+         reinterpret_cast<void *>(cbase), csize);
+    yz_self_unmap_tail(reinterpret_cast<void *>(cbase), csize);
   }
   LOGE("self-unmap failed: core remains mapped at %p size=%zu",
        reinterpret_cast<void *>(cbase), csize);
@@ -1224,12 +1324,13 @@ void zygisk_load_modules(JNIEnv *env) { load_modules_impl(env); }
 void zygisk_run_app_pre(zygisk::AppSpecializeArgs *args) {
   run_app_pre_impl(args);
 }
-void zygisk_run_app_post(const zygisk::AppSpecializeArgs *args) {
-  run_app_post_impl(args);
+void zygisk_run_app_post(JNIEnv *env, const zygisk::AppSpecializeArgs *args) {
+  run_app_post_impl(env, args);
 }
 void zygisk_run_server_pre(zygisk::ServerSpecializeArgs *args) {
   run_server_pre_impl(args);
 }
-void zygisk_run_server_post(const zygisk::ServerSpecializeArgs *args) {
-  run_server_post_impl(args);
+void zygisk_run_server_post(JNIEnv *env,
+                            const zygisk::ServerSpecializeArgs *args) {
+  run_server_post_impl(env, args);
 }

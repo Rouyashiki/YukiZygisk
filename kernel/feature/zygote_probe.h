@@ -23,6 +23,7 @@ struct file;
 
 void yz_zygote_probe_init(void);
 void yz_zygote_probe_exit(void);
+bool yz_zygote_probe_is_native_runtime(pid_t pid, u64 start_boottime);
 void yz_zygote_probe_set_dlopen_off(u64 dlopen_off, u64 dlsym_off);
 void yz_zygote_probe_set_dlopen32_off(u64 dlopen_off, u64 dlsym_off);
 void yz_zygote_probe_set_yukilinker(bool enabled);

@@ -110,7 +110,8 @@ inline ExecPage alloc_near(uintptr_t target) {
 }
 
 /* Patch target prologue and return call-original trampoline. */
-inline void *install(void *target, void *replacement, Hook *out, bool = false) {
+inline void *install(void *target, void *replacement, Hook *out, bool = false,
+                     bool capture_return = false) {
   auto *t = reinterpret_cast<uint32_t *>(target);
   for (int i = 0; i < 2; ++i)
     if (is_pcrel(t[i]))
@@ -130,7 +131,7 @@ inline void *install(void *target, void *replacement, Hook *out, bool = false) {
   // Capture stub.
   memcpy(base, yz_cap_tmpl, cap_size);
   *reinterpret_cast<uint64_t *>(base + ctx_off) =
-      reinterpret_cast<uint64_t>(g_yz_ret_ctx);
+      capture_return ? reinterpret_cast<uint64_t>(g_yz_ret_ctx) : 0;
   *reinterpret_cast<uint64_t *>(base + wrap_off) =
       reinterpret_cast<uint64_t>(replacement);
   // Call-original trampoline.
@@ -183,8 +184,8 @@ inline bool uninstall(Hook *h, UnhookMode mode = UnhookMode::RestoreBytes) {
   }
   __builtin___clear_cache(reinterpret_cast<char *>(h->target),
                           reinterpret_cast<char *>(h->target) + 8);
-  if (h->trampoline != nullptr)
-    munmap(h->trampoline, 0x1000);
+  if (h->trampoline != nullptr && munmap(h->trampoline, 0x1000) != 0)
+    return false;
   h->trampoline = nullptr;
   h->active = false;
   return true;
@@ -223,9 +224,11 @@ inline bool thumb_is_32bit(uint16_t instruction) {
 inline bool thumb_is_pcrel(const uint16_t *instruction, bool wide) {
   uint16_t first = instruction[0];
   if (!wide) {
-    if ((first & 0xf800u) == 0x4800u || (first & 0xf800u) == 0xa000u ||
-        (first & 0xf000u) == 0xd000u || (first & 0xf800u) == 0xe000u ||
-        (first & 0xf500u) == 0xb100u)
+    if ((first & 0xf800u) == 0x4800u || // LDR literal
+        (first & 0xf800u) == 0xa000u || // ADR
+        (first & 0xf000u) == 0xd000u || // B.cond / SVC
+        (first & 0xf800u) == 0xe000u || // B
+        (first & 0xf500u) == 0xb100u)   // CBZ / CBNZ
       return true;
     if ((first & 0xfc00u) == 0x4400u) {
       unsigned int rm = (first >> 3) & 0xf;
@@ -236,18 +239,21 @@ inline bool thumb_is_pcrel(const uint16_t *instruction, bool wide) {
   }
 
   uint16_t second = instruction[1];
-  if ((first & 0xff7fu) == 0xf85fu || (first & 0xfbf0u) == 0xf20fu ||
-      (first & 0xfbf0u) == 0xf2afu)
+  if ((first & 0xff7fu) == 0xf85fu || // LDR literal
+      (first & 0xfbf0u) == 0xf20fu || // ADR / ADR.W
+      (first & 0xfbf0u) == 0xf2afu)   // SUBW from PC
     return true;
-  return (first & 0xf800u) == 0xf000u && (second & 0x8000u) != 0;
+  if ((first & 0xf800u) == 0xf000u && (second & 0x8000u) != 0)
+    return true; // B.W / BL / BLX and conditional branches
+  return false;
 }
 
 inline bool arm_is_pcrel(uint32_t instruction) {
   if ((instruction & 0x0ffffff0u) == 0x012fff10u ||
       (instruction & 0x0ffffff0u) == 0x012fff30u)
-    return false;
+    return false; // BX / BLX register
   if ((instruction & 0x0e000000u) == 0x0a000000u)
-    return true;
+    return true; // B / BL
   unsigned int rn = (instruction >> 16) & 0xf;
   if (rn != 15)
     return false;
@@ -265,6 +271,7 @@ inline size_t arm32_copy_size(const void *target, bool thumb,
         return 0;
     return words_needed * 4U;
   }
+
   auto *half = static_cast<const uint16_t *>(target);
   size_t bytes = 0;
   while (bytes < minimum_size) {
@@ -365,7 +372,7 @@ inline size_t emit_absolute_jump(uint8_t *where, uintptr_t instruction_address,
     memcpy(where + literal_offset, &address, sizeof(address));
     return literal_offset + sizeof(address);
   } else {
-    const uint32_t jump = 0xe51ff004u;
+    const uint32_t jump = 0xe51ff004u; // ldr pc, [pc, #-4]
     memcpy(where, &jump, sizeof(jump));
     uint32_t address = static_cast<uint32_t>(destination);
     memcpy(where + 4, &address, sizeof(address));
@@ -379,7 +386,8 @@ inline const uint8_t *arm32_code_bytes(uint8_t *symbol) {
 }
 
 inline void *install(void *target, void *replacement, Hook *out,
-                     bool prefer_relative = false) {
+                     bool prefer_relative = false,
+                     bool capture_return = false) {
   uintptr_t callable = reinterpret_cast<uintptr_t>(target);
   bool thumb = (callable & 1U) != 0;
   uintptr_t target_address = callable & ~uintptr_t{1};
@@ -424,7 +432,8 @@ inline void *install(void *target, void *replacement, Hook *out,
 
   auto *base = static_cast<uint8_t *>(page);
   memcpy(base, capture, capture_size);
-  uint32_t context = reinterpret_cast<uint32_t>(g_yz_ret_ctx);
+  uint32_t context =
+      capture_return ? reinterpret_cast<uint32_t>(g_yz_ret_ctx) : 0;
   uint32_t wrapper =
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(replacement));
   memcpy(base + (capture_ctx - capture), &context, sizeof(context));
@@ -480,8 +489,8 @@ inline bool uninstall(Hook *hook, UnhookMode mode = UnhookMode::RestoreBytes) {
   __builtin___clear_cache(reinterpret_cast<char *>(hook->target),
                           reinterpret_cast<char *>(hook->target) +
                               hook->patched_size);
-  if (hook->trampoline != nullptr)
-    munmap(hook->trampoline, 0x1000);
+  if (hook->trampoline != nullptr && munmap(hook->trampoline, 0x1000) != 0)
+    return false;
   hook->trampoline = nullptr;
   hook->patched_size = 0;
   hook->active = false;
@@ -491,12 +500,17 @@ inline bool uninstall(Hook *hook, UnhookMode mode = UnhookMode::RestoreBytes) {
 } // namespace yuki::ihook
 #else
 namespace yuki::ihook {
+
 struct Hook {
   bool active = false;
 };
-inline void *install(void *, void *, Hook *, bool = false) { return nullptr; }
+
+inline void *install(void *, void *, Hook *, bool = false, bool = false) {
+  return nullptr;
+}
 inline bool uninstall(Hook *, UnhookMode = UnhookMode::RestoreBytes) {
   return false;
 }
+
 } // namespace yuki::ihook
 #endif // #if defined(__aarch64__)

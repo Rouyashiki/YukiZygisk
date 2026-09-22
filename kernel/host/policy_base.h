@@ -35,6 +35,7 @@ enum yz_policy_tmpfs_access {
 	YZ_POLICY_TMPFS_NONE,
 	YZ_POLICY_TMPFS_LOAD,
 	YZ_POLICY_TMPFS_RECEIVE,
+	YZ_POLICY_FILE_RECEIVE,
 };
 
 bool yz_policy_base_ready(void);
