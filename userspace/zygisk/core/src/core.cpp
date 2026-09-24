@@ -1086,6 +1086,8 @@ static bool first_stage_handoff_complete() {
 
 bool g_loader_unmap_safe = false;
 
+static void prepare_system_core_unmap(uintptr_t entry);
+
 extern "C" [[gnu::visibility("default")]] void
 zygisk_core_entry(const char *self_path, void *loader_self, void *core_base,
                   void *core_size, int /*early_packet_fd_plus1*/) {
@@ -1111,6 +1113,8 @@ zygisk_bootstrap_handoff_complete() {
 extern "C" [[gnu::visibility("default")]] void
 zygisk_core_entry_direct(int /*core_fd*/) {
   core_start(nullptr);
+  prepare_system_core_unmap(
+      reinterpret_cast<uintptr_t>(zygisk_core_entry_direct));
 }
 
 namespace {
@@ -1118,17 +1122,16 @@ uintptr_t g_tango_stub = 0;
 uint32_t g_tango_stub_size = 0;
 } // namespace
 
-#if defined(__arm__)
-struct TangoCoreImage {
+struct SystemCoreImage {
   uintptr_t anchor = 0;
   uintptr_t base = 0;
   size_t size = 0;
 };
 
-static int find_tango_core_image(dl_phdr_info *info, size_t, void *data) {
+static int find_system_core_image(dl_phdr_info *info, size_t, void *data) {
   if (info == nullptr || info->dlpi_phdr == nullptr)
     return 0;
-  auto &image = *static_cast<TangoCoreImage *>(data);
+  auto &image = *static_cast<SystemCoreImage *>(data);
   uintptr_t low = UINTPTR_MAX;
   uintptr_t high = 0;
   bool contains_entry = false;
@@ -1158,28 +1161,34 @@ static int find_tango_core_image(dl_phdr_info *info, size_t, void *data) {
   return 1;
 }
 
-static void prepare_tango_core_unmap(uintptr_t entry) {
-  const uintptr_t anchor = entry & ~uintptr_t{1};
-  TangoCoreImage image{anchor};
-  if (dl_iterate_phdr(find_tango_core_image, &image) != 1 || image.base == 0 ||
+static void prepare_system_core_unmap(uintptr_t entry) {
+#if defined(__arm__)
+  entry &= ~uintptr_t{1};
+#endif
+  const uintptr_t anchor = entry;
+  SystemCoreImage image{anchor};
+  if (dl_iterate_phdr(find_system_core_image, &image) != 1 || image.base == 0 ||
       image.size == 0) {
-    LOGE("Tango core bounds unavailable; retaining system linker mapping");
+    LOGE("system core bounds unavailable; retaining linker mapping");
     return;
   }
   // Remove linker ownership while keeping this executing image mapped.
   if (yuki::solist::release_lib_containing(anchor) != 1) {
-    LOGE("Tango core linker detach failed; retaining mapping");
+    LOGE("system core linker detach failed; retaining mapping");
     return;
   }
-  TangoCoreImage remaining{anchor};
-  if (dl_iterate_phdr(find_tango_core_image, &remaining) != 0) {
-    LOGE("Tango core linker still owns the image; retaining mapping");
+  SystemCoreImage remaining{anchor};
+  if (dl_iterate_phdr(find_system_core_image, &remaining) != 0) {
+    LOGE("system linker still owns the core; retaining mapping");
     return;
   }
   g_self_base = image.base;
   g_self_size = image.size;
+  LOGI("system core unload prepared: base=%p size=%zu",
+       reinterpret_cast<void *>(g_self_base), g_self_size);
 }
 
+#if defined(__arm__)
 extern "C" [[gnu::visibility("default")]] void
 zygisk_core_entry_tango(uint32_t got, uint32_t original, uint32_t stub,
                         uint32_t size) {
@@ -1193,7 +1202,7 @@ zygisk_core_entry_tango(uint32_t got, uint32_t original, uint32_t stub,
   LOGI("Tango guest core start");
   core_start(nullptr);
   if (g_tango_stub != 0)
-    prepare_tango_core_unmap(
+    prepare_system_core_unmap(
         reinterpret_cast<uintptr_t>(zygisk_core_entry_tango));
 }
 #endif
@@ -1223,6 +1232,10 @@ void zygisk_cleanup_tango_stub() {
 extern "C" [[gnu::visibility("default")]] void zygisk_finalize_loader(int,
                                                                       int) {
   zd_load_config();
+  // The bootstrap has finished resolving symbols through the core handle.
+  if (g_self_base == 0)
+    prepare_system_core_unmap(
+        reinterpret_cast<uintptr_t>(zygisk_finalize_loader));
   LOGI("finalize_loader: finalizing loader at base=%p munmap=%d",
        (void *)g_loader_base, g_loader_unmap_safe);
   int n =
