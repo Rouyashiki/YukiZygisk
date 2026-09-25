@@ -16,6 +16,7 @@ export const PATHS = {
 
 export const DEFAULT_CONFIG = {
   yukilinker: true,
+  anonymous_memory: true,
   denylist_mode: 0,
   dmesg_log: false,
 };
@@ -34,6 +35,7 @@ export const DEFAULT_STATUS = {
   zygote_crashes: 0,
   safe_mode_zygote: "zygote",
   yukilinker: true,
+  anonymous_memory: true,
   denylist_mode: 0,
   dmesg_log: false,
   recent: [],
@@ -68,6 +70,7 @@ function normalizeConfig(value = {}) {
   const mode = Number(value.denylist_mode);
   return {
     yukilinker: value.yukilinker !== false,
+    anonymous_memory: value.anonymous_memory !== false,
     denylist_mode: [0, 1, 2].includes(mode) ? mode : 0,
     dmesg_log: value.dmesg_log === true,
   };
@@ -123,6 +126,7 @@ async function writeConfig(config) {
 const mockState = {
   config: {
     yukilinker: true,
+    anonymous_memory: true,
     denylist_mode: 1,
     dmesg_log: false,
   },

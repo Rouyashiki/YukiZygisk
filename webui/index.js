@@ -284,6 +284,7 @@ function renderSettings() {
       ${sectionHeader(t("settings.title"))}
       <div class="switch-list">
         ${switchCard("setting-yukilinker", t("settings.yukilinker"), t("settings.yukilinkerDesc"), state.config.yukilinker)}
+        ${switchCard("setting-anonymous-memory", t("settings.anonymousMemory"), t("settings.anonymousMemoryDesc"), state.config.anonymous_memory)}
         <label class="select-card"><span><strong>${escapeHtml(t("settings.denylistMode"))}</strong><small>${escapeHtml(t("settings.denylistDesc", "", { root: rootImplLabel() }))}</small></span><select id="denylist-mode"><option value="0" ${state.config.denylist_mode === 0 ? "selected" : ""}>${escapeHtml(t("settings.denylistOff"))}</option><option value="1" ${state.config.denylist_mode === 1 ? "selected" : ""}>${escapeHtml(t("settings.denylistSkip"))}</option><option value="2" ${state.config.denylist_mode === 2 ? "selected" : ""}>${escapeHtml(t("settings.denylistRevert"))}</option></select></label>
         ${switchCard("setting-dmesg", t("settings.dmesg"), t("settings.dmesgDesc"), state.config.dmesg_log)}
       </div>
@@ -376,10 +377,13 @@ async function refreshAll({ includeConfig = true } = {}) {
 
 function collectConfigControls() {
   const yukilinker = document.getElementById("setting-yukilinker");
+  const anonymousMemory = document.getElementById("setting-anonymous-memory");
   const dmesg = document.getElementById("setting-dmesg");
   const mode = document.getElementById("denylist-mode");
   if (yukilinker)
     state.config.yukilinker = yukilinker.checked;
+  if (anonymousMemory)
+    state.config.anonymous_memory = anonymousMemory.checked;
   if (dmesg)
     state.config.dmesg_log = dmesg.checked;
   if (mode)
