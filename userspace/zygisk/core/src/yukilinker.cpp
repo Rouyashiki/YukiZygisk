@@ -18,8 +18,10 @@
 #endif // #ifndef YUKILINKER_FULL
 
 #include "yukilinker.hpp"
+#include "load_config.hpp"
 
 #include <algorithm>
+#include <android/dlext.h>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
@@ -2370,8 +2372,8 @@ extern "C" {
 // These hidden aliases bind directly to the copy of yukilinker compiled into
 // the core; the bootstrap-only exports below remain the stage-one ABI.
 [[gnu::visibility("hidden")]] void *
-yuki_core_dlopen_memfd(int memfd, const char *vma_name) {
-  return yukilinker::dlopen_memfd(memfd, vma_name, false);
+yuki_core_dlopen_memfd(int memfd, const char *vma_name, bool file_backed) {
+  return yukilinker::dlopen_memfd(memfd, vma_name, file_backed);
 }
 
 [[gnu::visibility("hidden")]] void *yuki_core_dlsym(void *handle,
@@ -2406,30 +2408,55 @@ yuki_core_dlopen_memfd(int memfd, const char *vma_name) {
     return;
   }
 
-  yukilinker::SoHandle *core = yukilinker::dlopen_memfd(core_fd, "", false);
+  yz_config config = yukizygisk::config::early_config(packet_fd);
+  (void)yukizygisk::config::read_runtime(&config);
+  yukilinker::SoHandle *core = nullptr;
+  void *system_core = nullptr;
+  if (config.yukilinker) {
+    core = yukilinker::dlopen_memfd(core_fd, "",
+                                    !yukizygisk::config::anonymous(config));
+  } else {
+    android_dlextinfo ext{};
+    ext.flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD;
+    ext.library_fd = core_fd;
+    system_core = android_dlopen_ext("/jit-cache", RTLD_NOW, &ext);
+  }
   raw_close_descriptor(core_fd);
-  if (core == nullptr) {
+  if (core == nullptr && system_core == nullptr) {
     close_early_packet(packet_fd);
     return;
   }
 
+  const auto symbol = [core, system_core](const char *name) {
+    return core != nullptr ? yukilinker::dlsym(core, name)
+                           : ::dlsym(system_core, name);
+  };
   using CoreEntry = void (*)(const char *, void *, void *, void *, int);
-  auto entry =
-      reinterpret_cast<CoreEntry>(yukilinker::dlsym(core, "zygisk_core_entry"));
+  auto entry = reinterpret_cast<CoreEntry>(symbol("zygisk_core_entry"));
   if (entry == nullptr) {
+    if (core != nullptr)
+      yukilinker::dlclose(core);
+    else
+      ::dlclose(system_core);
     close_early_packet(packet_fd);
     return;
   }
+  using SetConfig = void (*)(const yz_config *);
+  auto set_config =
+      reinterpret_cast<SetConfig>(symbol("zygisk_set_load_config"));
+  if (set_config != nullptr)
+    set_config(&config);
   entry(kCorePath, reinterpret_cast<void *>(&yuki_bootstrap),
-        reinterpret_cast<void *>(core->load_bias),
-        reinterpret_cast<void *>(core->map_size), early_packet_fd_plus1);
+        core != nullptr ? reinterpret_cast<void *>(core->load_bias) : nullptr,
+        core != nullptr ? reinterpret_cast<void *>(core->map_size) : nullptr,
+        early_packet_fd_plus1);
   using FinalizeLoader = void (*)(int, int);
-  auto finalize = reinterpret_cast<FinalizeLoader>(
-      yukilinker::dlsym(core, "zygisk_finalize_loader"));
+  auto finalize =
+      reinterpret_cast<FinalizeLoader>(symbol("zygisk_finalize_loader"));
   using HandoffComplete = bool (*)();
   auto handoff_complete = reinterpret_cast<HandoffComplete>(
-      yukilinker::dlsym(core, "zygisk_bootstrap_handoff_complete"));
-  if (finalize != nullptr && handoff_complete != nullptr &&
+      symbol("zygisk_bootstrap_handoff_complete"));
+  if (core != nullptr && finalize != nullptr && handoff_complete != nullptr &&
       handoff_complete() && !yukilinker::release_bootstrap_metadata(core)) {
     ZLOGE("bootstrap metadata cleanup failed; retaining loader");
     return;

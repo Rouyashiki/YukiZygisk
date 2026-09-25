@@ -37,6 +37,7 @@ namespace {
 using NativeModule = yukizygisk::native::NativeModule;
 
 struct RuntimeSnapshot {
+  uint32_t capabilities = 0;
   uint32_t generation = 0;
   bool safe_mode = false;
   uint32_t zygote_crashes = 0;
@@ -166,6 +167,7 @@ bool query_runtime(Host &host, RuntimeSnapshot *snapshot, std::string *error) {
       std::min<size_t>(command.count, snapshot->records.size()));
   snapshot->generation = command.generation;
   snapshot->safe_mode = command.safe_mode != 0;
+  snapshot->capabilities = command.capabilities;
   snapshot->zygote_crashes = command.zygote_crashes;
   snapshot->safe_mode_zygote = bounded_string(command.safe_mode_zygote);
   return true;
@@ -186,6 +188,10 @@ yz_config read_config(const std::string &path) {
     const json::Value &yukilinker = root.at("yukilinker");
     if (yukilinker.type == json::Type::Bool)
       config.yukilinker = yukilinker.as_bool() ? 1 : 0;
+    const json::Value &anonymous = root.at("anonymous_memory");
+    if (anonymous.type == json::Type::Bool)
+      config.memory_type =
+          anonymous.as_bool() ? YZ_MEMORY_ANONYMOUS : YZ_MEMORY_FILE;
     const json::Value &denylist_mode = root.at("denylist_mode");
     if (denylist_mode.type == json::Type::Number) {
       const double mode = denylist_mode.as_number();
@@ -455,7 +461,7 @@ void append_zygotes(std::string *json, const RuntimeSnapshot &snapshot,
                     bool monitor) {
   bool first = true;
   for (const auto &record : snapshot.records) {
-    if (record.kind != YZ_RUNTIME_KIND_ZYGOTE)
+    if (record.kind != YZ_RUNTIME_KIND_ZYGOTE || record.module_id[0] != '\0')
       continue;
     const char *state = runtime_state_name(record.state);
     if (state == nullptr ||
@@ -467,6 +473,7 @@ void append_zygotes(std::string *json, const RuntimeSnapshot &snapshot,
     const std::string target = bounded_string(record.target);
     *json += "{\"pid\":" + std::to_string(record.pid) + ",\"name\":";
     append_json_string(json, target);
+    *json += ",\"generation\":" + std::to_string(record.generation);
     *json += ",\"target\":";
     append_json_string(json, target);
     *json += ",\"abi\":";
@@ -519,6 +526,7 @@ bool query_status(Host &host, const StatusOptions &options,
   document->zygotes = static_cast<size_t>(std::count_if(
       runtime.records.begin(), runtime.records.end(), [](const auto &record) {
         return record.kind == YZ_RUNTIME_KIND_ZYGOTE &&
+               record.module_id[0] == '\0' &&
                record.state != YZ_RUNTIME_STATE_EXITED;
       }));
   document->zygisk_modules = zygisk_modules.size();
@@ -542,6 +550,9 @@ bool query_status(Host &host, const StatusOptions &options,
   output += ",\"count\":" + std::to_string(document->injected);
   output += ",\"safe_mode\":";
   output += runtime.safe_mode ? "true" : "false";
+  output += ",\"zygisk_module_monitor\":";
+  output += (runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT) != 0
+                ? "true" : "false";
   output += ",\"zygote_crashes\":" + std::to_string(runtime.zygote_crashes);
   output += ",\"safe_mode_zygote\":";
   append_json_string(&output, runtime.safe_mode_zygote.empty()
@@ -549,10 +560,32 @@ bool query_status(Host &host, const StatusOptions &options,
                                   : runtime.safe_mode_zygote);
   output += ",\"yukilinker\":";
   output += config.yukilinker != 0 ? "true" : "false";
+  output += ",\"anonymous_memory\":";
+  output += config.memory_type != YZ_MEMORY_FILE ? "true" : "false";
   output += ",\"denylist_mode\":" + std::to_string(config.denylist_mode);
   output += ",\"dmesg_log\":";
   output += config.dmesg_log != 0 ? "true" : "false";
-  output += ",\"recent\":[],\"zygotes\":[";
+  output += ",\"runtime\":[";
+  bool first_record = true;
+  for (const auto &record : runtime.records) {
+    if (!first_record)
+      output += ',';
+    first_record = false;
+    output += "{\"pid\":" + std::to_string(record.pid);
+    output += ",\"generation\":" + std::to_string(record.generation);
+    output += ",\"kind\":";
+    append_json_string(&output, record.kind == YZ_RUNTIME_KIND_ZYGOTE
+                                   ? "zygote" : "native");
+    output += ",\"abi\":";
+    append_json_string(&output, abi_name(record.abi));
+    output += ",\"module\":";
+    append_json_string(&output, bounded_string(record.module_id));
+    output += ",\"state\":";
+    const char *state = runtime_state_name(record.state);
+    append_json_string(&output, state ? state : "exited");
+    output += '}';
+  }
+  output += "],\"recent\":[],\"zygotes\":[";
   append_zygotes(&output, runtime, false);
   output += "],\"zygote_monitor\":[";
   append_zygotes(&output, runtime, true);

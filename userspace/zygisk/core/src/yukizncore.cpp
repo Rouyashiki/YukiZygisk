@@ -9,6 +9,7 @@
 
 #include "hyos_runtime.hpp"
 #include "inline_hook.hpp"
+#include "load_config.hpp"
 #include "log.hpp"
 #include "solist.hpp"
 #include "yukilinker.hpp"
@@ -123,7 +124,7 @@ struct InlineHookRecord {
 
 std::vector<InlineHookRecord> g_inline_hooks;
 std::vector<ModuleHandle *> g_loaded_modules;
-yz_config g_yz_config{};
+yz_config g_yz_config = yukizygisk::config::defaults;
 uint32_t g_runtime_generation = 0;
 uintptr_t g_loader_base = 0;
 uintptr_t g_self_base = 0;
@@ -421,14 +422,9 @@ bool report_hyos_callback(uint32_t module_index) {
 }
 
 void load_config() {
-  int s = connect_zygiskd();
-  if (s < 0)
-    return;
-  uint8_t op = static_cast<uint8_t>(ZdRequest::GetConfig);
-  yz_config cfg{};
-  if (write_all(s, &op, 1) && read_all(s, &cfg, sizeof(cfg)))
-    g_yz_config = cfg;
-  close(s);
+  if (g_early_packet_fd >= 0)
+    g_yz_config = yukizygisk::config::early_config(g_early_packet_fd);
+  (void)yukizygisk::config::read_runtime(&g_yz_config);
 }
 
 void restore_native_load_policy() {
@@ -1033,8 +1029,11 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
   std::string lib_name = basename_of(lib_path);
   bool yuki_loaded = false;
   int fallback_anonymized = 0;
-  void *so = yukilinker::dlopen_memfd(lib_fd, lib_path.c_str(),
-                                      /*file_backed=*/false);
+  void *so = g_yz_config.yukilinker
+                 ? yukilinker::dlopen_memfd(
+                       lib_fd, lib_path.c_str(),
+                       !yukizygisk::config::anonymous(g_yz_config))
+                 : nullptr;
   if (so != nullptr) {
     yuki_loaded = true;
     LOGI("native core: yukilinker loaded id=%s idx=%u path=%s early=%u",
@@ -1062,7 +1061,7 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
       LOGE("native core: dlopen path err=%s",
            path_error.empty() ? "(null)" : path_error.c_str());
     }
-    if (so != nullptr)
+    if (so != nullptr && yukizygisk::config::anonymous(g_yz_config))
       fallback_anonymized =
           yuki::solist::spoof_fd_maps(lib_fd, /*private_only=*/true);
   }
@@ -1443,6 +1442,9 @@ void core_start() {
   g_inline_hooks.reserve(YZ_NATIVE_TARGET_MAX);
   g_runtime_generation = request_runtime_generation();
   load_config();
+  if (g_self_base == 0 && yukizygisk::config::anonymous(g_yz_config))
+    (void)yuki::solist::spoof_loaded_object_maps(
+        reinterpret_cast<uintptr_t>(core_start));
   (void)yukizygisk::hyos::initialize(open_hyos_control_session,
                                      report_hyos_callback);
   load_early_modules();
@@ -1535,6 +1537,12 @@ extern "C" bool yz_patch_text(uintptr_t addr, const void *bytes,
     ok = read_all(s, &ack, 1) && ack != 0;
   close(s);
   return ok;
+}
+
+extern "C" [[gnu::visibility("default")]] void
+zygisk_set_load_config(const yz_config *config) {
+  if (config != nullptr)
+    g_yz_config = *config;
 }
 
 extern "C" [[gnu::visibility("default")]] void

@@ -134,12 +134,16 @@ struct yz_native_targets_cmd {
 #define YZ_EARLY_NATIVE_ENTRY_ABI32 (1U << 0)
 #define YZ_EARLY_NATIVE_ENTRY_ABI64 (1U << 1)
 
+#define YZ_LOAD_CONFIG_VALID (1U << 0)
+#define YZ_LOAD_YUKILINKER (1U << 1)
+#define YZ_LOAD_ANONYMOUS (1U << 2)
+
 struct yz_early_native_snapshot_header {
 	__u32 magic;
 	__u16 version;
 	__u16 header_size;
 	__u16 entry_size;
-	__u16 reserved;
+	__u16 load_flags;
 	__u32 flags;
 	__u32 count;
 	__u64 dlopen_offset;
@@ -166,6 +170,7 @@ struct yz_early_native_packet_header {
 	__u16 version;
 	__u16 header_size;
 	__u16 entry_size;
+	__u16 load_flags;
 	__u32 count;
 };
 
@@ -308,6 +313,7 @@ enum yz_runtime_abi {
 #define YZ_RUNTIME_F_EARLY_NATIVE (1U << 0)
 
 #define YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY (1U << 0)
+#define YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT (1U << 1)
 
 struct yz_runtime_record {
 	__u32 pid;
@@ -338,7 +344,8 @@ struct yz_runtime_report_cmd {
 	__u32 pid;
 	__u32 generation;
 	__u8 kind;
-	__u8 reserved[3];
+	__u8 module_state; // Zero preserves success-only reports from older daemons.
+	__u8 reserved[2];
 	char module_id[YZ_NATIVE_MODULE_ID_MAX];
 };
 
@@ -347,11 +354,17 @@ struct yz_runtime_report_cmd {
 #define YZ_IOCTL_REPORT_RUNTIME _IOC(_IOC_WRITE, YZ_IOCTL_MAGIC, 69, 0)
 #define YZ_IOCTL_DAEMON_READY _IOC(_IOC_NONE, YZ_IOCTL_MAGIC, 70, 0)
 
+enum yz_memory_type {
+	/* Zero preserves anonymous loading with older daemons. */
+	YZ_MEMORY_ANONYMOUS = 0,
+	YZ_MEMORY_FILE = 1,
+};
+
 struct yz_config {
 	__u8 yukilinker;
 	__u8 denylist_mode;
 	__u8 dmesg_log;
-	__u8 reserved;
+	__u8 memory_type;
 };
 
 #endif /* _UAPI_YUKIZYGISK_H */

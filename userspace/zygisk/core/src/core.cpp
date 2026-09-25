@@ -10,7 +10,9 @@
 #include <lsplt.hpp>
 
 #include "hook.hpp"
+#include "load_config.hpp"
 #include "log.hpp"
+#include "userspace/zygisk/daemon/zygiskd.hpp"
 #include "solist.hpp"
 #include "yukilinker.hpp"
 #include "zygisk.hpp"
@@ -82,6 +84,8 @@ int zd_connect_companion(int id);
 uint32_t zd_get_flags(int uid);
 int g_app_uid = -1; // uid of the process currently being specialized
 bool g_module_policy_armed = false;
+uint32_t g_monitor_zygote_pid = 0;
+uint32_t g_monitor_zygote_generation = 0;
 
 void api_hook_jni_native_methods(JNIEnv *env, const char *cls,
                                  JNINativeMethod *methods, int n) {
@@ -189,6 +193,8 @@ enum class ZdRequest : uint8_t {
   ReportZygote = 12,
   RestoreLoadPolicy = 17,
   GetRuntimeGeneration = 21,
+  GetModuleInfo = 25,
+  ReportZygoteModule = 26,
 };
 #if defined(__LP64__)
 constexpr char kZygiskdSocket[] = "zygiskd64";
@@ -350,18 +356,9 @@ int make_app_memfd(int src_fd) {
 }
 
 /* Runtime config from zygiskd. */
-yz_config g_yz_config{};
+yz_config g_yz_config = yukizygisk::config::defaults;
 
-void zd_load_config() {
-  int s = connect_zygiskd();
-  if (s < 0)
-    return;
-  uint8_t req = static_cast<uint8_t>(ZdRequest::GetConfig);
-  yz_config cfg{};
-  if (write(s, &req, 1) == 1 && read_all(s, &cfg, sizeof(cfg)))
-    g_yz_config = cfg;
-  close(s);
-}
+void zd_load_config() { (void)yukizygisk::config::read_runtime(&g_yz_config); }
 
 uint32_t zd_get_runtime_generation(uint8_t kind) {
   int s = connect_zygiskd();
@@ -386,6 +383,46 @@ void zd_report_zygote(uint32_t generation) {
   uint8_t ack = 0;
   if (write_all(s, &req, sizeof(req)) &&
       write_all(s, &generation, sizeof(generation)))
+    (void)read_all(s, &ack, sizeof(ack));
+  close(s);
+}
+
+bool zd_get_module_info(int id, char *module_id, size_t module_id_size) {
+  if (module_id == nullptr || module_id_size == 0)
+    return false;
+  int s = connect_zygiskd();
+  if (s < 0)
+    return false;
+  const uint8_t req = static_cast<uint8_t>(ZdRequest::GetModuleInfo);
+  uint32_t index = static_cast<uint32_t>(id);
+  zygiskd::ModuleInfo info{};
+  const bool ok = write_all(s, &req, sizeof(req)) &&
+                  write_all(s, &index, sizeof(index)) &&
+                  read_all(s, &info, sizeof(info));
+  close(s);
+  info.module_id[sizeof(info.module_id) - 1] = '\0';
+  if (!ok || info.module_id[0] == '\0')
+    return false;
+  (void)std::snprintf(module_id, module_id_size, "%s", info.module_id);
+  return true;
+}
+
+void zd_report_zygote_module(const char *module_id, uint8_t state) {
+  if (g_monitor_zygote_generation == 0 || module_id == nullptr ||
+      module_id[0] == '\0')
+    return;
+  int s = connect_zygiskd();
+  if (s < 0)
+    return;
+  const uint8_t req = static_cast<uint8_t>(ZdRequest::ReportZygoteModule);
+  zygiskd::ZygoteModuleReport report{};
+  report.zygote_pid = g_monitor_zygote_pid;
+  report.generation = g_monitor_zygote_generation;
+  report.state = state;
+  (void)std::snprintf(report.module_id, sizeof(report.module_id), "%s",
+                      module_id);
+  uint8_t ack = 0;
+  if (write_all(s, &req, sizeof(req)) && write_all(s, &report, sizeof(report)))
     (void)read_all(s, &ack, sizeof(ack));
   close(s);
 }
@@ -450,12 +487,12 @@ extern "C" void yz_klog(const char *fmt, ...) {
 /* Built-in yukilinker symbols. */
 extern "C" {
 __attribute__((visibility("hidden"))) void *
-yuki_core_dlopen_memfd(int memfd, const char *vma_name);
+yuki_core_dlopen_memfd(int memfd, const char *vma_name, bool file_backed);
 __attribute__((visibility("hidden"))) void *yuki_core_dlsym(void *handle,
                                                             const char *name);
 __attribute__((visibility("hidden"))) void yuki_core_dlclose(void *handle);
 }
-using yuki_dlopen_fn = void *(*)(int, const char *);
+using yuki_dlopen_fn = void *(*)(int, const char *, bool);
 using yuki_dlsym_fn = void *(*)(void *, const char *);
 using yuki_dlclose_fn = void (*)(void *);
 yuki_dlopen_fn g_yuki_dlopen = nullptr;
@@ -503,18 +540,29 @@ void load_modules_impl(JNIEnv *env) {
     (void)arm_module_load_policy(0);
 
   for (uint32_t i = 0; i < count; ++i) {
+    char module_id[YZ_NATIVE_MODULE_ID_MAX]{};
+    if (g_monitor_zygote_generation != 0)
+      (void)zd_get_module_info(static_cast<int>(i), module_id,
+                               sizeof(module_id));
+    const auto report_module = [&](uint8_t state) {
+      zd_report_zygote_module(module_id, state);
+    };
     int s = connect_zygiskd();
-    if (s < 0)
+    if (s < 0) {
+      report_module(YZ_RUNTIME_STATE_FAILED);
       continue;
+    }
     req = static_cast<uint8_t>(ZdRequest::GetModuleFd);
     if (write(s, &req, 1) != 1 || write(s, &i, sizeof(i)) != sizeof(i)) {
       close(s);
+      report_module(YZ_RUNTIME_STATE_FAILED);
       continue;
     }
     int lib_fd = recv_fd(s);
     close(s);
     if (lib_fd < 0) {
       LOGE("no fd for module %u", i);
+      report_module(YZ_RUNTIME_STATE_FAILED);
       continue;
     }
 
@@ -527,9 +575,11 @@ void load_modules_impl(JNIEnv *env) {
     close(lib_fd);
     if (mfd >= 0) {
       const bool use_system_tls = image_has_tls(mfd);
-      if (!use_system_tls && g_yuki_dlopen != nullptr &&
-          g_yuki_dlsym != nullptr && g_yuki_dlclose != nullptr) {
-        handle = g_yuki_dlopen(mfd, "");
+      if (g_yz_config.yukilinker && !use_system_tls &&
+          g_yuki_dlopen != nullptr && g_yuki_dlsym != nullptr &&
+          g_yuki_dlclose != nullptr) {
+        handle =
+            g_yuki_dlopen(mfd, "", !yukizygisk::config::anonymous(g_yz_config));
         if (handle != nullptr) {
           yuki_loaded = true;
           entry = reinterpret_cast<module_entry_fn>(
@@ -545,19 +595,22 @@ void load_modules_impl(JNIEnv *env) {
         handle =
             android_dlopen_ext(kSystemModuleName, RTLD_NOW | RTLD_LOCAL, &ext);
         if (handle != nullptr) {
-          LOGI("module %u using system linker fallback", i);
+          LOGI("module %u using system linker", i);
           entry = reinterpret_cast<module_entry_fn>(
               dlsym(handle, "zygisk_module_entry"));
-          int anonymized = yuki::solist::spoof_loaded_object_maps(
-              reinterpret_cast<uintptr_t>(entry));
-          LOGI("module %u system fallback anonymized %d segment(s)", i,
-               anonymized);
+          if (entry != nullptr && yukizygisk::config::anonymous(g_yz_config)) {
+            int anonymized = yuki::solist::spoof_loaded_object_maps(
+                reinterpret_cast<uintptr_t>(entry));
+            LOGI("module %u system load anonymized %d segment(s)", i,
+                 anonymized);
+          }
         }
       }
       close(mfd);
     }
     if (handle == nullptr) {
       LOGE("dlopen module %u failed", i);
+      report_module(YZ_RUNTIME_STATE_FAILED);
       continue;
     }
     if (entry == nullptr) {
@@ -566,6 +619,7 @@ void load_modules_impl(JNIEnv *env) {
         g_yuki_dlclose(handle);
       else
         dlclose(handle);
+      report_module(YZ_RUNTIME_STATE_FAILED);
       continue;
     }
     Module &m = g_modules.emplace_back();
@@ -584,8 +638,10 @@ void load_modules_impl(JNIEnv *env) {
       else
         dlclose(handle);
       g_modules.pop_back();
+      report_module(YZ_RUNTIME_STATE_FAILED);
       continue;
     }
+    report_module(YZ_RUNTIME_STATE_INJECTED);
   }
   g_loading = nullptr;
   g_cur = nullptr;
@@ -782,8 +838,14 @@ static void core_start(const char *self_path) {
   g_yuki_dlopen = yuki_core_dlopen_memfd;
   g_yuki_dlsym = yuki_core_dlsym;
   g_yuki_dlclose = yuki_core_dlclose;
+  zd_load_config();
+  if (g_self_base == 0 && yukizygisk::config::anonymous(g_yz_config))
+    (void)yuki::solist::spoof_loaded_object_maps(
+        reinterpret_cast<uintptr_t>(core_start));
   const uint32_t runtime_generation =
       zd_get_runtime_generation(YZ_RUNTIME_KIND_ZYGOTE);
+  g_monitor_zygote_pid = static_cast<uint32_t>(getpid());
+  g_monitor_zygote_generation = runtime_generation;
   LOGI("core start, self=%s", self_path ? self_path : "(null)");
   if (!yuki::solist::prepare_linker())
     LOGE("linker internals unavailable; solist cleanup disabled");
@@ -1089,6 +1151,12 @@ bool g_loader_unmap_safe = false;
 static void prepare_system_core_unmap(uintptr_t entry);
 
 extern "C" [[gnu::visibility("default")]] void
+zygisk_set_load_config(const yz_config *config) {
+  if (config != nullptr)
+    g_yz_config = *config;
+}
+
+extern "C" [[gnu::visibility("default")]] void
 zygisk_core_entry(const char *self_path, void *loader_self, void *core_base,
                   void *core_size, int /*early_packet_fd_plus1*/) {
   g_loader_base = reinterpret_cast<uintptr_t>(loader_self);
@@ -1097,7 +1165,8 @@ zygisk_core_entry(const char *self_path, void *loader_self, void *core_base,
   core_start(self_path);
   // Never turn the first stage into an unmapped trampoline. A partial handoff
   // is safe only while its mapping remains pinned.
-  const bool all_pointers_handed_off = first_stage_handoff_complete();
+  const bool all_pointers_handed_off =
+      g_self_base == 0 || first_stage_handoff_complete();
   g_loader_unmap_safe = all_pointers_handed_off;
   if (!g_loader_unmap_safe)
     LOGI("loader handoff is incomplete; retaining first-stage mapping");

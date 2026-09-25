@@ -35,6 +35,8 @@ enum class Request : uint8_t {
   WriteLog = 22,
   OpenHyosControlSession = 23,
   ReportHyosCallback = 24,
+  GetModuleInfo = 25,
+  ReportZygoteModule = 26,
 };
 
 enum class LogLevel : uint8_t {
@@ -73,6 +75,21 @@ struct NativeModuleInfo {
   char target[kNativeModuleTargetMax];
   char lib_path[kNativeModulePathMax];
 };
+
+struct ModuleInfo {
+  char module_id[kNativeModuleNameMax];
+};
+
+struct ZygoteModuleReport {
+  uint32_t zygote_pid;
+  uint32_t generation;
+  uint8_t state;
+  uint8_t reserved[3];
+  char module_id[kNativeModuleNameMax];
+};
+
+static_assert(sizeof(ModuleInfo) == 64);
+static_assert(sizeof(ZygoteModuleReport) == 76);
 
 #if defined(__LP64__)
 inline constexpr char kSocketName[] = "zygiskd64";
