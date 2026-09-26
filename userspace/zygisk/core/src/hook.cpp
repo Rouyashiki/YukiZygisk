@@ -796,8 +796,19 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
     record.mode = mode;
     record.original = orig;
     record.replacement = m.fnPtr;
-    void *tramp =
-        yuki::ihook::install(orig, m.fnPtr, &record.hook, false, owner == -1);
+    // Tango translates the guest ARM32 native entry and may not execute an
+    // inline-patched ArtMethod body. Register the zygote replacement in ART's
+    // native table so the child specialization wrapper remains reachable.
+    const bool prefer_register =
+#ifdef __arm__
+        owner == -1;
+#else
+        false;
+#endif
+    void *tramp = prefer_register
+                      ? nullptr
+                      : yuki::ihook::install(orig, m.fnPtr, &record.hook, false,
+                                             owner == -1);
     if (tramp != nullptr) {
       g_jni_hooks.push_back(std::move(record));
       m.fnPtr = tramp;
