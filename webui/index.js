@@ -132,7 +132,7 @@ function policySourceLabel() {
 }
 
 function stateBadge(value) {
-  const tones = { injected: "success", failed: "danger", crashed: "warning", unsupported32: "muted" };
+  const tones = { injected: "success", failed: "danger", crashed: "warning", suspended: "warning", unsupported32: "muted" };
   return `<span class="badge ${tones[value] || "muted"}">${escapeHtml(t(`state.${value}`, value))}</span>`;
 }
 
@@ -152,11 +152,18 @@ function infoItem(label, value, code = false) {
   return `<div><dt>${escapeHtml(label)}</dt><dd>${code ? `<code>${escapeHtml(value)}</code>` : escapeHtml(value)}</dd></div>`;
 }
 
+function crashEvidenceDetails(moduleId) {
+  const evidence = (state.status.crash_evidence || []).filter((item) => item.module === moduleId);
+  if (!evidence.length) return "";
+  const rows = evidence.map((item) => `<p>${escapeHtml(item.process)} · PID ${escapeHtml(item.pid)} · ${escapeHtml(item.abi)}<br>${escapeHtml(item.timestamp)} · ${escapeHtml(item.tombstone)}</p><pre>${escapeHtml(item.frame)}</pre>`).join("");
+  return `<details><summary class="badge danger">${escapeHtml(t("status.crashEvidence"))}</summary><p>${escapeHtml(t("status.crashEvidenceDesc"))}</p>${rows}</details>`;
+}
+
 function renderZygiskModuleCards() {
   const standard = state.status.modules || [];
   if (!standard.length)
     return emptyState(t("status.noModules"));
-  return standard.map((name) => `<article class="module-card"><div class="module-mark">Z</div><div><strong>${escapeHtml(name)}</strong><span>Zygisk API</span></div>${stateBadge("injected")}</article>`).join("");
+  return standard.map((name) => `<article class="module-card"><div class="module-mark">Z</div><div><strong>${escapeHtml(name)}</strong><span>Zygisk API</span>${crashEvidenceDetails(name)}</div>${stateBadge((state.status.suspended_modules || []).includes(name) ? "suspended" : "injected")}</article>`).join("");
 }
 
 function combinedNativeState(items, fallback = "failed") {
@@ -173,7 +180,7 @@ function renderNativeModules(injections) {
   return modules.map((module) => {
     const targets = injections.filter((item) => item.module === module.id);
     const detail = `${module.target_type}=${module.target} · ${t("status.nativeProcessCount", "", { count: targets.length })}`;
-    return `<article class="module-card native"><div class="module-mark">N</div><div><strong>${escapeHtml(module.id)}</strong><span>${escapeHtml(detail)}</span></div>${stateBadge(combinedNativeState(targets, module.state))}</article>`;
+    return `<article class="module-card native"><div class="module-mark">N</div><div><strong>${escapeHtml(module.id)}</strong><span>${escapeHtml(detail)}</span>${crashEvidenceDetails(module.id)}</div>${stateBadge(combinedNativeState(targets, module.state))}</article>`;
   }).join("");
 }
 
@@ -285,6 +292,7 @@ function renderSettings() {
       <div class="switch-list">
         ${switchCard("setting-yukilinker", t("settings.yukilinker"), t("settings.yukilinkerDesc"), state.config.yukilinker)}
         ${switchCard("setting-anonymous-memory", t("settings.anonymousMemory"), t("settings.anonymousMemoryDesc"), state.config.anonymous_memory)}
+        ${switchCard("setting-crash-protection", t("settings.crashProtection"), t("settings.crashProtectionDesc"), state.config.crash_protection)}
         <label class="select-card"><span><strong>${escapeHtml(t("settings.denylistMode"))}</strong><small>${escapeHtml(t("settings.denylistDesc", "", { root: rootImplLabel() }))}</small></span><select id="denylist-mode"><option value="0" ${state.config.denylist_mode === 0 ? "selected" : ""}>${escapeHtml(t("settings.denylistOff"))}</option><option value="1" ${state.config.denylist_mode === 1 ? "selected" : ""}>${escapeHtml(t("settings.denylistSkip"))}</option><option value="2" ${state.config.denylist_mode === 2 ? "selected" : ""}>${escapeHtml(t("settings.denylistRevert"))}</option></select></label>
         ${switchCard("setting-dmesg", t("settings.dmesg"), t("settings.dmesgDesc"), state.config.dmesg_log)}
       </div>
@@ -379,6 +387,7 @@ function collectConfigControls() {
   const yukilinker = document.getElementById("setting-yukilinker");
   const anonymousMemory = document.getElementById("setting-anonymous-memory");
   const dmesg = document.getElementById("setting-dmesg");
+  const crashProtection = document.getElementById("setting-crash-protection");
   const mode = document.getElementById("denylist-mode");
   if (yukilinker)
     state.config.yukilinker = yukilinker.checked;
@@ -386,6 +395,8 @@ function collectConfigControls() {
     state.config.anonymous_memory = anonymousMemory.checked;
   if (dmesg)
     state.config.dmesg_log = dmesg.checked;
+  if (crashProtection)
+    state.config.crash_protection = crashProtection.checked;
   if (mode)
     state.config.denylist_mode = Number(mode.value);
 }

@@ -19,6 +19,7 @@ export const DEFAULT_CONFIG = {
   anonymous_memory: true,
   denylist_mode: 0,
   dmesg_log: false,
+  crash_protection: false,
 };
 
 export const DEFAULT_STATUS = {
@@ -38,12 +39,14 @@ export const DEFAULT_STATUS = {
   anonymous_memory: true,
   denylist_mode: 0,
   dmesg_log: false,
+  crash_protection: false,
   recent: [],
   zygotes: [],
   zygote_monitor: [],
   modules: [],
   native_modules: [],
   native_injections: [],
+  suspended_modules: [],
   error: "",
 };
 
@@ -73,6 +76,7 @@ function normalizeConfig(value = {}) {
     anonymous_memory: value.anonymous_memory !== false,
     denylist_mode: [0, 1, 2].includes(mode) ? mode : 0,
     dmesg_log: value.dmesg_log === true,
+    crash_protection: value.crash_protection === true,
   };
 }
 
@@ -83,7 +87,7 @@ function normalizeStatus(value = {}) {
     ...value,
     available: value.kernel_alive === true,
   };
-  for (const key of ["recent", "zygotes", "zygote_monitor", "modules", "native_modules", "native_injections"]) {
+  for (const key of ["recent", "zygotes", "zygote_monitor", "modules", "native_modules", "native_injections", "suspended_modules"]) {
     if (!Array.isArray(status[key]))
       status[key] = [];
   }
@@ -114,9 +118,9 @@ function parseModuleProp(text) {
 
 async function writeConfig(config) {
   const normalized = normalizeConfig(config);
-  const payload = shellEscape(JSON.stringify(normalized, null, 2));
-  const path = shellEscape(PATHS.CONFIG);
-  const command = `mkdir -p /data/adb/yukizygisk && printf '%s\n' '${payload}' > '${path}' && chmod 0600 '${path}'`;
+  const args = Object.entries(normalized).flatMap(([key, value]) => [key, String(value)]);
+  const command = [PATHS.CONTROL, "config", "set", ...args]
+    .map((value) => "'" + shellEscape(value) + "'").join(" ");
   const result = await exec(command);
   if (result.errno !== 0)
     throw new Error(output(result) || "failed to write yzconfig.json");
@@ -129,6 +133,7 @@ const mockState = {
     anonymous_memory: true,
     denylist_mode: 1,
     dmesg_log: false,
+    crash_protection: false,
   },
   status: normalizeStatus({
     kernel_alive: true,
@@ -224,7 +229,7 @@ const realApi = {
   },
 
   async loadConfig() {
-    const result = await exec(`cat '${shellEscape(PATHS.CONFIG)}' 2>/dev/null`);
+    const result = await exec("'" + shellEscape(PATHS.CONTROL) + "' config get");
     if (result.errno !== 0 || !result.stdout.trim())
       return clone(DEFAULT_CONFIG);
     try {
@@ -236,7 +241,6 @@ const realApi = {
 
   async saveConfig(config) {
     const normalized = await writeConfig(config);
-    await reloadRuntime();
     return normalized;
   },
 
