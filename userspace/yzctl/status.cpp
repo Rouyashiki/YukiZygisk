@@ -8,6 +8,9 @@
  */
 
 #include "status.hpp"
+#include "userspace/zygisk/crash_evidence.hpp"
+#include "userspace/zygisk/crash_protection.hpp"
+#include "userspace/zygisk/settings.hpp"
 
 #include "host.hpp"
 #include "native_modules.hpp"
@@ -552,7 +555,8 @@ bool query_status(Host &host, const StatusOptions &options,
   output += runtime.safe_mode ? "true" : "false";
   output += ",\"zygisk_module_monitor\":";
   output += (runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT) != 0
-                ? "true" : "false";
+                ? "true"
+                : "false";
   output += ",\"zygote_crashes\":" + std::to_string(runtime.zygote_crashes);
   output += ",\"safe_mode_zygote\":";
   append_json_string(&output, runtime.safe_mode_zygote.empty()
@@ -574,8 +578,8 @@ bool query_status(Host &host, const StatusOptions &options,
     output += "{\"pid\":" + std::to_string(record.pid);
     output += ",\"generation\":" + std::to_string(record.generation);
     output += ",\"kind\":";
-    append_json_string(&output, record.kind == YZ_RUNTIME_KIND_ZYGOTE
-                                   ? "zygote" : "native");
+    append_json_string(
+        &output, record.kind == YZ_RUNTIME_KIND_ZYGOTE ? "zygote" : "native");
     output += ",\"abi\":";
     append_json_string(&output, abi_name(record.abi));
     output += ",\"module\":";
@@ -633,7 +637,19 @@ bool query_status(Host &host, const StatusOptions &options,
     append_json_string(&output, injection.state);
     output += '}';
   }
-  output += "]}";
+  output += "],\"crash_evidence\":" +
+            json::dump(yukizygisk::crash::read_evidence(
+                "/data/adb/yukizygisk/diagnostics/current"));
+  const bool protection =
+      yukizygisk::settings::protection_enabled(options.config_path);
+  output += ",\"crash_protection\":";
+  output += protection ? "true" : "false";
+  output += ",\"suspended_modules\":";
+  output +=
+      json::dump(protection ? yukizygisk::crash::suspended_modules(
+                                  "/data/adb/yukizygisk/diagnostics/current")
+                            : json::Value::array());
+  output += '}';
   document->json = std::move(output);
   return true;
 }

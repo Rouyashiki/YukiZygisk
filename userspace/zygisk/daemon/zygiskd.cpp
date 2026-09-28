@@ -11,6 +11,7 @@
 #if defined(YUKIZYGISK_RUNTIME_LOG)
 #include "log.hpp"
 #endif
+#include "crash_monitor.hpp"
 #include "native_modules.hpp"
 #include "root_policy.hpp"
 #include "uapi/yukizygisk.h"
@@ -272,6 +273,11 @@ using NativeModule = yukizygisk::native::NativeModule;
 
 std::vector<NativeModule> g_native_modules;
 std::vector<NativeModule> g_native_targets;
+
+yukizygisk::crash::Monitor
+    g_crash_monitor("/data/tombstones", [](const char *message) {
+      DLOGI("crash monitor: %s", message);
+    });
 
 int consume_ready_fd() {
   const char *env = getenv("YUKIZYGISK_READY_FD");
@@ -554,6 +560,13 @@ void rescan_modules() {
 #if defined(__LP64__)
   publish_native_targets();
 #endif // #if defined(__LP64__)
+  std::vector<yukizygisk::crash::Module> crash_modules;
+  crash_modules.reserve(g_modules.size() + g_native_modules.size());
+  for (const auto &module : g_modules)
+    crash_modules.push_back({module.name, module.lib_path, {}, true});
+  for (const auto &module : g_native_modules)
+    crash_modules.push_back({module.module_id, module.lib_path});
+  g_crash_monitor.set_modules(std::move(crash_modules));
   DLOGI("found %zu zygisk module(s), %zu native module(s) for %s",
         g_modules.size(), g_native_modules.size(), kAbi);
 }
@@ -1276,6 +1289,7 @@ uint32_t query_flags(uint32_t uid) {
 
 void read_yzconfig() {
   yz_config cfg = yukizygisk::config::defaults;
+  bool crash_protection = false;
   int fd = open(yzhost::config_path().c_str(), O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     std::string buf;
@@ -1298,9 +1312,12 @@ void read_yzconfig() {
       }
       if (root.contains("dmesg_log"))
         cfg.dmesg_log = root.at("dmesg_log").as_bool() ? 1 : 0;
+      crash_protection = root.at("crash_protection").type == json::Type::Bool &&
+                         root.at("crash_protection").as_bool();
     }
   }
   g_yz_config = cfg;
+  g_crash_monitor.set_protection_enabled(crash_protection);
 #if defined(YUKIZYGISK_RUNTIME_LOG)
   zygiskd::logging::set_kernel_mirror(cfg.dmesg_log != 0);
 #endif
@@ -1699,6 +1716,11 @@ void handle_client(int client) {
       send_fd(client, -1);
       break;
     }
+    g_crash_monitor.drain();
+    if (g_crash_monitor.suspended(g_modules[idx].name)) {
+      send_fd(client, -1);
+      break;
+    }
     // Never expose the source module inode to zygote. Besides preserving
     // anonymous loading, this avoids an SCM_RIGHTS SELinux check against a
     // module that was installed with adb_data_file context.
@@ -1715,6 +1737,16 @@ void handle_client(int client) {
       (void)snprintf(info.module_id, sizeof(info.module_id), "%s",
                      g_modules[idx].name.c_str());
     write_exact(client, &info, sizeof(info));
+    break;
+  }
+  case zygiskd::Request::GetModuleLoadState: {
+    uint32_t idx = 0;
+    uint8_t state = 2;
+    if (read_client(&idx, sizeof(idx)) && idx < g_modules.size()) {
+      g_crash_monitor.drain();
+      state = g_crash_monitor.suspended(g_modules[idx].name) ? 1 : 0;
+    }
+    write_exact(client, &state, sizeof(state));
     break;
   }
   case zygiskd::Request::ConnectCompanion: {
@@ -2037,11 +2069,18 @@ int nl_listen() {
   return fd;
 }
 
-void nl_drain(int fd) {
-  char buf[4096];
-  ssize_t got = recv(fd, buf, sizeof(buf), 0);
+bool nl_receive_one(int fd) {
+  alignas(nlmsghdr) char buf[4096];
+  sockaddr_nl sender{};
+  socklen_t sender_length = sizeof(sender);
+  const ssize_t got =
+      recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT,
+               reinterpret_cast<sockaddr *>(&sender), &sender_length);
   if (got <= 0)
-    return;
+    return got < 0 && errno == EINTR;
+  if (sender_length != sizeof(sender) || sender.nl_family != AF_NETLINK ||
+      sender.nl_pid != 0)
+    return true;
 
   size_t remaining = static_cast<size_t>(got);
   for (nlmsghdr *nlh = reinterpret_cast<nlmsghdr *>(buf);
@@ -2065,6 +2104,12 @@ void nl_drain(int fd) {
         (void)yzpolicy::refresh(true);
       } else if (ev->type == YZ_EV_SAFEMODE) {
         DLOGI("safemode event pid=%u crashes=%u", ev->pid, ev->appid);
+      } else if (ev->type == YZ_EV_ZYGOTE_EXIT) {
+        if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(yz_zygote_exit_event))) {
+          yz_zygote_exit_event event{};
+          memcpy(&event, ev, sizeof(event));
+          g_crash_monitor.on_exit(event);
+        }
       } else if (ev->type == YZ_EV_POLICY_REFRESH) {
         yzpolicy::handle_refresh_request(ev->appid);
       }
@@ -2075,6 +2120,12 @@ void nl_drain(int fd) {
       break;
     remaining -= step;
     nlh = reinterpret_cast<nlmsghdr *>(reinterpret_cast<char *>(nlh) + step);
+  }
+  return true;
+}
+
+void nl_drain(int fd) {
+  while (nl_receive_one(fd)) {
   }
 }
 
@@ -2247,6 +2298,8 @@ int run_daemon() {
   }
 #endif // #if defined(__LP64__)
 
+  g_crash_monitor.start("/data/adb/yukizygisk/diagnostics/current",
+                        kRuntimeAbi);
   DLOGI("zygiskd up: unix @%s, netlink proto=%d, modules=%s, config=%s, "
         "policy=%s",
         zygiskd::kSocketName, YZ_NETLINK_PROTO, yzhost::modules_dir().c_str(),
@@ -2255,6 +2308,7 @@ int run_daemon() {
 
   for (;;) {
     reap_terminating_companions();
+    g_crash_monitor.tick();
     std::vector<pollfd> poll_fds;
     std::vector<uint32_t> module_companion_indices;
     std::vector<uint32_t> native_companion_indices;
@@ -2264,9 +2318,12 @@ int run_daemon() {
     native_companion_indices.reserve(g_native_companions.size());
     poll_fds.push_back({srv, POLLIN, 0});
     poll_fds.push_back({nlfd, POLLIN, 0});
+    const size_t tombstone_watch_index = poll_fds.size();
+    poll_fds.push_back({g_crash_monitor.fd(), POLLIN, 0});
+    const size_t hyos_session_offset = poll_fds.size();
     for (const auto &session : g_hyos_sessions)
       poll_fds.push_back({session.session, POLLIN, 0});
-    int poll_timeout = -1;
+    int poll_timeout = g_crash_monitor.timeout_ms();
     const auto now = std::chrono::steady_clock::now();
     const size_t module_companion_offset = poll_fds.size();
     for (uint32_t index = 0; index < g_companions.size(); ++index) {
@@ -2330,7 +2387,7 @@ int run_daemon() {
     }
 
     for (size_t index = g_hyos_sessions.size(); index > 0; --index) {
-      const short events = poll_fds[index + 1].revents;
+      const short events = poll_fds[hyos_session_offset + index - 1].revents;
       bool keep = (events & (POLLERR | POLLHUP | POLLNVAL)) == 0;
       if (keep && (events & POLLIN) != 0)
         keep = handle_hyos_control_session(g_hyos_sessions[index - 1]);
@@ -2353,6 +2410,10 @@ int run_daemon() {
         (void)refresh_native_companion(native_companion_indices[index]);
     }
 
+    // Apply crash decisions before serving new module image requests.
+    nl_drain(nlfd);
+    if (poll_fds[tombstone_watch_index].revents != 0)
+      g_crash_monitor.drain();
     if (poll_fds[0].revents & POLLIN) {
       int client = accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
       if (client >= 0) {
@@ -2360,8 +2421,6 @@ int run_daemon() {
         close(client);
       }
     }
-    if (poll_fds[1].revents & POLLIN)
-      nl_drain(nlfd);
   }
 }
 

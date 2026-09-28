@@ -17,6 +17,7 @@ endif()
 
 set(ZYGISKD_SOURCES
   ${PROJECT_SOURCE_DIR}/userspace/common/cxx_slim.cpp
+  crash_monitor.cpp
   root_policy.cpp
   zygiskd.cpp)
 if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")

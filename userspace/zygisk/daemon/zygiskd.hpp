@@ -37,6 +37,7 @@ enum class Request : uint8_t {
   ReportHyosCallback = 24,
   GetModuleInfo = 25,
   ReportZygoteModule = 26,
+  GetModuleLoadState = 27, // -> uint8_t: 0 available, 1 suspended, 2 invalid.
 };
 
 enum class LogLevel : uint8_t {

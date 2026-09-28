@@ -9,6 +9,7 @@
 
 #include "host.hpp"
 #include "status.hpp"
+#include "userspace/zygisk/settings.hpp"
 
 #include "uapi/yukizygisk.h"
 
@@ -24,7 +25,9 @@ void usage(FILE *stream) {
   fprintf(stream,
           "Usage:\n"
           "  yzctl status [--json] [--modules-dir DIR] [--config FILE]\n"
-          "  yzctl reload\n");
+          "  yzctl reload\n"
+          "  yzctl config get\n"
+          "  yzctl config set KEY VALUE [KEY VALUE ...]\n");
 }
 
 bool option_value(int argc, char **argv, int *index, const char *name,
@@ -122,6 +125,32 @@ int reload_command(int argc) {
   return 0;
 }
 
+int config_command(int argc, char **argv) {
+  constexpr char path[] = "/data/adb/yukizygisk/yzconfig.json";
+  if (argc == 3 && strcmp(argv[2], "get") == 0) {
+    json::Value root;
+    if (!yukizygisk::settings::read(path, &root)) {
+      fprintf(stderr, "yzctl: configuration read failed: %s\n",
+              strerror(errno));
+      return 1;
+    }
+    puts(json::dump(root).c_str());
+    return 0;
+  }
+  if (argc < 5 || strcmp(argv[2], "set") != 0 || argc % 2 != 1) {
+    fprintf(
+        stderr,
+        "yzctl: expected config get or config set KEY VALUE [KEY VALUE ...]\n");
+    return 2;
+  }
+  const std::vector<std::string> pairs(argv + 3, argv + argc);
+  if (!yukizygisk::settings::update(path, pairs)) {
+    fprintf(stderr, "yzctl: configuration save failed: %s\n", strerror(errno));
+    return 1;
+  }
+  return reload_command(2);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -133,6 +162,8 @@ int main(int argc, char **argv) {
     return status_command(argc, argv);
   if (strcmp(argv[1], "reload") == 0)
     return reload_command(argc);
+  if (strcmp(argv[1], "config") == 0)
+    return config_command(argc, argv);
   if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
       strcmp(argv[1], "-h") == 0) {
     usage(stdout);

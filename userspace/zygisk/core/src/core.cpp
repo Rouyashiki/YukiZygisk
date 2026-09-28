@@ -12,8 +12,8 @@
 #include "hook.hpp"
 #include "load_config.hpp"
 #include "log.hpp"
-#include "userspace/zygisk/daemon/zygiskd.hpp"
 #include "solist.hpp"
+#include "userspace/zygisk/daemon/zygiskd.hpp"
 #include "yukilinker.hpp"
 #include "zygisk.hpp"
 
@@ -195,6 +195,7 @@ enum class ZdRequest : uint8_t {
   GetRuntimeGeneration = 21,
   GetModuleInfo = 25,
   ReportZygoteModule = 26,
+  GetModuleLoadState = 27,
 };
 #if defined(__LP64__)
 constexpr char kZygiskdSocket[] = "zygiskd64";
@@ -407,6 +408,21 @@ bool zd_get_module_info(int id, char *module_id, size_t module_id_size) {
   return true;
 }
 
+bool zd_module_suspended(uint32_t index) {
+  const int socket = connect_zygiskd();
+  if (socket < 0)
+    return false;
+  const uint8_t request = static_cast<uint8_t>(ZdRequest::GetModuleLoadState);
+  uint8_t state = 0;
+  uint8_t packet[sizeof(request) + sizeof(index)]{request};
+  memcpy(packet + sizeof(request), &index, sizeof(index));
+  const bool ok = send(socket, packet, sizeof(packet), MSG_NOSIGNAL) ==
+                      static_cast<ssize_t>(sizeof(packet)) &&
+                  read_all(socket, &state, sizeof(state));
+  close(socket);
+  return ok && state == 1;
+}
+
 void zd_report_zygote_module(const char *module_id, uint8_t state) {
   if (g_monitor_zygote_generation == 0 || module_id == nullptr ||
       module_id[0] == '\0')
@@ -540,6 +556,10 @@ void load_modules_impl(JNIEnv *env) {
     (void)arm_module_load_policy(0);
 
   for (uint32_t i = 0; i < count; ++i) {
+    if (zd_module_suspended(i)) {
+      LOGI("module %u injection suspended for this boot", i);
+      continue;
+    }
     char module_id[YZ_NATIVE_MODULE_ID_MAX]{};
     if (g_monitor_zygote_generation != 0)
       (void)zd_get_module_info(static_cast<int>(i), module_id,
