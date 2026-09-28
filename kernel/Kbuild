@@ -25,6 +25,7 @@ yukizygisk-objs := \
 	feature/tango.o \
 	feature/zygote_orch.o \
 	feature/zygote_nl.o \
+	feature/zygote_exit.o \
 	feature/zygote_ctl.o
 
 ccflags-y += -I$(src)
@@ -39,4 +40,8 @@ ccflags-y += -Wno-unused-variable
 
 ifneq ($(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h; echo $$?),0)
 ccflags-y += -DKSU_HAS_NEW_DCACHE_FLUSH
+endif
+
+ifneq ($(shell grep -A3 'sched_process_exit,' $(srctree)/include/trace/events/sched.h | grep -c 'bool group_dead'),0)
+ccflags-y += -DYZ_EXIT_HAS_GROUP_DEAD
 endif

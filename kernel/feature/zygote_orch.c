@@ -31,6 +31,7 @@
 #include "feature/zygote_orch.h"
 #include "feature/zygote_nl.h"
 #include "feature/zygote_ctl.h"
+#include "feature/zygote_exit.h"
 #include "host/host.h"
 #include "klog.h" // IWYU pragma: keep
 
@@ -387,12 +388,16 @@ void yz_zygote_orch_init(void)
 		return;
 	}
 
+	ret = yz_zygote_exit_enable();
+	if (ret)
+		pr_warn("zygote_orch: exit diagnostics unavailable: %d\n", ret);
 	zo_setresuid_monitor_init();
 	pr_info("zygote_orch: lifecycle state machine armed\n");
 }
 
 void yz_zygote_orch_exit(void)
 {
+	yz_zygote_exit_disable();
 	zo_setresuid_monitor_exit();
 	zo_specialize_events_reset();
 	zo_unregister_tracepoint(&zo_trace_fork_tp, (void *)zo_on_fork);

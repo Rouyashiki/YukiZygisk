@@ -69,6 +69,25 @@ void yz_zygote_nl_emit_policy_refresh(u32 owner, u32 uid)
 	yz_zygote_nl_emit_event(YZ_EV_POLICY_REFRESH, owner, uid);
 }
 
+void yz_zygote_nl_emit_zygote_exit(const struct yz_zygote_exit_event *event)
+{
+	struct sk_buff *skb;
+	struct nlmsghdr *nlh;
+
+	if (!yz_sock)
+		return;
+	skb = nlmsg_new(sizeof(*event), GFP_KERNEL);
+	if (!skb)
+		return;
+	nlh = nlmsg_put(skb, 0, 0, YZ_NL_MSG_EVENT, sizeof(*event), 0);
+	if (!nlh) {
+		nlmsg_free(skb);
+		return;
+	}
+	memcpy(nlmsg_data(nlh), event, sizeof(*event));
+	nlmsg_multicast(yz_sock, skb, 0, YZ_NL_GROUP_EVENTS, GFP_KERNEL);
+}
+
 void yz_zygote_nl_init(void)
 {
 	struct netlink_kernel_cfg cfg = {

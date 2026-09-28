@@ -49,6 +49,7 @@
 #include "uapi/yukizygisk.h"
 #include "zygote_nl.h"
 #include "zygote_probe.h"
+#include "zygote_exit.h"
 #include "tango.h"
 
 static const char app_process[] = "app_process";
@@ -1002,6 +1003,8 @@ static u32 zp_runtime_begin(u8 kind, u8 abi, u8 target_type, u32 flags,
 		     target);
 	entry->start_boottime = start_boottime;
 	generation = entry->record.generation;
+	if (kind == YZ_RUNTIME_KIND_ZYGOTE)
+		yz_zygote_exit_track(pid, start_boottime, generation, abi);
 out:
 	mutex_unlock(&zp_runtime_lock);
 	return generation;
