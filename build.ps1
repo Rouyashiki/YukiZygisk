@@ -411,15 +411,19 @@ function Stage-Module {
 	New-Item -ItemType Directory -Path $lkmDir -Force | Out-Null
 	Copy-RequiredFile -Source $kernelOut -Destination (Join-Path $lkmDir "$(Split-Path -Leaf $kernelOut)")
 
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'zygiskd64') -Destination (Join-Path $zipDir 'zygiskd64')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'zygiskd32') -Destination (Join-Path $zipDir 'zygiskd32')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'yzctl') -Destination (Join-Path $zipDir 'yzctl')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libzygisk64.so') -Destination (Join-Path $zipDir 'libzygisk64.so')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libzygisk32.so') -Destination (Join-Path $zipDir 'libzygisk32.so')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukilinker64.so') -Destination (Join-Path $zipDir 'libyukilinker64.so')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukilinker32.so') -Destination (Join-Path $zipDir 'libyukilinker32.so')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukizncore64.so') -Destination (Join-Path $zipDir 'libyukizncore64.so')
-	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukizncore32.so') -Destination (Join-Path $zipDir 'libyukizncore32.so')
+	$binDir = Join-Path $zipDir 'bin'
+	$lib64Dir = Join-Path $zipDir 'lib64'
+	$lib32Dir = Join-Path $zipDir 'lib'
+	New-Item -ItemType Directory -Path $binDir, $lib64Dir, $lib32Dir -Force | Out-Null
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'zygiskd64') -Destination (Join-Path $binDir 'zygiskd64')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'zygiskd32') -Destination (Join-Path $binDir 'zygiskd32')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'yzctl') -Destination (Join-Path $binDir 'yzctl')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libzygisk64.so') -Destination (Join-Path $lib64Dir 'libzygisk.so')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukilinker64.so') -Destination (Join-Path $lib64Dir 'libyukilinker.so')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukizncore64.so') -Destination (Join-Path $lib64Dir 'libyukizncore.so')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libzygisk32.so') -Destination (Join-Path $lib32Dir 'libzygisk.so')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukilinker32.so') -Destination (Join-Path $lib32Dir 'libyukilinker.so')
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukizncore32.so') -Destination (Join-Path $lib32Dir 'libyukizncore.so')
 
 	return $zipDir
 }

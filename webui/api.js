@@ -10,7 +10,7 @@ import { exec, hasKernelSU } from "./assets/kernelsu.js";
 
 export const PATHS = {
   MODULE: "/data/adb/modules/yukizygisk",
-  CONTROL: "/data/adb/modules/yukizygisk/yzctl",
+  CONTROL: "/data/adb/modules/yukizygisk/bin/yzctl",
   CONFIG: "/data/adb/yukizygisk/yzconfig.json",
 };
 

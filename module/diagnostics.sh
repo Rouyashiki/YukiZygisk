@@ -490,8 +490,8 @@ yz_diagnostics_export() {
 		cp -p "$YZ_STATE_DIR/zygiskd.log" "$staging/legacy-bootstrap.log" 2>/dev/null; then
 		collected_legacy_bootstrap=true
 	fi
-	if [ -x "$moddir/yzctl" ] &&
-		"$moddir/yzctl" status --json >"$staging/status.json" 2>/dev/null &&
+	if [ -x "$moddir/bin/yzctl" ] &&
+		"$moddir/bin/yzctl" status --json >"$staging/status.json" 2>/dev/null &&
 		[ -s "$staging/status.json" ]; then
 		collected_status=true
 	else

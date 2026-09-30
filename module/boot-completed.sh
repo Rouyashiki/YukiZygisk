@@ -18,7 +18,7 @@ log() {
 	echo "boot-completed: $*" >>"$LOG_FILE"
 }
 
-if "$MODDIR/yzctl" status --json >/dev/null 2>>"$LOG_FILE"; then
+if "$MODDIR/bin/yzctl" status --json >/dev/null 2>>"$LOG_FILE"; then
 	log "kernel control status ok"
 	exit 0
 fi

@@ -462,13 +462,23 @@ validate_android_platform
 	die "standalone packages require an arm64-v8a device with optional ARM compat"
 
 stage_payloads() {
-	local lib
-	for lib in libzygisk64.so libzygisk32.so libyukilinker64.so \
-		libyukilinker32.so libyukizncore64.so libyukizncore32.so; do
-		if [[ -f "$OUT_DIR/$lib" ]]; then
-			cp "$OUT_DIR/$lib" "$PACKAGE_DIR/$lib"
+	local source destination payload
+	local payloads=(
+		"libzygisk64.so:lib64/libzygisk.so"
+		"libyukilinker64.so:lib64/libyukilinker.so"
+		"libyukizncore64.so:lib64/libyukizncore.so"
+		"libzygisk32.so:lib/libzygisk.so"
+		"libyukilinker32.so:lib/libyukilinker.so"
+		"libyukizncore32.so:lib/libyukizncore.so"
+	)
+	for payload in "${payloads[@]}"; do
+		source="${payload%%:*}"
+		destination="${payload#*:}"
+		if [[ -f "$OUT_DIR/$source" ]]; then
+			mkdir -p "$PACKAGE_DIR/${destination%/*}"
+			cp "$OUT_DIR/$source" "$PACKAGE_DIR/$destination"
 		else
-			die "missing runtime payload: build/out/$lib"
+			die "missing runtime payload: build/out/$source"
 		fi
 	done
 }
@@ -501,16 +511,17 @@ package_module() {
 		source="$(lkm_output_path "$target")"
 		cp "$source" "$PACKAGE_DIR/lkm/${target}_yukizygisk.ko"
 	done < <(kernel_targets)
-	cp "$OUT_DIR/zygiskd64" "$PACKAGE_DIR/zygiskd64"
-	cp "$OUT_DIR/zygiskd32" "$PACKAGE_DIR/zygiskd32"
-	cp "$OUT_DIR/yzctl" "$PACKAGE_DIR/yzctl"
+	mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib64" "$PACKAGE_DIR/lib"
+	cp "$OUT_DIR/zygiskd64" "$PACKAGE_DIR/bin/zygiskd64"
+	cp "$OUT_DIR/zygiskd32" "$PACKAGE_DIR/bin/zygiskd32"
+	cp "$OUT_DIR/yzctl" "$PACKAGE_DIR/bin/yzctl"
 	stage_payloads
 
 	chmod 0644 "$PACKAGE_DIR/module.prop" "$PACKAGE_DIR"/lkm/*.ko \
-		"$PACKAGE_DIR"/lib*.so "$PACKAGE_DIR"/LICENSE* \
+		"$PACKAGE_DIR"/lib64/*.so "$PACKAGE_DIR"/lib/*.so "$PACKAGE_DIR"/LICENSE* \
 		"$PACKAGE_DIR/NOTICE"
-	chmod 0755 "$PACKAGE_DIR/zygiskd64" "$PACKAGE_DIR/zygiskd32" \
-		"$PACKAGE_DIR/yzctl" \
+	chmod 0755 "$PACKAGE_DIR/bin/zygiskd64" "$PACKAGE_DIR/bin/zygiskd32" \
+		"$PACKAGE_DIR/bin/yzctl" \
 		"$PACKAGE_DIR/post-fs-data.sh" \
 		"$PACKAGE_DIR/boot-completed.sh" "$PACKAGE_DIR/customize.sh" \
 		"$PACKAGE_DIR/action.sh" \

@@ -56,12 +56,12 @@ enabled.
 The standalone control ABI is `YZ_IOCTL_*` with ioctl magic `'Y'` only. It does
 not accept the integrated YukiSU/YukiZygisk `KSU_IOCTL_YZ_*`/`'K'` ABI.
 
-The default package is a normal module containing `zygiskd64`, `zygiskd32`,
-the arm64 `yzctl` control client,
-paired `libzygisk64.so`/`libzygisk32.so`,
-`libyukilinker64.so`/`libyukilinker32.so`, and
-`libyukizncore64.so`/`libyukizncore32.so` payloads, plus a KMI-specific LKM
-directory. A local test package may contain one `lkm/<kmi>_yukizygisk.ko`:
+The default package is a normal module using the conventional Zygisk layout:
+`bin/zygiskd64`, `bin/zygiskd32`, and the arm64 `bin/yzctl` control client;
+the matching 64-bit payloads are under `lib64/`, and the 32-bit payloads are
+under `lib/`. The installed module also provides `bin/zygiskd` as a symlink to
+the active 64-bit daemon. A KMI-specific LKM directory is included, and a
+local test package may contain one `lkm/<kmi>_yukizygisk.ko`:
 
 ```bash
 ./build.sh package -k android15-6.6

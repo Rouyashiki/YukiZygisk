@@ -124,22 +124,30 @@ random_cookie() {
 
 COOKIE="$(random_cookie)"
 
-chmod 0755 "$MODDIR/zygiskd64" "$MODDIR/zygiskd32" "$MODDIR/yzctl" \
+chmod 0755 "$MODDIR/bin/zygiskd64" "$MODDIR/bin/zygiskd32" "$MODDIR/bin/yzctl" \
 	2>/dev/null || true
 
-for lib in libzygisk64.so libzygisk32.so libyukilinker64.so \
-	libyukilinker32.so libyukizncore64.so libyukizncore32.so; do
-	if [ ! -f "$MODDIR/$lib" ]; then
-		log "missing payload $lib"
+copy_payload() {
+	source="$1"
+	destination="$2"
+	if [ ! -f "$source" ]; then
+		log "missing payload ${source##*/}"
 		exit 0
 	fi
-	if ! cp "$MODDIR/$lib" "$LIB_DIR/$lib.tmp" 2>>"$LOG_FILE"; then
-		log "copy $lib failed"
+	if ! cp "$source" "$LIB_DIR/$destination.tmp" 2>>"$LOG_FILE"; then
+		log "copy ${source##*/} failed"
 		exit 0
 	fi
-	mv "$LIB_DIR/$lib.tmp" "$LIB_DIR/$lib" 2>>"$LOG_FILE" || exit 0
-	chmod 0644 "$LIB_DIR/$lib" 2>/dev/null || true
-done
+	mv "$LIB_DIR/$destination.tmp" "$LIB_DIR/$destination" 2>>"$LOG_FILE" || exit 0
+	chmod 0644 "$LIB_DIR/$destination" 2>/dev/null || true
+}
+
+copy_payload "$MODDIR/lib64/libzygisk.so" libzygisk64.so
+copy_payload "$MODDIR/lib64/libyukilinker.so" libyukilinker64.so
+copy_payload "$MODDIR/lib64/libyukizncore.so" libyukizncore64.so
+copy_payload "$MODDIR/lib/libzygisk.so" libzygisk32.so
+copy_payload "$MODDIR/lib/libyukilinker.so" libyukilinker32.so
+copy_payload "$MODDIR/lib/libyukizncore.so" libyukizncore32.so
 
 if ! rm -f "$LIB_DIR/libzygisk.so" "$LIB_DIR/libyukilinker.so" \
 	"$LIB_DIR/libyukizncore.so" 2>>"$LOG_FILE"; then
@@ -171,6 +179,6 @@ YUKIZYGISK_BOOTSTRAP_COOKIE_LO="$COOKIE" \
 YUKIZYGISK_CONFIG="$CONFIG_FILE" \
 YUKIZYGISK_LOG_DIR="$RUNTIME_LOG_DIR" \
 YUKIZYGISK_MODULES_DIR="$MODULES_DIR" \
-"$MODDIR/zygiskd64" >>"$LOG_FILE" 2>&1 &
+"$MODDIR/bin/zygiskd64" >>"$LOG_FILE" 2>&1 &
 
 exit 0

@@ -12,7 +12,7 @@ LOG_FILE="/data/adb/yukizygisk/zygiskd.log"
 
 echo "YukiZygisk status"
 echo
-if ! "$MODDIR/yzctl" status 2>/dev/null; then
+if ! "$MODDIR/bin/yzctl" status 2>/dev/null; then
 	echo "kernel control is unavailable"
 fi
 
