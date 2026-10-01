@@ -16,6 +16,7 @@
 #include "root_policy.hpp"
 #include "uapi/yukizygisk.h"
 #include "userspace/zygisk/load_policy.hpp"
+#include "userspace/zygisk/settings.hpp"
 
 #include "json.hpp"
 
@@ -1289,7 +1290,6 @@ uint32_t query_flags(uint32_t uid) {
 
 void read_yzconfig() {
   yz_config cfg = yukizygisk::config::defaults;
-  bool crash_protection = false;
   int fd = open(yzhost::config_path().c_str(), O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     std::string buf;
@@ -1312,12 +1312,11 @@ void read_yzconfig() {
       }
       if (root.contains("dmesg_log"))
         cfg.dmesg_log = root.at("dmesg_log").as_bool() ? 1 : 0;
-      crash_protection = root.at("crash_protection").type == json::Type::Bool &&
-                         root.at("crash_protection").as_bool();
     }
   }
   g_yz_config = cfg;
-  g_crash_monitor.set_protection_enabled(crash_protection);
+  g_crash_monitor.set_protection_enabled(
+      yukizygisk::settings::protection_enabled(yzhost::config_path()));
 #if defined(YUKIZYGISK_RUNTIME_LOG)
   zygiskd::logging::set_kernel_mirror(cfg.dmesg_log != 0);
 #endif

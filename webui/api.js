@@ -19,7 +19,7 @@ export const DEFAULT_CONFIG = {
   anonymous_memory: true,
   denylist_mode: 0,
   dmesg_log: false,
-  crash_protection: false,
+  crash_protection: true,
 };
 
 export const DEFAULT_STATUS = {
@@ -39,7 +39,7 @@ export const DEFAULT_STATUS = {
   anonymous_memory: true,
   denylist_mode: 0,
   dmesg_log: false,
-  crash_protection: false,
+  crash_protection: true,
   recent: [],
   zygotes: [],
   zygote_monitor: [],
@@ -76,7 +76,7 @@ function normalizeConfig(value = {}) {
     anonymous_memory: value.anonymous_memory !== false,
     denylist_mode: [0, 1, 2].includes(mode) ? mode : 0,
     dmesg_log: value.dmesg_log === true,
-    crash_protection: value.crash_protection === true,
+    crash_protection: value.crash_protection !== false,
   };
 }
 
@@ -133,7 +133,7 @@ const mockState = {
     anonymous_memory: true,
     denylist_mode: 1,
     dmesg_log: false,
-    crash_protection: false,
+    crash_protection: true,
   },
   status: normalizeStatus({
     kernel_alive: true,
