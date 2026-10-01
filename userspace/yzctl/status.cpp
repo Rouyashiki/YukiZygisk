@@ -69,7 +69,7 @@ struct NativeModuleView {
   uint8_t target_type = 0;
   std::string target;
   bool has_companion = false;
-  std::string state = "failed";
+  std::string state = "unknown";
 };
 
 template <size_t Size> std::string bounded_string(const char (&value)[Size]) {
@@ -96,10 +96,13 @@ const char *runtime_state_name(uint8_t state) {
   case YZ_RUNTIME_STATE_EXITED:
     return nullptr;
   case YZ_RUNTIME_STATE_DETECTED:
+    return "detected";
   case YZ_RUNTIME_STATE_REDIRECTED:
+    return "redirected";
   case YZ_RUNTIME_STATE_FAILED:
-  default:
     return "failed";
+  default:
+    return "unknown";
   }
 }
 
@@ -341,9 +344,15 @@ build_native_injections(const RuntimeSnapshot &snapshot,
         continue;
       const yz_runtime_record *ready =
           find_ready_record(snapshot, base, module.module_id);
-      const char *state = ready != nullptr ? runtime_state_name(ready->state)
-                          : base.state == YZ_RUNTIME_STATE_SAFEMODE ? "crashed"
-                                                                    : "failed";
+      // A captured process without a module report is not proof of failure.
+      // Another module may have reported success for the same base record.
+      const char *state = "unknown";
+      if (ready != nullptr)
+        state = runtime_state_name(ready->state);
+      else if (base.state == YZ_RUNTIME_STATE_SAFEMODE)
+        state = "crashed";
+      else if (base.state == YZ_RUNTIME_STATE_FAILED)
+        state = "failed";
       if (state == nullptr)
         continue;
       injections.push_back(NativeInjection{
@@ -379,7 +388,7 @@ std::string aggregate_state(const std::string &module_id, uint8_t target_type,
   }
   if (failed)
     return "failed";
-  return injected ? "injected" : "failed";
+  return injected ? "injected" : "unknown";
 }
 
 std::vector<NativeModuleView>

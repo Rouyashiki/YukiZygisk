@@ -395,6 +395,7 @@ function Stage-Module {
 	New-Item -ItemType Directory -Path $zipDir | Out-Null
 
 	Copy-Item -Path (Join-Path $moduleTemplate '*') -Destination $zipDir -Recurse
+	New-Item -ItemType Directory -Path (Join-Path $zipDir 'webroot') -Force | Out-Null
 	Copy-Item -Path (Join-Path $webuiSource '*') -Destination (Join-Path $zipDir 'webroot') -Recurse
 	Stamp-ModuleProp -Source (Join-Path $moduleTemplate 'module.prop') -Destination (Join-Path $zipDir 'module.prop')
 

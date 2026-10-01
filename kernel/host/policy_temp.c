@@ -210,8 +210,9 @@ static int yz_policy_temp_plan_allow_locked(const struct yz_policy_key *key,
 		*state_av = 0;
 	if (commit_av)
 		*commit_av = 0;
+	/* An overlapping file/tmpfs key is acquired through the tmpfs role. */
 	if (!required_av)
-		return -ENOENT;
+		return 0;
 
 	direct_av = yz_policy_base_direct_allowed_av(key);
 	owned_av = yz_policy_temp_mask_locked(key);

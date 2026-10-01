@@ -166,8 +166,8 @@ function renderZygiskModuleCards() {
   return standard.map((name) => `<article class="module-card"><div class="module-mark">Z</div><div><strong>${escapeHtml(name)}</strong><span>Zygisk API</span>${crashEvidenceDetails(name)}</div>${stateBadge((state.status.suspended_modules || []).includes(name) ? "suspended" : "injected")}</article>`).join("");
 }
 
-function combinedNativeState(items, fallback = "failed") {
-  for (const candidate of ["crashed", "failed", "unsupported32", "injected"])
+function combinedNativeState(items, fallback = "unknown") {
+  for (const candidate of ["crashed", "failed", "injected", "unsupported32"])
     if (items.some((item) => item.state === candidate))
       return candidate;
   return fallback;
@@ -178,7 +178,8 @@ function renderNativeModules(injections) {
   if (!modules.length)
     return emptyState(t("status.noNativeModules"));
   return modules.map((module) => {
-    const targets = injections.filter((item) => item.module === module.id);
+    const targets = injections.filter((item) => item.module === module.id
+      && item.target_type === module.target_type && item.target === module.target);
     const detail = `${module.target_type}=${module.target} · ${t("status.nativeProcessCount", "", { count: targets.length })}`;
     return `<article class="module-card native"><div class="module-mark">N</div><div><strong>${escapeHtml(module.id)}</strong><span>${escapeHtml(detail)}</span>${crashEvidenceDetails(module.id)}</div>${stateBadge(combinedNativeState(targets, module.state))}</article>`;
   }).join("");
@@ -210,7 +211,7 @@ function renderNativeProcesses(injections) {
     a.process.localeCompare(b.process) || Number(a.pid) - Number(b.pid));
   if (!processes.length)
     return emptyState(t("status.noNativeInjections"));
-  return processes.map((item) => `<div class="data-row native-row"><div class="identity"><strong>${escapeHtml(item.process)}</strong><span>${escapeHtml(item.modules.join(" · "))} · ${escapeHtml(item.abi)}</span></div><code>PID ${escapeHtml(item.pid)}</code>${stateBadge(combinedNativeState(item.records, "injected"))}</div>`).join("");
+  return processes.map((item) => `<div class="data-row native-row"><div class="identity"><strong>${escapeHtml(item.process)}</strong><span>${escapeHtml(item.modules.join(" · "))} · ${escapeHtml(item.abi)}</span></div><code>PID ${escapeHtml(item.pid)}</code>${stateBadge(combinedNativeState(item.records))}</div>`).join("");
 }
 
 function nativeViewToggle() {
