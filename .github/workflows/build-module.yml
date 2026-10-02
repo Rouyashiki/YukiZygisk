@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# YukiZygisk all-KMI module build and packaging workflow.
+# YukiZygisk all-KMI module build, packaging, and release workflow.
 #
 # License: Apache-2.0
 #
@@ -120,6 +120,251 @@ jobs:
           name: YukiZygisk-module-all-kmi-arm64-v8a
           path: build/out/YukiZygisk-*-all-kmi-arm64-v8a.zip
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      version_code: ${{ steps.package.outputs.version_code }}
+    steps:
+      - name: Download module package
+        uses: actions/download-artifact@v7
+        with:
+          name: YukiZygisk-module-all-kmi-arm64-v8a
+          path: dist
+
+      - name: Read package version and generate checksum
+        id: package
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(YukiZygisk-*-all-kmi-arm64-v8a.zip)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "Expected exactly one all-KMI YukiZygisk package."
+            exit 1
+          fi
+
+          module_prop="$(unzip -p "${packages[0]}" module.prop | tr -d '\r')"
+          version="$(sed -n 's/^version=//p' <<< "$module_prop")"
+          version_code="$(sed -n 's/^versionCode=//p' <<< "$module_prop")"
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]
+          [[ "$version_code" =~ ^[0-9]+$ ]]
+          [[ "$version" == *-"$version_code" ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          sha256sum "${packages[0]}" > SHA256SUMS
+
+      - name: Publish package as github-actions bot
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ci-${{ github.run_id }}
+          target_commitish: ${{ github.sha }}
+          name: YukiZygisk ${{ steps.package.outputs.version }} (CI ${{ github.run_number }})
+          prerelease: ${{ github.ref != 'refs/heads/main' }}
+          make_latest: ${{ github.ref == 'refs/heads/main' && 'legacy' || 'false' }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/YukiZygisk-*-all-kmi-arm64-v8a.zip
+            dist/SHA256SUMS
+          body: |
+            Automated all-KMI module build.
+
+            - Version: `${{ steps.package.outputs.version }}`
+            - Version code: `${{ steps.package.outputs.version_code }}`
+            - Ref: `${{ github.ref_name }}`
+            - Commit: `${{ github.sha }}`
+            - Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  publish-update:
+    name: Publish Cloudflare update feed
+    needs: release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: yukizygisk-updates-main
+      queue: max
+      cancel-in-progress: false
+    env:
+      UPDATE_URL: https://ci.yukizygisk.anatdx.com/update.json
+      VERSION: ${{ needs.release.outputs.version }}
+      VERSION_CODE: ${{ needs.release.outputs.version_code }}
+    steps:
+      - name: Skip versions already published
+        id: update
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          candidate = int(os.environ["VERSION_CODE"])
+          url = f'{os.environ["UPDATE_URL"]}?run={os.environ["GITHUB_RUN_ID"]}&attempt={os.environ["GITHUB_RUN_ATTEMPT"]}'
+          request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  current = json.load(response)["versionCode"]
+              if type(current) is not int or current <= 0:
+                  raise SystemExit("Published update.json has an invalid versionCode")
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              current = 0
+
+          publish = candidate > current
+          print(f'Published versionCode: {current}; candidate: {candidate}; publish: {publish}')
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f'publish={str(publish).lower()}\n')
+          PY
+
+      - name: Checkout release commit
+        if: steps.update.outputs.publish == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download released module package
+        if: steps.update.outputs.publish == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: YukiZygisk-module-all-kmi-arm64-v8a
+          path: dist
+
+      - name: Prepare versioned package and changelog
+        if: steps.update.outputs.publish == 'true'
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          packages = list(Path("dist").glob("YukiZygisk-*-all-kmi-arm64-v8a.zip"))
+          if len(packages) != 1:
+              raise SystemExit("Expected exactly one all-KMI module ZIP")
+          package = packages[0]
+          if not 0 < package.stat().st_size <= 25 * 1024 * 1024:
+              raise SystemExit("Module ZIP must be nonempty and fit the Pages 25 MiB file limit")
+          with zipfile.ZipFile(package) as archive:
+              prop = dict(line.split("=", 1) for line in archive.read("module.prop").decode().splitlines() if "=" in line)
+          version = os.environ["VERSION"]
+          version_code = int(os.environ["VERSION_CODE"])
+          if prop.get("version") != version or prop.get("versionCode") != str(version_code):
+              raise SystemExit("Package metadata does not match the published Release")
+          if prop.get("updateJson") != os.environ["UPDATE_URL"]:
+              raise SystemExit("Package updateJson does not match the update feed")
+
+          payload = Path("pages-payload")
+          payload.mkdir()
+          shutil.copy2(package, payload / package.name)
+          digest = hashlib.sha256(package.read_bytes()).hexdigest()
+          (payload / "SHA256SUMS").write_text(f'{digest}  {package.name}\n', encoding="utf-8")
+          changes = subprocess.check_output(
+              ["git", "log", "-1", "--format=%B", os.environ["GITHUB_SHA"]], text=True, encoding="utf-8"
+          ).strip()
+          repo_url = f'{os.environ["GITHUB_SERVER_URL"]}/{os.environ["GITHUB_REPOSITORY"]}'
+          changelog = (
+              f'# YukiZygisk {version}\n\n'
+              f'- Version code: `{version_code}`\n'
+              f'- [Release]({repo_url}/releases/tag/ci-{os.environ["GITHUB_RUN_ID"]})\n'
+              f'- [Commit]({repo_url}/commit/{os.environ["GITHUB_SHA"]})\n'
+              f'- SHA-256: `{digest}`\n\n'
+              f'## Changes\n\n{changes}\n'
+          )
+          (payload / "changelog.md").write_text(changelog, encoding="utf-8")
+          (payload / "_headers").write_text(
+              "/update.json\n  Cache-Control: no-store\n/changelog.md\n  Cache-Control: no-cache\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload immutable update assets
+        if: steps.update.outputs.publish == 'true'
+        id: assets
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy pages-payload --project-name=yukizygiskupdates --branch=ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Generate module update JSON
+        if: steps.update.outputs.publish == 'true'
+        env:
+          ASSET_URL: ${{ steps.assets.outputs.deployment-url }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import quote
+
+          base = os.environ["ASSET_URL"].rstrip("/")
+          if not re.fullmatch(r"https://[a-f0-9]+\.yukizygiskupdates\.pages\.dev", base):
+              raise SystemExit("Wrangler did not return an immutable Pages deployment URL")
+          payload = Path("pages-payload")
+          package, = payload.glob("YukiZygisk-*-all-kmi-arm64-v8a.zip")
+          metadata = {
+              "version": os.environ["VERSION"],
+              "versionCode": int(os.environ["VERSION_CODE"]),
+              "zipUrl": f'{base}/{quote(package.name)}',
+              "changelog": f'{base}/changelog.md',
+          }
+          (payload / "update.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Deploy production update feed
+        if: steps.update.outputs.publish == 'true'
+        id: pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy pages-payload --project-name=yukizygiskupdates --branch=main
+
+      - name: Verify public update feed
+        if: steps.update.outputs.publish == 'true'
+        env:
+          PAGES_ENVIRONMENT: ${{ steps.pages.outputs.pages-environment }}
+        run: |
+          set -euo pipefail
+          if [ "$PAGES_ENVIRONMENT" != production ]; then
+            echo "Set the yukizygiskupdates Pages production branch to main."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          expected = json.loads(Path("pages-payload/update.json").read_text(encoding="utf-8"))
+          for attempt in range(6):
+              try:
+                  url = f'{os.environ["UPDATE_URL"]}?run={os.environ["GITHUB_RUN_ID"]}&check={attempt}'
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      if json.load(response) == expected:
+                          print(f'Update feed verified: {os.environ["UPDATE_URL"]}')
+                          break
+              except (urllib.error.URLError, ValueError) as error:
+                  print(f'Waiting for the public update feed: {error}')
+              if attempt == 5:
+                  raise SystemExit("Public update feed does not match this deployment; check the Pages custom domain")
+              time.sleep(5)
+          PY
 
   post-telegram:
     name: Post package to Telegram

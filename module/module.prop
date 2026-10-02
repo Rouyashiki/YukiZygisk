@@ -4,3 +4,4 @@ version=v0.2.0
 versionCode=1
 author=Anatdx
 description=Standalone kernel-level Zygisk with WebUI control and telemetry
+updateJson=https://ci.yukizygisk.anatdx.com/update.json
