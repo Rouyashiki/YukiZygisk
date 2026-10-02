@@ -75,9 +75,14 @@ The script then starts the daemon with the same bootstrap cookie. This gives
 up early-native injection by default; that capability can remain a future
 optional host backend rather than the baseline standalone path.
 
-The packaged WebUI has three pages: device/injection status, configuration,
-and about/credits. It reads kernel-owned runtime state and requests reloads
-through `yzctl`; zygiskd is not a manager or user control interface. The WebUI
+The packaged Material 3 Expressive WebUI has four pages: device/injection status, Zygisk
+and Native modules, settings, and about/credits. Settings save immediately
+through `yzctl`, with serialized updates and visible failure feedback. The
+interface supports light/dark appearance and the host's dynamic Material
+palette, connected setting groups, press ripples, and navigation transitions.
+Its controls and icons are bundled locally. It reads kernel-owned
+runtime state and requests reloads through `yzctl`; zygiskd is not a manager
+or user control interface. The WebUI
 does not own a separately configured denylist. The
 preferred path asks the accepted KernelSU or KernelPatch backend through a
 CFI-safe kernel callable. If that callable cannot be resolved, the kernel asks
@@ -86,3 +91,17 @@ ioctl/prctl policy API or parses APatch's `package_config`, then atomically
 hands a bounded snapshot back through a sealed memfd on the authenticated
 anonymous control fd. The WebUI only selects whether matching processes skip
 injection or keep injection before mount cleanup.
+
+## WebUI Development
+
+The packaged frontend is static; normal module builds copy `webui/` without
+requiring Node.js. To rebuild its pinned Material and Lucide assets:
+
+```bash
+npm ci --prefix tools/webui
+npm run build --prefix tools/webui
+```
+
+For interactive preview, run `python -m http.server 4173` from the
+repository and open `http://127.0.0.1:4173/webui/?mock=1`. Browser preview data
+does not establish Android runtime behavior.

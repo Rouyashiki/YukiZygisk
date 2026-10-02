@@ -1,0 +1,18 @@
+{
+  "name": "yukizygisk-webui-assets",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@material/web": "2.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "fast-xml-parser": "5.11.2",
+    "lucide-static": "1.49.0"
+  }
+}

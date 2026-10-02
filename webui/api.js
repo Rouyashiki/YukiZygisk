@@ -65,6 +65,12 @@ function output(result) {
   return String(result?.stdout || result?.stderr || "").trim();
 }
 
+function commandError(result, fallback) {
+  const error = new Error(output(result) || fallback);
+  error.errno = result.errno;
+  return error;
+}
+
 function shellEscape(value) {
   return String(value ?? "").replace(/'/g, "'\\''");
 }
@@ -123,7 +129,7 @@ async function writeConfig(config) {
     .map((value) => "'" + shellEscape(value) + "'").join(" ");
   const result = await exec(command);
   if (result.errno !== 0)
-    throw new Error(output(result) || "failed to write yzconfig.json");
+    throw commandError(result, "failed to write yzconfig.json");
   return normalized;
 }
 
@@ -193,6 +199,9 @@ const mockApi = {
       selinux: "Enforcing",
     };
   },
+  async getSelinux() {
+    return "Enforcing";
+  },
   async getModuleMeta() {
     return {
       id: "yukizygisk",
@@ -219,7 +228,7 @@ async function queryStatus() {
 async function reloadRuntime() {
   const result = await exec(`'${shellEscape(PATHS.CONTROL)}' reload`);
   if (result.errno !== 0)
-    throw new Error(output(result) || "kernel reload failed");
+    throw commandError(result, "kernel reload failed");
 }
 
 const realApi = {
@@ -230,12 +239,15 @@ const realApi = {
 
   async loadConfig() {
     const result = await exec("'" + shellEscape(PATHS.CONTROL) + "' config get");
-    if (result.errno !== 0 || !result.stdout.trim())
-      return clone(DEFAULT_CONFIG);
+    if (result.errno !== 0)
+      throw commandError(result, "failed to read yzconfig.json");
     try {
-      return normalizeConfig(JSON.parse(result.stdout));
-    } catch (_error) {
-      return clone(DEFAULT_CONFIG);
+      const config = JSON.parse(result.stdout);
+      if (!config || typeof config !== "object" || Array.isArray(config))
+        throw new Error("expected a configuration object");
+      return normalizeConfig(config);
+    } catch (error) {
+      throw new Error(`invalid configuration JSON from yzctl: ${error.message}`);
     }
   },
 
@@ -250,27 +262,100 @@ const realApi = {
   },
 
   async getSystemInfo() {
-    const [model, release, sdk, kernel, selinux] = await Promise.all([
-      exec("getprop ro.product.model"),
-      exec("getprop ro.build.version.release"),
-      exec("getprop ro.build.version.sdk"),
-      exec("uname -r"),
-      exec("getenforce 2>/dev/null || echo Unknown"),
-    ]);
-    const androidRelease = output(release) || "Unknown";
-    const apiLevel = output(sdk);
+    const result = await exec("printf '%s\\n' \"$(getprop ro.product.model)\" \"$(getprop ro.build.version.release)\" \"$(getprop ro.build.version.sdk)\" \"$(uname -r)\" \"$(getenforce 2>/dev/null || echo Unknown)\"");
+    if (result.errno !== 0)
+      throw commandError(result, "failed to read device information");
+    const [model, release, sdk, kernel, selinux] = String(result.stdout || "").split(/\r?\n/);
+    const androidRelease = release || "Unknown";
+    const apiLevel = sdk;
     return {
-      model: output(model) || "Unknown",
+      model: model || "Unknown",
       android: apiLevel ? `Android ${androidRelease} (API ${apiLevel})` : `Android ${androidRelease}`,
-      kernel: output(kernel) || "Unknown",
-      selinux: output(selinux) || "Unknown",
+      kernel: kernel || "Unknown",
+      selinux: selinux || "Unknown",
     };
+  },
+
+  async getSelinux() {
+    const result = await exec("getenforce");
+    if (result.errno !== 0)
+      throw commandError(result, "failed to read SELinux state");
+    return output(result) || "Unknown";
   },
 
   async getModuleMeta() {
     const result = await exec(`cat '${shellEscape(PATHS.MODULE)}/module.prop' 2>/dev/null`);
+    if (result.errno !== 0)
+      throw commandError(result, "failed to read module metadata");
     return parseModuleProp(result.stdout);
   },
 };
 
-export const api = runtimeMode === "mock" ? mockApi : realApi;
+const backend = runtimeMode === "mock" ? mockApi : realApi;
+const pendingReads = new Map();
+let mutationTail = Promise.resolve();
+let moduleMeta;
+
+function readOnce(key, read) {
+  let pending = pendingReads.get(key);
+  if (!pending) {
+    pending = Promise.resolve().then(read);
+    pendingReads.set(key, pending);
+    const clear = () => {
+      if (pendingReads.get(key) === pending)
+        pendingReads.delete(key);
+    };
+    pending.then(clear, clear);
+  }
+  return pending.then(clone);
+}
+
+function mutate(write) {
+  const pending = mutationTail.then(async () => {
+    pendingReads.delete("status");
+    pendingReads.delete("config");
+    try {
+      return await write();
+    } finally {
+      pendingReads.delete("status");
+      pendingReads.delete("config");
+    }
+  });
+  mutationTail = pending.catch(() => {});
+  return pending;
+}
+
+export const api = {
+  getStatus() {
+    return readOnce("status", async () => {
+      await mutationTail;
+      return backend.getStatus();
+    });
+  },
+  loadConfig() {
+    return readOnce("config", async () => {
+      await mutationTail;
+      return backend.loadConfig();
+    });
+  },
+  saveConfig(config) {
+    const snapshot = normalizeConfig(config);
+    return mutate(() => backend.saveConfig(snapshot));
+  },
+  reload() {
+    return mutate(() => backend.reload());
+  },
+  getSystemInfo() {
+    return readOnce("system", () => backend.getSystemInfo());
+  },
+  getSelinux() {
+    return readOnce("selinux", () => backend.getSelinux());
+  },
+  getModuleMeta() {
+    return readOnce("meta", async () => {
+      if (!moduleMeta)
+        moduleMeta = await backend.getModuleMeta();
+      return moduleMeta;
+    });
+  },
+};

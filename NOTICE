@@ -35,5 +35,25 @@ Third-party components
   - The WebUI bridge and static frontend structure are adapted from
     KOWX712/ksu-webui-demo under the MIT License. Copyright (c) 2025 KOWX712.
     The license is included in webui/LICENSE and packaged with the WebUI.
+  - Material Web 2.5.0 is by Google LLC and is distributed under Apache-2.0.
+    Its selected components are bundled in webui/assets/material.js with
+    their original copyright notices. The complete license is included in
+    webui/assets/LICENSE.material. Source: https://github.com/material-components/material-web
+  - The Material Web bundle includes Lit and its supporting packages by
+    Google LLC under BSD-3-Clause, and tslib by Microsoft Corporation under
+    0BSD. Their licenses are included in webui/assets/LICENSE.lit and
+    webui/assets/LICENSE.tslib. Sources: https://github.com/lit/lit and
+    https://github.com/microsoft/tslib
+  - The WebUI icon sprite uses Lucide 1.49.0 under ISC. Copyright (c) 2026
+    Lucide Icons and Contributors. Included Feather-derived icons retain
+    the MIT License. Copyright (c) 2013-present Cole Bemis. Both original
+    licenses are included in webui/assets/LICENSE.lucide.
+    Source: https://github.com/lucide-icons/lucide
+  - The Zygote Adb icon is from AndroidX Compose Material Icons 1.7.8.
+    Copyright 2025 The Android Open Source Project. Apache-2.0.
+    Its source and attribution are retained in tools/webui/icons/adb.svg;
+    the complete license is included in webui/assets/LICENSE.material.
+    Source: androidx.compose.material:material-icons-extended-android:1.7.8,
+    commonMain/androidx/compose/material/icons/filled/Adb.kt.
 
 SPDX-License-Identifier: Apache-2.0 OR GPL-2.0

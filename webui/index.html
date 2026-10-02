@@ -9,7 +9,7 @@
     <meta charset="utf-8">
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     >
     <meta name="color-scheme" content="light dark">
     <link rel="icon" type="image/svg+xml" href="./icon.svg">
@@ -22,11 +22,14 @@
       <div class="boot-panel">
         <img src="./icon.svg" alt="" width="52" height="52">
         <div>
-          <div class="boot-mark">YUKIZYGISK</div>
-          <p>Preparing the control surface…</p>
+          <div class="boot-mark">YukiZygisk</div>
         </div>
       </div>
     </div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
+    <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-header"><h2 id="dialog-title"></h2><md-icon-button data-action="close-dialog" aria-label="Close"></md-icon-button></div>
+      <div id="dialog-body" class="dialog-body"></div>
+    </dialog>
   </body>
 </html>
