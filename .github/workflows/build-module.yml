@@ -194,6 +194,7 @@ jobs:
       cancel-in-progress: false
     env:
       UPDATE_URL: https://ci.yukizygisk.anatdx.com/update.json
+      UPDATE_USER_AGENT: YukiZygisk-CI/1.0 (+${{ github.server_url }}/${{ github.repository }})
       VERSION: ${{ needs.release.outputs.version }}
       VERSION_CODE: ${{ needs.release.outputs.version_code }}
     steps:
@@ -209,7 +210,10 @@ jobs:
 
           candidate = int(os.environ["VERSION_CODE"])
           url = f'{os.environ["UPDATE_URL"]}?run={os.environ["GITHUB_RUN_ID"]}&attempt={os.environ["GITHUB_RUN_ATTEMPT"]}'
-          request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+          request = urllib.request.Request(url, headers={
+              "User-Agent": os.environ["UPDATE_USER_AGENT"],
+              "Cache-Control": "no-cache",
+          })
           try:
               with urllib.request.urlopen(request, timeout=30) as response:
                   current = json.load(response)["versionCode"]
@@ -355,7 +359,11 @@ jobs:
           for attempt in range(6):
               try:
                   url = f'{os.environ["UPDATE_URL"]}?run={os.environ["GITHUB_RUN_ID"]}&check={attempt}'
-                  with urllib.request.urlopen(url, timeout=15) as response:
+                  request = urllib.request.Request(url, headers={
+                      "User-Agent": os.environ["UPDATE_USER_AGENT"],
+                      "Cache-Control": "no-cache",
+                  })
+                  with urllib.request.urlopen(request, timeout=15) as response:
                       if json.load(response) == expected:
                           print(f'Update feed verified: {os.environ["UPDATE_URL"]}')
                           break
