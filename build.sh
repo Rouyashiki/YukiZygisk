@@ -217,13 +217,12 @@ check_package_deps() {
 }
 
 compute_version() {
-	local tag count
-	tag="$(git -C "$PROJECT_ROOT" describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")"
-	tag="${tag#v}"
-	[[ -n "$tag" ]] || tag="0.1.0"
+	local version count
+	version="$(sed -n 's/^version=//p' "$PROJECT_ROOT/module/module.prop" | tr -d '\r')"
+	[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid base version in module/module.prop: $version"
 	count="$(git -C "$PROJECT_ROOT" rev-list --count HEAD 2>/dev/null || echo "0")"
 	VERSION_CODE=$((count + 10000))
-	VERSION_NAME="v${tag}-${VERSION_CODE}"
+	VERSION_NAME="${version}-${VERSION_CODE}"
 	export VERSION_NAME VERSION_CODE
 }
 

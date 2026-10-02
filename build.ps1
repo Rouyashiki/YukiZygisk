@@ -208,24 +208,16 @@ function Resolve-BuildTools {
 }
 
 function Get-ComputeVersion {
-	$tag = '0.1.0'
-	$rawTag = $null
-	try {
-		$rawTag = & git -C $script:RepoRoot describe --tags --abbrev=0 2>$null
-		if ($LASTEXITCODE -ne 0 -or -not $rawTag) {
-			$rawTag = $null
-		}
+	$moduleVersionLine = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'module\module.prop') |
+		Where-Object { $_ -match '^version=' } | Select-Object -First 1
+	if (-not $moduleVersionLine -or $moduleVersionLine -notmatch '^version=(v[0-9]+\.[0-9]+\.[0-9]+)$') {
+		throw 'Invalid base version in module/module.prop; expected vMAJOR.MINOR.PATCH.'
 	}
-	catch {
-		$rawTag = $null
-	}
-	if ($rawTag) {
-		$tag = [string]$rawTag.TrimStart('v')
-	}
+	$baseVersion = $Matches[1]
 	$revCount = & git -C $script:RepoRoot rev-list --count HEAD
 	if ($LASTEXITCODE -ne 0) { $revCount = '0' }
 	$versionCode = [int]$revCount + 10000
-	$script:VersionName = "v$tag-$versionCode"
+	$script:VersionName = "$baseVersion-$versionCode"
 	$script:VersionCode = [string]$versionCode
 }
 

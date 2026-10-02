@@ -7,7 +7,7 @@
 # Author: Anatdx
 
 cmake_minimum_required(VERSION 3.22)
-project(YukiZygisk VERSION 0.1 LANGUAGES C CXX ASM)
+project(YukiZygisk VERSION 0.2.0 LANGUAGES C CXX ASM)
 
 # Drop package artifacts left by releases from before filenames became
 # ABI-explicit. The build script also performs this cleanup before staging.

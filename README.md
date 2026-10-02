@@ -67,6 +67,9 @@ local test package may contain one `lkm/<kmi>_yukizygisk.ko`:
 ./build.sh package -k android15-6.6
 ```
 
+Package versions use the base version in `module/module.prop`, followed by
+`10000 + git rev-list --count HEAD`, for example `v0.2.0-10075`.
+
 A release package contains all supported KMIs and is produced with
 `./build.sh package --all-kmis` (or by CI's parallel matrix). During install
 and `post-fs-data`, the module derives the exact GKI KMI from `uname -r` and
