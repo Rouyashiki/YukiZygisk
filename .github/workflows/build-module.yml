@@ -293,30 +293,16 @@ jobs:
           )
           PY
 
-      - name: Upload immutable update assets
-        if: steps.update.outputs.publish == 'true'
-        id: assets
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy pages-payload --project-name=yukizygiskupdates --branch=ci-${{ github.run_id }}-${{ github.run_attempt }}
-
       - name: Generate module update JSON
         if: steps.update.outputs.publish == 'true'
-        env:
-          ASSET_URL: ${{ steps.assets.outputs.deployment-url }}
         run: |
           python3 - <<'PY'
           import json
           import os
-          import re
           from pathlib import Path
           from urllib.parse import quote
 
-          base = os.environ["ASSET_URL"].rstrip("/")
-          if not re.fullmatch(r"https://[a-f0-9]+\.yukizygiskupdates\.pages\.dev", base):
-              raise SystemExit("Wrangler did not return an immutable Pages deployment URL")
+          base = os.environ["UPDATE_URL"].rsplit("/", 1)[0]
           payload = Path("pages-payload")
           package, = payload.glob("YukiZygisk-*-all-kmi-arm64-v8a.zip")
           metadata = {
