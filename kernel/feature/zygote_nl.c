@@ -59,6 +59,11 @@ void yz_zygote_nl_emit_reload(void)
 	yz_zygote_nl_emit_event(YZ_EV_RELOAD, 0, 0);
 }
 
+void yz_zygote_nl_emit_viola_recovery(u32 owner)
+{
+	yz_zygote_nl_emit_event(YZ_EV_VIOLA_RECOVERY, owner, 0);
+}
+
 void yz_zygote_nl_emit_safemode(u32 pid, u32 crashes)
 {
 	yz_zygote_nl_emit_event(YZ_EV_SAFEMODE, pid, crashes);

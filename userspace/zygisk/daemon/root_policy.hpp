@@ -14,7 +14,8 @@
 
 namespace yzpolicy {
 
-bool setup(int control_fd, const yz_root_status_cmd &status);
+bool setup(int control_fd, const yz_root_status_cmd &status,
+           bool publish_cache = true);
 bool active();
 bool refresh(bool force);
 bool query_uid(uint32_t uid, bool *should_umount);

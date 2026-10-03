@@ -23,6 +23,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pid.h>
@@ -44,6 +45,8 @@
 #include <linux/workqueue.h>
 
 #include "host/host.h"
+#include "core/auth.h"
+#include <viola.h>
 #include "host/runtime.h"
 #include "klog.h" // IWYU pragma: keep
 #include "uapi/yukizygisk.h"
@@ -1532,8 +1535,9 @@ static void zp_cache_name(char *buf, size_t len)
 }
 
 /* Stage a private shmem payload fd in current. */
-static int zp_stage_fd(const char *path, const char *name,
-		       struct yz_file_load_policy *policy_state)
+static int zp_stage_image(const char *path, const char *name,
+			  struct yz_file_load_policy *policy_state,
+			  unsigned int core_role, bool compat)
 {
 	const struct cred *old_cred;
 	struct file *src, *mfd;
@@ -1587,6 +1591,14 @@ static int zp_stage_fd(const char *path, const char *name,
 
 	yz_file_close(src, NULL);
 
+	if (core_role) {
+		ret = yz_auth_check_payload(core_role, compat, buf, sz);
+		if (ret) {
+			kvfree(buf);
+			return ret;
+		}
+	}
+
 	mfd = shmem_file_setup(name, sz, 0);
 	if (IS_ERR(mfd)) {
 		long err = PTR_ERR(mfd);
@@ -1615,6 +1627,13 @@ static int zp_stage_fd(const char *path, const char *name,
 		fput(mfd);
 		return r < 0 ? (int)r : -EIO;
 	}
+	if (core_role) {
+		ret = yz_auth_seal_image(mfd);
+		if (ret) {
+			fput(mfd);
+			return ret;
+		}
+	}
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
@@ -1637,6 +1656,13 @@ static int zp_stage_fd(const char *path, const char *name,
 	pr_info("zygote_probe: [2c-3b] staged %s (%lld bytes) -> fd=%d\n", path,
 		(long long)sz, fd);
 	return fd;
+}
+
+/* Third-party native modules retain their existing independent trust model. */
+static int zp_stage_fd(const char *path, const char *name,
+		       struct yz_file_load_policy *policy_state)
+{
+	return zp_stage_image(path, name, policy_state, 0, false);
 }
 
 /* Stage a real file-backed payload fd in current. */
@@ -1868,6 +1894,8 @@ enum zp_inject_kind {
 
 struct zp_inject_tw {
 	struct callback_head cb;
+	struct yz_auth_ticket ticket;
+	struct mm_struct *mm;
 	enum zp_inject_kind kind;
 	u8 native_target_type;
 	bool early_native;
@@ -2043,6 +2071,10 @@ static void zp_inject_tw_func(struct callback_head *cb)
 	u32 runtime_flags = native && tw->early_native ?
 				YZ_RUNTIME_F_EARLY_NATIVE : 0;
 
+	if (current->flags & PF_EXITING || current->mm != tw->mm ||
+	    !yz_auth_injection_ticket_alive(&tw->ticket))
+		goto out;
+
 	if (!native && yz_tango_is_process()) {
 		pr_info("yukizygisk: Tango host exec pid=%d; waiting for guest "
 			"RELRO\n",
@@ -2053,6 +2085,8 @@ static void zp_inject_tw_func(struct callback_head *cb)
 #ifdef CONFIG_COMPAT
 	compat = is_compat_task();
 #endif // #ifdef CONFIG_COMPAT
+	if (!yz_auth_injection_allowed(native && tw->early_native, compat))
+		goto out;
 	runtime_abi = compat ? YZ_RUNTIME_ABI_32 : YZ_RUNTIME_ABI_64;
 	zp_runtime_read_process(mm, process, sizeof(process));
 	if (native) {
@@ -2202,13 +2236,13 @@ static void zp_inject_tw_func(struct callback_head *cb)
 		zp_cache_name(loader_name, sizeof(loader_name));
 		zp_cache_name(core_name, sizeof(core_name));
 		if (yuki)
-			loader_fd = zp_stage_fd(loader_path, loader_name,
-						&native_policy);
-		else if (native)
-			loader_fd = zp_stage_file_fd(core_path, &native_policy);
+			loader_fd = zp_stage_image(loader_path, loader_name,
+				&native_policy, VIOLA_ROLE_LOADER, compat);
 		else
 			loader_fd =
-			    zp_stage_fd(core_path, core_name, &native_policy);
+			    zp_stage_image(core_path, core_name, &native_policy,
+					   native ? VIOLA_ROLE_NATIVE : VIOLA_ROLE_CORE,
+					   compat);
 		if (loader_fd < 0) {
 			pr_info("zygote_probe: [2c-3b] pid=%d socket=%s stage "
 				"loader "
@@ -2217,7 +2251,8 @@ static void zp_inject_tw_func(struct callback_head *cb)
 			goto out;
 		}
 		if (yuki) {
-			core_fd = zp_stage_fd(core_path, core_name, NULL);
+			core_fd = zp_stage_image(core_path, core_name, NULL,
+				native ? VIOLA_ROLE_NATIVE : VIOLA_ROLE_CORE, compat);
 		} else {
 			core_fd = loader_fd; /* dlopen the core directly */
 		}
@@ -2383,8 +2418,9 @@ static void zp_inject_tw_func(struct callback_head *cb)
 		    stub, stub + (compat ? sizeof(compat_code) : sizeof(code)));
 
 		redirected_entry = compat ? stub | 1UL : stub;
-		werr = zp_write_stack_at_entry(at_entry_uaddr, redirected_entry,
-					       compat);
+		werr = yz_auth_injection_ticket_alive(&tw->ticket) ?
+			zp_write_stack_at_entry(at_entry_uaddr, redirected_entry, compat) :
+			-ECANCELED;
 		pr_info(
 		    "zygote_probe: [2c-3b] pid=%d socket=%s abi=%s stub@0x%lx "
 		    "loader_fd=%d "
@@ -2412,7 +2448,9 @@ out:
 	if (runtime_generation && !runtime_redirected && !runtime_safemode)
 		zp_runtime_set_state((u32)current->tgid, runtime_generation,
 				     YZ_RUNTIME_STATE_FAILED);
+	mmdrop(tw->mm);
 	kfree(tw);
+	module_put(THIS_MODULE);
 }
 
 static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
@@ -2425,8 +2463,15 @@ static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
 	bool by_path;
 	bool by_native;
 	bool live_native;
+	bool compat = false;
 
 	((bprm_committed_creds_fn)zygote_probe_hook.original)(bprm);
+
+	if (!yz_auth_catalog_ready())
+		return;
+#ifdef CONFIG_COMPAT
+	compat = is_compat_task();
+#endif
 
 	by_sid = yz_host_is_zygote(current_cred());
 	by_path = zp_is_app_process_path(filename);
@@ -2461,8 +2506,15 @@ static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
 			    kzalloc(sizeof(*tw), GFP_ATOMIC);
 
 			if (tw) {
+				if (!yz_auth_injection_ticket(by_native && early_native,
+					compat, &tw->ticket) || !try_module_get(THIS_MODULE)) {
+					kfree(tw);
+					return;
+				}
 				tw->kind = by_native ? ZP_INJECT_NATIVE
 						     : ZP_INJECT_ZYGOTE;
+				tw->mm = current->mm;
+				mmgrab(tw->mm);
 				if (by_native) {
 					tw->native_target_type =
 					    native_target_type;
@@ -2473,8 +2525,11 @@ static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
 				}
 				init_task_work(&tw->cb, zp_inject_tw_func);
 				if (yz_task_work_add(current, &tw->cb,
-						     TWA_RESUME))
+						     TWA_RESUME)) {
+					mmdrop(tw->mm);
 					kfree(tw);
+					module_put(THIS_MODULE);
+				}
 			}
 		}
 	}
@@ -2520,7 +2575,8 @@ void yz_zygote_probe_exit(void)
 
 bool yz_tango_active(void)
 {
-	return READ_ONCE(zp_enable_lsm_injector);
+	return READ_ONCE(zp_enable_lsm_injector) &&
+	       yz_auth_injection_allowed(false, true);
 }
 
 void yz_tango_linker_offsets(u64 *dlopen, u64 *dlsym)
@@ -2549,7 +2605,8 @@ int yz_tango_prepare(u32 *generation)
 				     YZ_RUNTIME_STATE_SAFEMODE);
 		return -ECANCELED;
 	}
-	fd = zp_stage_fd(ZP_CORE32_PATH, ZP_VMA_NAME, &policy);
+	fd = zp_stage_image(ZP_CORE32_PATH, ZP_VMA_NAME, &policy,
+			    VIOLA_ROLE_CORE, true);
 	if (fd < 0) {
 		zp_restore_native_policy_state(&policy);
 		zp_runtime_set_state(current->tgid, *generation,
@@ -2600,4 +2657,84 @@ bool yz_zygote_probe_is_native_runtime(pid_t pid, u64 start_boottime)
 	}
 	mutex_unlock(&zp_runtime_lock);
 	return found;
+}
+
+u8 yz_zygote_probe_task_abi(struct task_struct *task)
+{
+	struct {
+		pid_t pid;
+		u64 start;
+	} lineage[4];
+	u32 i, n = 0, level;
+	u8 abi = YZ_RUNTIME_ABI_UNKNOWN;
+
+	/* App children inherit a zygote's logical runtime ABI. In particular,
+	 * Tango's ARM32 guest must not be classified by its ARM64 host task. */
+	rcu_read_lock();
+	while (task && n < ARRAY_SIZE(lineage)) {
+		lineage[n].pid = task->tgid;
+		lineage[n++].start = READ_ONCE(task->group_leader->start_boottime);
+		if (task->tgid == 1)
+			break;
+		task = rcu_dereference(task->real_parent);
+	}
+	rcu_read_unlock();
+	mutex_lock(&zp_runtime_lock);
+	for (level = 0; level < n && !abi; level++) {
+		u32 newest = 0;
+
+		for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+			const struct zp_runtime_entry *entry = &zp_runtime_records[i];
+
+			if (entry->record.pid == lineage[level].pid &&
+			    !entry->record.module_id[0] &&
+			    entry->start_boottime == lineage[level].start &&
+			    (!abi || (s32)(entry->record.generation - newest) > 0)) {
+				newest = entry->record.generation;
+				abi = entry->record.abi;
+			}
+		}
+	}
+	mutex_unlock(&zp_runtime_lock);
+	return abi;
+}
+
+u8 yz_zygote_probe_runtime_abi(pid_t pid)
+{
+	struct task_struct *task;
+	u8 abi;
+
+	rcu_read_lock();
+	task = get_pid_task(find_vpid(pid), PIDTYPE_PID);
+	rcu_read_unlock();
+	if (!task)
+		return YZ_RUNTIME_ABI_UNKNOWN;
+	abi = yz_zygote_probe_task_abi(task);
+	put_task_struct(task);
+	return abi;
+}
+
+u8 yz_zygote_probe_report_abi(u32 pid, u32 generation)
+{
+	u32 i;
+	u32 newest = 0;
+	u8 abi = YZ_RUNTIME_ABI_UNKNOWN;
+
+	mutex_lock(&zp_runtime_lock);
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		const struct yz_runtime_record *record = &zp_runtime_records[i].record;
+
+		if (record->pid != pid || record->module_id[0])
+			continue;
+		if (generation && record->generation == generation) {
+			abi = record->abi;
+			break;
+		}
+		if (!generation && (!abi || (s32)(record->generation - newest) > 0)) {
+			newest = record->generation;
+			abi = record->abi;
+		}
+	}
+	mutex_unlock(&zp_runtime_lock);
+	return abi;
 }

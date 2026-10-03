@@ -29,6 +29,7 @@
 #include <linux/vmalloc.h>
 
 #include "core/bootstrap.h"
+#include "core/auth.h"
 #include "core/control.h"
 #include "feature/zygote_ctl.h"
 #include "feature/zygote_nl.h"
@@ -36,13 +37,10 @@
 #include "host/host.h"
 #include "host/runtime.h"
 #include "uapi/yukizygisk.h"
+#include "uapi/viola.h"
 
 static atomic_t yz_control_available = ATOMIC_INIT(0);
 static DECLARE_RWSEM(yz_control_sem);
-
-struct yz_control_file {
-	bool bootstrap;
-};
 
 #define YZ_PER_USER_RANGE 100000
 
@@ -101,9 +99,19 @@ static int yz_ioctl_set_native_targets(void __user *arg)
 static int yz_ioctl_restore_native_load_policy(void __user *arg)
 {
 	struct yz_native_load_policy_cmd cmd;
+	struct task_struct *task;
+	int ret;
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
+	rcu_read_lock();
+	task = get_pid_task(find_vpid(cmd.pid), PIDTYPE_PID);
+	rcu_read_unlock();
+	ret = task ? yz_auth_target_task(task) : yz_auth_target_report(cmd.pid, 0);
+	if (task)
+		put_task_struct(task);
+	if (ret)
+		return ret;
 	return yz_zygote_probe_restore_native_policy((pid_t)cmd.pid);
 }
 
@@ -127,6 +135,11 @@ static int yz_ioctl_allow_module_load_policy(void __user *arg)
 	rcu_read_unlock();
 	if (!task)
 		return -ESRCH;
+	ret = yz_auth_target_task(task);
+	if (ret) {
+		put_task_struct(task);
+		return ret;
+	}
 	cred = get_task_cred(task);
 	payload = fdget(cmd.dirfd);
 	file = fd_file(payload);
@@ -223,9 +236,13 @@ static int yz_ioctl_get_runtime(void __user *arg)
 static int yz_ioctl_report_runtime(void __user *arg)
 {
 	struct yz_runtime_report_cmd cmd;
+	int ret;
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
+	ret = yz_auth_target_report(cmd.pid, cmd.generation);
+	if (ret)
+		return ret;
 	cmd.module_id[sizeof(cmd.module_id) - 1] = '\0';
 	return yz_zygote_probe_report_runtime(&cmd);
 }
@@ -304,6 +321,8 @@ static int yz_ioctl_umount_pid(void __user *arg)
 
 struct yz_unmap_tw {
 	struct callback_head cb;
+	struct yz_auth_ticket ticket;
+	struct mm_struct *mm;
 	unsigned long addr[YZ_MAX_UNMAP_SEGS];
 	unsigned long size[YZ_MAX_UNMAP_SEGS];
 	unsigned int n;
@@ -317,19 +336,24 @@ static void yz_unmap_tw_func(struct callback_head *cb)
 	unsigned long pc = regs ? instruction_pointer(regs) : 0;
 	unsigned int i;
 
+	if (current->flags & PF_EXITING || current->mm != tw->mm ||
+	    !yz_auth_ticket_begin(&tw->ticket))
+		goto out;
+
 	for (i = 0; i < tw->n; i++) {
 		if (pc >= tw->addr[i] && pc < tw->addr[i] + tw->size[i]) {
 			if (++tw->retry < 16) {
 				init_task_work(&tw->cb, yz_unmap_tw_func);
 				if (!yz_task_work_add(current, &tw->cb,
-						      TWA_RESUME))
+						      TWA_RESUME)) {
+					yz_auth_end();
 					return;
+				}
 			}
 			pr_warn("yukizygisk: yz_unmap pc=0x%lx still in core "
 				"after %u tries, skip pid=%d\n",
 				pc, tw->retry, current->pid);
-			kfree(tw);
-			return;
+			goto unlock;
 		}
 	}
 
@@ -338,7 +362,33 @@ static void yz_unmap_tw_func(struct callback_head *cb)
 			tw->addr[i], tw->size[i], current->pid);
 		vm_munmap(tw->addr[i], tw->size[i]);
 	}
+unlock:
+	yz_auth_end();
+out:
+	mmdrop(tw->mm);
 	kfree(tw);
+	module_put(THIS_MODULE);
+}
+
+static int yz_unmap_work_init(struct yz_unmap_tw *tw, struct task_struct *task)
+{
+	int ret = yz_auth_current_ticket(&tw->ticket);
+
+	if (ret)
+		return ret;
+	task_lock(task);
+	tw->mm = task->mm;
+	if (tw->mm)
+		mmgrab(tw->mm);
+	task_unlock(task);
+	if (!tw->mm)
+		return -ESRCH;
+	if (!try_module_get(THIS_MODULE)) {
+		mmdrop(tw->mm);
+		return -ENODEV;
+	}
+	init_task_work(&tw->cb, yz_unmap_tw_func);
+	return 0;
 }
 
 static int yz_ioctl_unmap_pid(void __user *arg)
@@ -347,6 +397,7 @@ static int yz_ioctl_unmap_pid(void __user *arg)
 	struct task_struct *task;
 	struct yz_unmap_tw *tw;
 	unsigned int i;
+	int ret;
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
@@ -358,6 +409,11 @@ static int yz_ioctl_unmap_pid(void __user *arg)
 	rcu_read_unlock();
 	if (!task)
 		return -ESRCH;
+	ret = yz_auth_target_task(task);
+	if (ret) {
+		put_task_struct(task);
+		return ret;
+	}
 
 	if (!yz_is_appuid(task_uid(task).val)) {
 		pr_info("yukizygisk: yz_unmap_pid reject non-app pid=%u uid=%u\n",
@@ -371,13 +427,20 @@ static int yz_ioctl_unmap_pid(void __user *arg)
 		put_task_struct(task);
 		return -ENOMEM;
 	}
-	init_task_work(&tw->cb, yz_unmap_tw_func);
+	ret = yz_unmap_work_init(tw, task);
+	if (ret) {
+		kfree(tw);
+		put_task_struct(task);
+		return ret;
+	}
 	tw->n = cmd.n_segs;
 	for (i = 0; i < cmd.n_segs; i++) {
 		tw->addr[i] = (unsigned long)cmd.addr[i];
 		tw->size[i] = (unsigned long)cmd.size[i];
 	}
 	if (yz_task_work_add(task, &tw->cb, TWA_RESUME)) {
+		mmdrop(tw->mm);
+		module_put(THIS_MODULE);
 		kfree(tw);
 		put_task_struct(task);
 		return -ESRCH;
@@ -393,6 +456,7 @@ static int yz_ioctl_unmap_self(void __user *arg)
 	struct yz_unmap_self_cmd cmd;
 	struct yz_unmap_tw *tw;
 	unsigned int i;
+	int ret;
 
 	if (!current->mm)
 		return -EINVAL;
@@ -417,13 +481,19 @@ static int yz_ioctl_unmap_self(void __user *arg)
 	tw = kzalloc(sizeof(*tw), GFP_KERNEL);
 	if (!tw)
 		return -ENOMEM;
-	init_task_work(&tw->cb, yz_unmap_tw_func);
+	ret = yz_unmap_work_init(tw, current);
+	if (ret) {
+		kfree(tw);
+		return ret;
+	}
 	tw->n = cmd.n_segs;
 	for (i = 0; i < cmd.n_segs; i++) {
 		tw->addr[i] = (unsigned long)cmd.addr[i];
 		tw->size[i] = (unsigned long)cmd.size[i];
 	}
 	if (yz_task_work_add(current, &tw->cb, TWA_RESUME)) {
+		mmdrop(tw->mm);
+		module_put(THIS_MODULE);
 		kfree(tw);
 		return -ESRCH;
 	}
@@ -437,6 +507,7 @@ static int yz_ioctl_patch_text(void __user *arg)
 	struct yz_patch_text_cmd cmd;
 	struct task_struct *task;
 	int n;
+	int ret;
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
@@ -451,6 +522,11 @@ static int yz_ioctl_patch_text(void __user *arg)
 	rcu_read_unlock();
 	if (!task)
 		return -ESRCH;
+	ret = yz_auth_target_task(task);
+	if (ret) {
+		put_task_struct(task);
+		return ret;
+	}
 
 	n = access_process_vm(task, (unsigned long)cmd.addr, cmd.bytes, cmd.len,
 			      FOLL_FORCE | FOLL_WRITE);
@@ -468,7 +544,6 @@ static int yz_ioctl_patch_text(void __user *arg)
 static long yukizygisk_ioctl_dispatch(struct file *file,
 				      unsigned int request, unsigned long arg)
 {
-	struct yz_control_file *control = file->private_data;
 	void __user *uarg = (void __user *)arg;
 
 	switch (request) {
@@ -514,9 +589,7 @@ static long yukizygisk_ioctl_dispatch(struct file *file,
 	case YZ_IOCTL_REPORT_RUNTIME:
 		return yz_ioctl_report_runtime(uarg);
 	case YZ_IOCTL_DAEMON_READY:
-		if (!control || !control->bootstrap)
-			return -EPERM;
-		return yukizygisk_bootstrap_daemon_ready();
+		return -EPERM; /* Authenticated control dispatch handles readiness. */
 	default:
 		return -ENOTTY;
 	}
@@ -528,19 +601,35 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 	long ret;
 
 	down_read(&yz_control_sem);
-	ret = atomic_read(&yz_control_available) ?
-		      yukizygisk_ioctl_dispatch(file, request, arg) :
-		      -ENODEV;
+	if (!atomic_read(&yz_control_available)) {
+		ret = -ENODEV;
+	} else if (request == YZ_IOCTL_DAEMON_READY ||
+		   request == YZ_IOCTL_VIOLA_STATUS ||
+		   request == YZ_IOCTL_VIOLA_CATALOG ||
+		   request == YZ_IOCTL_VIOLA_PIN_EXEC ||
+		   request == YZ_IOCTL_VIOLA_ARM_EXEC ||
+		   request == YZ_IOCTL_VIOLA_CLAIM ||
+		   request == YZ_IOCTL_VIOLA_DELEGATE ||
+		   request == YZ_IOCTL_VIOLA_COMPAT_READY ||
+		   request == YZ_IOCTL_VIOLA_RECOVER_COMPAT ||
+		   request == YZ_IOCTL_VIOLA_TAKE_RECOVERY ||
+		   request == YZ_IOCTL_VIOLA_FINISH_RECOVERY) {
+		ret = yz_auth_ioctl(file->private_data, request, (void __user *)arg);
+	} else {
+		ret = yz_auth_begin(file->private_data, request, (void __user *)arg);
+		if (!ret) {
+			ret = yukizygisk_ioctl_dispatch(file, request, arg);
+			yz_auth_end();
+		}
+	}
 	up_read(&yz_control_sem);
 	return ret;
 }
 
 static int yukizygisk_release(struct inode *inode, struct file *file)
 {
-	struct yz_control_file *control = file->private_data;
-
 	(void)inode;
-	kfree(control);
+	yz_auth_release(file->private_data);
 	module_put(THIS_MODULE);
 	return 0;
 }
@@ -575,38 +664,42 @@ bool yukizygisk_control_available(void)
 	return atomic_read(&yz_control_available) != 0;
 }
 
-int yukizygisk_control_install_fd(bool bootstrap)
+int yukizygisk_control_install_session(struct yz_auth_session *session)
 {
-	struct yz_control_file *control;
 	struct file *file;
 	int fd;
 
 	if (!yukizygisk_control_available())
 		return -ENODEV;
-	control = kzalloc(sizeof(*control), GFP_KERNEL);
-	if (!control)
-		return -ENOMEM;
-	control->bootstrap = bootstrap;
 	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0) {
-		kfree(control);
+	if (fd < 0)
 		return fd;
-	}
 	if (!try_module_get(THIS_MODULE)) {
 		put_unused_fd(fd);
-		kfree(control);
 		return -ENODEV;
 	}
 
-	file = anon_inode_getfile("ctl", &yukizygisk_fops, control,
+	file = anon_inode_getfile("ctl", &yukizygisk_fops, session,
 				  O_RDWR | O_CLOEXEC);
 	if (IS_ERR(file)) {
 		module_put(THIS_MODULE);
 		put_unused_fd(fd);
-		kfree(control);
 		return PTR_ERR(file);
 	}
 
 	fd_install(fd, file);
+	return fd;
+}
+
+int yukizygisk_control_install_fd(bool launcher)
+{
+	struct yz_auth_session *session = yz_auth_open(launcher);
+	int fd;
+
+	if (IS_ERR(session))
+		return PTR_ERR(session);
+	fd = yukizygisk_control_install_session(session);
+	if (fd < 0)
+		yz_auth_release(session);
 	return fd;
 }

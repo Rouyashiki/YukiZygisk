@@ -24,6 +24,7 @@
 #include <asm/cacheflush.h>
 
 #include "host/lsm.h"
+#include "core/auth.h"
 #include "host/runtime.h"
 #include "tango.h"
 #include "klog.h"
@@ -41,6 +42,7 @@ struct yz_tango_image {
 
 struct yz_tango_work {
 	struct callback_head cb;
+	struct yz_auth_ticket ticket;
 	struct mm_struct *mm;
 	unsigned long relro_start;
 	unsigned long relro_end;
@@ -372,7 +374,8 @@ static void yz_tango_inject(struct callback_head *cb)
 	const char *stage = "images";
 	bool redirected = false;
 
-	if (!yz_tango_active() || current->mm != work->mm ||
+	if (!yz_auth_injection_ticket_alive(&work->ticket) ||
+	    !yz_tango_active() || current->mm != work->mm ||
 	    current->flags & PF_EXITING)
 		goto out;
 	mmap_read_lock(current->mm);
@@ -424,11 +427,15 @@ static void yz_tango_inject(struct callback_head *cb)
 	yz_tango_bootstrap(bytes, got, original, stub,
 			   work->linker.bias + dlopen_off,
 			   work->linker.bias + dlsym_off, fd);
+	if (!yz_auth_injection_ticket_alive(&work->ticket))
+		goto finish;
 	n = access_process_vm(current, stub, bytes, sizeof(bytes),
 			      FOLL_FORCE | FOLL_WRITE);
 	if (n != sizeof(bytes))
 		goto restore;
 	flush_icache_range(stub, stub + sizeof(bytes));
+	if (!yz_auth_injection_ticket_alive(&work->ticket))
+		goto restore;
 	redirect = stub | 1;
 	n = access_process_vm(current, got, &redirect, sizeof(redirect),
 			      FOLL_FORCE | FOLL_WRITE);
@@ -460,6 +467,7 @@ skipped:
 		current->tgid, stage, count, app, linker, work->relro_start,
 		work->relro_end);
 out:
+	mmdrop(work->mm);
 	kfree(work);
 	module_put(THIS_MODULE);
 }
@@ -489,15 +497,18 @@ static int yz_tango_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 	work = kzalloc(sizeof(*work), GFP_KERNEL);
 	if (!work)
 		return ret;
-	if (!try_module_get(THIS_MODULE)) {
+	if (!yz_auth_injection_ticket(false, true, &work->ticket) ||
+	    !try_module_get(THIS_MODULE)) {
 		kfree(work);
 		return ret;
 	}
 	work->mm = current->mm;
+	mmgrab(work->mm);
 	work->relro_start = vma->vm_start;
 	work->relro_end = vma->vm_end;
 	init_task_work(&work->cb, yz_tango_inject);
 	if (yz_task_work_add(current, &work->cb, TWA_RESUME)) {
+		mmdrop(work->mm);
 		kfree(work);
 		module_put(THIS_MODULE);
 	}

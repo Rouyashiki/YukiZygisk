@@ -15,6 +15,7 @@
 #include <linux/printk.h>
 
 #include "core/bootstrap.h"
+#include "core/auth.h"
 #include "core/control.h"
 #include "core/lifecycle.h"
 #include "feature/zygote_ctl.h"
@@ -23,6 +24,10 @@
 #include "feature/zygote_probe.h"
 #include "host/host.h"
 #include "uapi/yukizygisk.h"
+#include <viola.h>
+#include <viola_identity.h>
+
+VIOLA_EMBED_IDENTITY(VIOLA_ROLE_KO, VIOLA_ABI_ARM64, VIOLA_BUILD_KMI);
 
 static unsigned int yz_init_stage_mask = 0x3f;
 module_param_named(init_stage_mask, yz_init_stage_mask, uint, 0644);
@@ -43,6 +48,7 @@ static bool yz_stage_control_active;
 static bool yz_stage_bootstrap_active;
 static bool yz_stage_lsm_active;
 static bool yz_stage_host_active;
+static bool yz_stage_auth_active;
 static DEFINE_MUTEX(yz_lifecycle_lock);
 
 static void yukizygisk_deactivate_locked(bool skip_bootstrap)
@@ -77,6 +83,10 @@ static void yukizygisk_deactivate_locked(bool skip_bootstrap)
 		yz_host_lsm_exit();
 		yz_stage_lsm_active = false;
 	}
+	if (yz_stage_auth_active) {
+		yz_auth_exit();
+		yz_stage_auth_active = false;
+	}
 	if (yz_stage_host_active) {
 		yz_host_exit();
 		yz_stage_host_active = false;
@@ -104,6 +114,13 @@ static int __init yukizygisk_init(void)
 	}
 	yz_stage_host_active = true;
 	pr_info("yukizygisk: init step host done\n");
+
+	/* Authentication precedes every business hook. Debug stage masks do
+	 * not bypass the loader check or turn off the control permission gate. */
+	ret = yz_auth_init();
+	if (ret)
+		goto err_control;
+	yz_stage_auth_active = true;
 
 	pr_info("yukizygisk: init step lsm\n");
 	yz_host_lsm_init();
@@ -150,7 +167,7 @@ static int __init yukizygisk_init(void)
 		pr_info("yukizygisk: init step zygote_ctl skipped\n");
 	}
 
-	if (yz_init_stage_mask & YZ_INIT_STAGE_CONTROL) {
+	{
 		pr_info("yukizygisk: init step control\n");
 		ret = yukizygisk_control_init();
 		if (ret) {
@@ -160,11 +177,9 @@ static int __init yukizygisk_init(void)
 		}
 		yz_stage_control_active = true;
 		pr_info("yukizygisk: init step control done\n");
-	} else {
-		pr_info("yukizygisk: init step control skipped\n");
 	}
 
-	if (yz_init_stage_mask & YZ_INIT_STAGE_BOOTSTRAP) {
+	{
 		pr_info("yukizygisk: init step bootstrap\n");
 		ret = yukizygisk_bootstrap_init();
 		if (ret) {
@@ -173,8 +188,6 @@ static int __init yukizygisk_init(void)
 		}
 		yz_stage_bootstrap_active = true;
 		pr_info("yukizygisk: init step bootstrap done\n");
-	} else {
-		pr_info("yukizygisk: init step bootstrap skipped\n");
 	}
 
 	pr_info("yukizygisk: standalone LKM initialized\n");

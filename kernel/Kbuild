@@ -13,6 +13,10 @@ yukizygisk-objs := \
 	core/module.o \
 	core/bootstrap.o \
 	core/control.o \
+	core/auth.o \
+	core/viola_shared.o \
+	core/viola_monocypher.o \
+	core/viola_ed25519.o \
 	host/runtime.o \
 	host/root_impl.o \
 	host/mount.o \
@@ -29,6 +33,14 @@ yukizygisk-objs := \
 	feature/zygote_ctl.o
 
 ccflags-y += -I$(src)
+VIOLA_BUILD_DIR ?= $(src)/../build/viola
+ccflags-y += -I$(src)/../shared/viola -I$(VIOLA_BUILD_DIR)
+CFLAGS_core/viola_shared.o += -std=gnu11
+CFLAGS_core/viola_monocypher.o += -std=gnu11 -DVIOLA_NO_ARGON2
+CFLAGS_core/viola_ed25519.o += -std=gnu11
+ifneq ($(strip $(VIOLA_KMI_ID)),)
+ccflags-y += -DVIOLA_KMI_ID=$(VIOLA_KMI_ID) -DVIOLA_BUILD_KMI=$(VIOLA_KMI_ID)
+endif
 ccflags-y += -I$(srctree)/security/selinux
 ccflags-y += -I$(objtree)/security/selinux
 ccflags-y += -I$(srctree)/security/selinux/include

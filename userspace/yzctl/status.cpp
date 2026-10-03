@@ -16,6 +16,7 @@
 #include "native_modules.hpp"
 
 #include "json.hpp"
+#include "shared/viola/viola.h"
 #include "uapi/yukizygisk.h"
 
 #include <algorithm>
@@ -498,6 +499,119 @@ void append_zygotes(std::string *json, const RuntimeSnapshot &snapshot,
   }
 }
 
+const char *viola_state_name(uint32_t state) {
+  switch (state) {
+  case YZ_VIOLA_ABSENT:
+    return "absent";
+  case YZ_VIOLA_STARTING:
+    return "starting";
+  case YZ_VIOLA_READY:
+    return "ready";
+  case YZ_VIOLA_LOST:
+    return "lost";
+  default:
+    return "unknown";
+  }
+}
+
+const char *viola_failure_stage_name(uint32_t stage) {
+  switch (stage) {
+  case YZ_VIOLA_STAGE_NONE:
+    return "none";
+  case YZ_VIOLA_STAGE_LOADER:
+    return "loader";
+  case YZ_VIOLA_STAGE_CATALOG:
+    return "catalog";
+  case YZ_VIOLA_STAGE_EXEC_IMAGE:
+    return "exec-image";
+  case YZ_VIOLA_STAGE_EXEC_CLAIM:
+    return "exec-claim";
+  case YZ_VIOLA_STAGE_SESSION:
+    return "session";
+  case YZ_VIOLA_STAGE_PAYLOAD:
+    return "payload";
+  case YZ_VIOLA_STAGE_TIMEOUT:
+    return "timeout";
+  default:
+    return "unknown";
+  }
+}
+
+const char *viola_failed_role_name(const yz_viola_status &status) {
+  switch (status.failed_role) {
+  case 0:
+    return status.failed_stage == YZ_VIOLA_STAGE_CATALOG ? "bundle" : "none";
+  case VIOLA_ROLE_VIOLA:
+    return "viola";
+  case VIOLA_ROLE_KO:
+    return "kernel";
+  case VIOLA_ROLE_DAEMON:
+    return "daemon";
+  case VIOLA_ROLE_CTL:
+    return "control-client";
+  case VIOLA_ROLE_LOADER:
+    return "loader";
+  case VIOLA_ROLE_CORE:
+    return "core";
+  case VIOLA_ROLE_NATIVE:
+    return "native-core";
+  default:
+    return "unknown";
+  }
+}
+
+std::string viola_id(const uint8_t (&bytes)[32]) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::string value(64, '0');
+  for (size_t index = 0; index < sizeof(bytes); ++index) {
+    value[2 * index] = hex[bytes[index] >> 4];
+    value[2 * index + 1] = hex[bytes[index] & 15];
+  }
+  return value;
+}
+
+void append_viola(std::string *json, const yz_viola_status &status,
+                   bool supported) {
+  *json += ",\"viola\":{\"supported\":";
+  if (!supported) {
+    *json += "false}";
+    return;
+  }
+  *json += "true,\"version\":" + std::to_string(status.version);
+  *json += ",\"profile\":" + std::to_string(status.profile);
+  *json += ",\"catalog_ready\":";
+  *json += status.catalog_ready ? "true" : "false";
+  *json += ",\"daemon64\":";
+  append_json_string(json, viola_state_name(status.daemon64));
+  *json += ",\"daemon32\":";
+  append_json_string(json, viola_state_name(status.daemon32));
+  *json += ",\"compat_required\":";
+  *json += status.compat_required ? "true" : "false";
+  *json += ",\"compat_recovering\":";
+  *json += status.compat_recovering ? "true" : "false";
+  *json += ",\"recovery_error\":" + std::to_string(status.recovery_error);
+  *json += ",\"role\":" + std::to_string(status.role);
+  *json += ",\"owner_pid\":" + std::to_string(status.owner_pid);
+  *json += ",\"epoch\":" + std::to_string(status.epoch);
+  *json += ",\"generation\":" + std::to_string(status.generation);
+  *json += ",\"release_id\":";
+  append_json_string(json, viola_id(status.release_id));
+  *json += ",\"trust_id\":";
+  append_json_string(json, viola_id(status.trust_id));
+  *json += ",\"last_error\":" + std::to_string(status.last_error);
+  *json += ",\"failed_role\":" + std::to_string(status.failed_role);
+  *json += ",\"failed_stage\":";
+  append_json_string(json, viola_failure_stage_name(status.failed_stage));
+  // role is a session role; failed_role always identifies a core payload.
+  *json += ",\"failed_role_kind\":";
+  append_json_string(json, status.failed_role ? "payload" :
+                           status.failed_stage == YZ_VIOLA_STAGE_CATALOG
+                               ? "bundle" : "none");
+  *json += ",\"failed_role_name\":";
+  append_json_string(json, viola_failed_role_name(status));
+  *json += '}';
+}
+
 } // namespace
 
 bool query_status(Host &host, const StatusOptions &options,
@@ -520,6 +634,10 @@ bool query_status(Host &host, const StatusOptions &options,
     }
     return false;
   }
+  yz_viola_status viola{};
+  bool viola_supported = false;
+  if (!host.query_viola(&viola, &viola_supported, error))
+    return false;
 
   const yz_config config = read_config(options.config_path);
   const std::vector<std::string> zygisk_modules =
@@ -559,6 +677,7 @@ bool query_status(Host &host, const StatusOptions &options,
   output += (root_status.flags & YZ_ROOT_STATUS_POLICY_CACHE_READY) != 0
                 ? "true"
                 : "false";
+  append_viola(&output, viola, viola_supported);
   output += ",\"count\":" + std::to_string(document->injected);
   output += ",\"safe_mode\":";
   output += runtime.safe_mode ? "true" : "false";

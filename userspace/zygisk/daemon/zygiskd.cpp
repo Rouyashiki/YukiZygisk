@@ -14,7 +14,9 @@
 #include "crash_monitor.hpp"
 #include "native_modules.hpp"
 #include "root_policy.hpp"
+#include "kernel/uapi/viola.h"
 #include "uapi/yukizygisk.h"
+#include "viola_build.h"
 #include "userspace/zygisk/load_policy.hpp"
 #include "userspace/zygisk/settings.hpp"
 
@@ -126,25 +128,16 @@ constexpr char kSystemLibContext[] = "u:object_r:system_lib_file:s0";
 
 std::string g_modules_dir = kDefaultModulesDir;
 std::string g_config_path = kDefaultConfigPath;
-uint64_t g_cookie_lo = 0;
-uint64_t g_cookie_hi = 0;
+std::string g_module_dir;
 int g_control_fd = -1;
+bool g_control_claimed = false;
+
+constexpr uint8_t kReleaseId[32] = VIOLA_RELEASE_ID_BYTES;
+constexpr uint8_t kTrustId[32] = VIOLA_TRUST_ID_BYTES;
 
 const std::string &modules_dir() { return g_modules_dir; }
 
 const std::string &config_path() { return g_config_path; }
-
-bool parse_u64(const char *s, uint64_t *out) {
-  if (s == nullptr || *s == '\0')
-    return false;
-  errno = 0;
-  char *end = nullptr;
-  unsigned long long v = strtoull(s, &end, 0);
-  if (errno != 0 || end == s || *end != '\0')
-    return false;
-  *out = static_cast<uint64_t>(v);
-  return true;
-}
 
 bool parse_i32(const char *s, int *out) {
   if (s == nullptr || *s == '\0')
@@ -162,10 +155,11 @@ void load_env() {
   const char *env = getenv("YUKIZYGISK_CONTROL_FD");
   if (env != nullptr && *env != '\0') {
     int inherited_fd = -1;
-    if (parse_i32(env, &inherited_fd) && inherited_fd >= 0 &&
+    if (parse_i32(env, &inherited_fd) && inherited_fd > STDERR_FILENO &&
         fcntl(inherited_fd, F_GETFD) >= 0)
       g_control_fd = inherited_fd;
   }
+  unsetenv("YUKIZYGISK_CONTROL_FD");
 
   env = getenv("YUKIZYGISK_MODULES_DIR");
   if (env != nullptr && *env != '\0')
@@ -174,56 +168,54 @@ void load_env() {
   env = getenv("YUKIZYGISK_CONFIG");
   if (env != nullptr && *env != '\0')
     g_config_path = env;
-
-  env = getenv("YUKIZYGISK_BOOTSTRAP_COOKIE");
-  if (env != nullptr && *env != '\0')
-    parse_u64(env, &g_cookie_lo);
-
-  env = getenv("YUKIZYGISK_BOOTSTRAP_COOKIE_LO");
-  if (env != nullptr && *env != '\0')
-    parse_u64(env, &g_cookie_lo);
-
-  env = getenv("YUKIZYGISK_BOOTSTRAP_COOKIE_HI");
-  if (env != nullptr && *env != '\0')
-    parse_u64(env, &g_cookie_hi);
+  env = getenv("YUKIZYGISK_MODULE_DIR");
+  if (env != nullptr && *env == '/')
+    g_module_dir = env;
 }
 
 int claim_control_fd() {
-  if (g_control_fd >= 0)
+  if (g_control_claimed)
     return g_control_fd;
-  if (g_cookie_lo == 0 && g_cookie_hi == 0) {
-    errno = EINVAL;
-    DLOGE("missing bootstrap cookie");
+  if (g_control_fd < 0) {
+    errno = EPERM;
+    DLOGE("missing Viola daemon session");
     return -1;
   }
-
-  int fd = -1;
-  errno = 0;
-  long ret =
-      syscall(SYS_prctl, static_cast<unsigned long>(YZ_PRCTL_BOOTSTRAP_OPTION),
-              static_cast<unsigned long>(YZ_PRCTL_BOOTSTRAP_MAGIC_YUKIHOOK),
-              static_cast<unsigned long>(g_cookie_lo),
-              static_cast<unsigned long>(g_cookie_hi),
-              reinterpret_cast<unsigned long>(&fd));
-  int saved_errno = errno;
-  if (fd < 0) {
-    DLOGE("bootstrap prctl failed: ret=%ld fd=%d errno=%d (%s)", ret, fd,
-          saved_errno, strerror(saved_errno));
+  const int flags = fcntl(g_control_fd, F_GETFD);
+  yz_viola_status status{};
+  status.size = sizeof(status);
+  status.version = YZ_VIOLA_VERSION;
+  constexpr uint32_t kRole =
+      sizeof(void *) == 8 ? YZ_VIOLA_DAEMON64 : YZ_VIOLA_DAEMON32;
+  bool ok = flags >= 0 &&
+            fcntl(g_control_fd, F_SETFD, flags | FD_CLOEXEC) == 0 &&
+            ioctl(g_control_fd, YZ_IOCTL_VIOLA_CLAIM) == 0 &&
+            ioctl(g_control_fd, YZ_IOCTL_VIOLA_STATUS, &status) == 0;
+  if (ok && (status.size != sizeof(status) ||
+             status.version != YZ_VIOLA_VERSION ||
+             status.profile != VIOLA_PROFILE || status.role != kRole ||
+             status.owner_pid != static_cast<uint32_t>(getpid()) ||
+             !status.catalog_ready ||
+             memcmp(status.release_id, kReleaseId, sizeof(kReleaseId)) != 0 ||
+             memcmp(status.trust_id, kTrustId, sizeof(kTrustId)) != 0)) {
+    errno = EKEYREJECTED;
+    ok = false;
+  }
+  if (!ok) {
+    const int saved_errno = errno;
+    close(g_control_fd);
+    g_control_fd = -1;
+    DLOGE("Viola daemon authorization failed: %s", strerror(saved_errno));
+    errno = saved_errno;
     return -1;
   }
-  if (ret != 0) {
-    DLOGI("bootstrap prctl returned ret=%ld errno=%d (%s), accepting delivered "
-          "fd=%d",
-          ret, saved_errno, strerror(saved_errno), fd);
-  }
-
-  g_control_fd = fd;
-  DLOGI("claimed anonymous control fd");
+  g_control_claimed = true;
+  DLOGI("claimed Viola daemon session");
   return g_control_fd;
 }
 
 int ctl(int request, void *arg) {
-  if (g_control_fd < 0) {
+  if (!g_control_claimed || g_control_fd < 0) {
     errno = ENODEV;
     return -1;
   }
@@ -288,9 +280,16 @@ int consume_ready_fd() {
   errno = 0;
   char *end = nullptr;
   long fd = strtol(env, &end, 10);
+  const bool valid = !errno && end != env && *end == '\0' &&
+                     fd > STDERR_FILENO && fd <= INT32_MAX;
   unsetenv("YUKIZYGISK_READY_FD");
-  if (errno || end == env || *end != '\0' || fd < 0 || fd > INT32_MAX)
+  if (!valid)
     return -1;
+  const int flags = fcntl(static_cast<int>(fd), F_GETFD);
+  if (flags < 0 || fcntl(static_cast<int>(fd), F_SETFD, flags | FD_CLOEXEC)) {
+    close(static_cast<int>(fd));
+    return -1;
+  }
   return static_cast<int>(fd);
 }
 
@@ -307,8 +306,50 @@ void notify_ready(int fd, bool ok) {
 }
 
 #if defined(__LP64__)
+pid_t g_compat_pid = -1;
+bool send_fd_nonblocking(int sock, int fd);
+int recv_fd(int sock);
+
+// Used after fork: avoid stdio and allocator locks held by another thread.
+void format_descriptor(int fd, char (&text)[16]) {
+  char digits[16];
+  size_t count = 0;
+  do {
+    digits[count++] = static_cast<char>('0' + fd % 10);
+    fd /= 10;
+  } while (fd);
+  for (size_t index = 0; index < count; ++index)
+    text[index] = digits[count - index - 1];
+  text[count] = '\0';
+}
+
+std::string own_module_dir() {
+  if (!yzhost::g_module_dir.empty())
+    return yzhost::g_module_dir;
+  char path[PATH_MAX];
+  const ssize_t length = readlink("/proc/self/exe", path, sizeof(path) - 1);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(path) - 1)
+    return {};
+  path[length] = '\0';
+  char *leaf = strrchr(path, '/');
+  if (!leaf)
+    return {};
+  *leaf = '\0';
+  leaf = strrchr(path, '/');
+  if (!leaf || strcmp(leaf, "/bin") != 0)
+    return {};
+  *leaf = '\0';
+  return path;
+}
+
 void stop_compat_daemon(pid_t pid) {
   if (pid <= 0)
+    return;
+  int state;
+  do {
+    state = waitpid(pid, nullptr, WNOHANG);
+  } while (state < 0 && errno == EINTR);
+  if (state != 0)
     return;
   (void)kill(pid, SIGKILL);
   while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
@@ -316,53 +357,107 @@ void stop_compat_daemon(pid_t pid) {
 }
 
 pid_t spawn_compat_daemon() {
-  char exe_path[PATH_MAX];
-  ssize_t exe_len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-  if (exe_len <= 0)
+  std::string module_dir = own_module_dir();
+  if (module_dir.empty())
     return -1;
-  exe_path[exe_len] = '\0';
-  char *leaf = strrchr(exe_path, '/');
-  if (leaf == nullptr ||
-      static_cast<size_t>(leaf - exe_path) + sizeof("/zygiskd32") >
-          sizeof(exe_path))
+  std::string viola_path = module_dir + "/bin/viola";
+  const int viola_fd =
+      open(viola_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (viola_fd < 0)
     return -1;
-  memcpy(leaf, "/zygiskd32", sizeof("/zygiskd32"));
-
+  struct stat image{};
+  if (fstat(viola_fd, &image) != 0 || !S_ISREG(image.st_mode)) {
+    close(viola_fd);
+    return -1;
+  }
   int ready[2];
-  if (pipe2(ready, O_CLOEXEC) != 0)
+  if (pipe2(ready, O_CLOEXEC) != 0) {
+    close(viola_fd);
     return -1;
+  }
+  int delegation[2];
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, delegation) != 0) {
+    close(ready[0]);
+    close(ready[1]);
+    close(viola_fd);
+    return -1;
+  }
+  char control_text[16]{};
+  char ready_text[16]{};
+  format_descriptor(ready[1], ready_text);
+  char *args[] = {viola_path.data(), const_cast<char *>("launch-compat"),
+                  const_cast<char *>("--module-dir"), module_dir.data(),
+                  const_cast<char *>("--control-fd"), control_text,
+                  const_cast<char *>("--ready-fd"), ready_text, nullptr};
+  std::string module_env = "YUKIZYGISK_MODULE_DIR=" + module_dir;
+  std::string modules_env = "YUKIZYGISK_MODULES_DIR=" + yzhost::modules_dir();
+  std::string config_env = "YUKIZYGISK_CONFIG=" + yzhost::config_path();
+  char *env[] = {const_cast<char *>("PATH=/system/bin:/system/xbin"),
+                module_env.data(), modules_env.data(), config_env.data(),
+                nullptr};
+  const pid_t parent_pid = getpid();
   pid_t pid = fork();
   if (pid == 0) {
     close(ready[0]);
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() == 1)
+    close(delegation[0]);
+    close(yzhost::g_control_fd);
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid)
       _exit(127);
-    int control_fd = fcntl(yzhost::g_control_fd, F_DUPFD, 3);
+    const int received_fd = recv_fd(delegation[1]);
+    close(delegation[1]);
+    if (received_fd < 0)
+      _exit(127);
+    const int control_fd = fcntl(received_fd, F_DUPFD_CLOEXEC, 3);
+    close(received_fd);
     if (control_fd < 0 || fcntl(control_fd, F_SETFD, 0) != 0 ||
         fcntl(ready[1], F_SETFD, 0) != 0)
       _exit(127);
-    char control_text[16];
-    char ready_text[16];
-    snprintf(control_text, sizeof(control_text), "%d", control_fd);
-    snprintf(ready_text, sizeof(ready_text), "%d", ready[1]);
-    setenv("YUKIZYGISK_CONTROL_FD", control_text, 1);
-    setenv("YUKIZYGISK_READY_FD", ready_text, 1);
-    setenv("YUKIZYGISK_MODULES_DIR", yzhost::modules_dir().c_str(), 1);
-    setenv("YUKIZYGISK_CONFIG", yzhost::config_path().c_str(), 1);
-    execl(exe_path, exe_path, static_cast<char *>(nullptr));
+    format_descriptor(control_fd, control_text);
+    syscall(SYS_execveat, viola_fd, "", args, env, AT_EMPTY_PATH);
     _exit(127);
   }
   close(ready[1]);
+  close(delegation[1]);
   if (pid < 0) {
     close(ready[0]);
+    close(delegation[0]);
+    close(viola_fd);
     return -1;
   }
-
+  yz_viola_delegate_cmd command{};
+  command.size = sizeof(command);
+  command.version = YZ_VIOLA_VERSION;
+  command.child_pid = static_cast<uint32_t>(pid);
+  command.viola_fd = viola_fd;
+  command.control_fd = -1;
+  bool delegated =
+      yzhost::ctl(YZ_IOCTL_VIOLA_DELEGATE, &command) == 0 &&
+      command.control_fd >= 0 &&
+      send_fd_nonblocking(delegation[0], command.control_fd);
+  if (command.control_fd >= 0)
+    close(command.control_fd);
+  close(viola_fd);
+  close(delegation[0]);
+  if (!delegated) {
+    close(ready[0]);
+    stop_compat_daemon(pid);
+    return -1;
+  }
   pollfd pfd{ready[0], POLLIN, 0};
   char result = '0';
-  int poll_result;
-  do {
-    poll_result = poll(&pfd, 1, 5000);
-  } while (poll_result < 0 && errno == EINTR);
+  int poll_result = 0;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - std::chrono::steady_clock::now())
+                               .count();
+    if (remaining <= 0)
+      break;
+    poll_result = poll(&pfd, 1, static_cast<int>(remaining));
+    if (poll_result >= 0 || errno != EINTR)
+      break;
+  }
   ssize_t received = -1;
   if (poll_result > 0 && (pfd.revents & POLLIN)) {
     do {
@@ -863,6 +958,12 @@ void *companion_thread(void *p) {
 }
 
 [[noreturn]] void companion_main(const std::string &lib_path, int ctrl) {
+  // Third-party entry points never retain the daemon's control capability.
+  if (yzhost::g_control_fd >= 0) {
+    close(yzhost::g_control_fd);
+    yzhost::g_control_fd = -1;
+    yzhost::g_control_claimed = false;
+  }
   // Drop daemon fds.
   if (DIR *fdd = opendir("/proc/self/fd")) {
     int dfd = dirfd(fdd);
@@ -1050,6 +1151,11 @@ void *native_companion_thread(void *p) {
 }
 
 [[noreturn]] void native_companion_main(const std::string &lib_path, int ctrl) {
+  if (yzhost::g_control_fd >= 0) {
+    close(yzhost::g_control_fd);
+    yzhost::g_control_fd = -1;
+    yzhost::g_control_claimed = false;
+  }
   if (DIR *fdd = opendir("/proc/self/fd")) {
     int dfd = dirfd(fdd);
     while (dirent *e = readdir(fdd)) {
@@ -1320,9 +1426,11 @@ void read_yzconfig() {
 #if defined(YUKIZYGISK_RUNTIME_LOG)
   zygiskd::logging::set_kernel_mirror(cfg.dmesg_log != 0);
 #endif
+#if defined(__LP64__)
   yz_yukilinker_cmd yc{};
   yc.enabled = cfg.yukilinker;
   yzhost::ctl(YZ_IOCTL_SET_YUKILINKER, &yc);
+#endif
   DLOGI("yzconfig: yukilinker=%u anonymous_memory=%u denylist_mode=%u "
         "dmesg_log=%u",
         cfg.yukilinker, yukizygisk::config::anonymous(cfg) ? 1U : 0U,
@@ -2109,6 +2217,29 @@ bool nl_receive_one(int fd) {
           memcpy(&event, ev, sizeof(event));
           g_crash_monitor.on_exit(event);
         }
+      } else if (ev->type == YZ_EV_VIOLA_RECOVERY) {
+#if defined(__LP64__)
+        if (ev->pid == static_cast<uint32_t>(getpid()) &&
+            yzhost::ctl(YZ_IOCTL_VIOLA_TAKE_RECOVERY, nullptr) == 0) {
+          yz_viola_status status{};
+          status.size = sizeof(status);
+          status.version = YZ_VIOLA_VERSION;
+          if (yzhost::ctl(YZ_IOCTL_VIOLA_STATUS, &status) != 0)
+            return false;
+          stop_compat_daemon(g_compat_pid);
+          g_compat_pid = spawn_compat_daemon();
+          yz_viola_recover_cmd done{};
+          done.size = sizeof(done);
+          done.version = YZ_VIOLA_VERSION;
+          done.epoch = status.epoch;
+          done.generation = status.generation;
+          done.result = g_compat_pid > 0 ? 0 : -EIO;
+          if (yzhost::ctl(YZ_IOCTL_VIOLA_FINISH_RECOVERY, &done) != 0)
+            DLOGE("compat recovery completion rejected: %s", strerror(errno));
+          DLOGI("explicit compat recovery: pid=%d result=%d", g_compat_pid,
+                done.result);
+        }
+#endif
       } else if (ev->type == YZ_EV_POLICY_REFRESH) {
         yzpolicy::handle_refresh_request(ev->appid);
       }
@@ -2212,12 +2343,15 @@ bool send_dlopen_offset() {
 
 int run_daemon() {
   int ready_fd = consume_ready_fd();
-#if defined(__LP64__)
-  pid_t compat_pid = -1;
-#endif // #if defined(__LP64__)
   yzhost::load_env();
 
   signal(SIGPIPE, SIG_IGN);
+
+  // Claim the execution-bound role before exposing any daemon service.
+  if (yzhost::claim_control_fd() < 0) {
+    notify_ready(ready_fd, false);
+    return 1;
+  }
 
   int srv = bind_listen();
   if (srv < 0) {
@@ -2227,18 +2361,14 @@ int run_daemon() {
     return 1;
   }
 
-  if (yzhost::claim_control_fd() < 0) {
-    close(srv);
-    notify_ready(ready_fd, false);
-    return 1;
-  }
-
+#if defined(__LP64__)
   if (yzhost::ctl(YZ_IOCTL_PREPARE_RUNTIME_POLICY, nullptr) != 0) {
     DLOGE("failed to prepare runtime SELinux policy: %s", strerror(errno));
     close(srv);
     notify_ready(ready_fd, false);
     return 1;
   }
+#endif
 
   int nlfd = nl_listen();
   if (nlfd < 0) {
@@ -2252,7 +2382,7 @@ int run_daemon() {
 #endif
   yz_root_status_cmd root_status{};
   if (!yzhost::get_root_status(&root_status) ||
-      !yzpolicy::setup(yzhost::g_control_fd, root_status)) {
+      !yzpolicy::setup(yzhost::g_control_fd, root_status, sizeof(void *) == 8)) {
     DLOGE("root policy unavailable; exiting");
     close(nlfd);
     close(srv);
@@ -2276,8 +2406,8 @@ int run_daemon() {
 
 #if defined(__LP64__)
   if (needs_compat_daemon()) {
-    compat_pid = spawn_compat_daemon();
-    if (compat_pid < 0) {
+    g_compat_pid = spawn_compat_daemon();
+    if (g_compat_pid < 0) {
       DLOGE("zygiskd32 failed to start");
       close(nlfd);
       close(srv);
@@ -2289,7 +2419,15 @@ int run_daemon() {
   }
   if (yzhost::ctl(YZ_IOCTL_DAEMON_READY, nullptr) != 0) {
     DLOGE("kernel rejected daemon readiness: %s", strerror(errno));
-    stop_compat_daemon(compat_pid);
+    stop_compat_daemon(g_compat_pid);
+    close(nlfd);
+    close(srv);
+    notify_ready(ready_fd, false);
+    return 1;
+  }
+#else
+  if (yzhost::ctl(YZ_IOCTL_VIOLA_COMPAT_READY, nullptr) != 0) {
+    DLOGE("kernel rejected compat daemon readiness: %s", strerror(errno));
     close(nlfd);
     close(srv);
     notify_ready(ready_fd, false);
@@ -2372,7 +2510,7 @@ int run_daemon() {
         continue;
       DLOGE("poll failed: %s; exiting", strerror(errno));
 #if defined(__LP64__)
-      stop_compat_daemon(compat_pid);
+      stop_compat_daemon(g_compat_pid);
 #endif // #if defined(__LP64__)
       return 1;
     }
@@ -2380,7 +2518,7 @@ int run_daemon() {
         (POLLERR | POLLHUP | POLLNVAL)) {
       DLOGE("daemon channel failed; exiting");
 #if defined(__LP64__)
-      stop_compat_daemon(compat_pid);
+      stop_compat_daemon(g_compat_pid);
 #endif // #if defined(__LP64__)
       return 1;
     }
