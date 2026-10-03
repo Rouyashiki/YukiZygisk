@@ -7,7 +7,42 @@
 #
 # Author: Anatdx
 
+# shellcheck disable=SC2034
+SKIPUNZIP=1
+
 ui_print "- Installing YukiZygisk"
+
+# Bootstrap the shell verifier before executing any packaged binary.
+YZ_VERIFY_DIR="$(mktemp -d "$TMPDIR/yz-verify.XXXXXX")" ||
+	abort "! Cannot create package verification directory"
+unzip -o "$ZIPFILE" verify.sh verify.sh.sha256 -d "$YZ_VERIFY_DIR" >&2 ||
+	abort "! Cannot extract verifier; please try downloading the ZIP again"
+if [ ! -f "$YZ_VERIFY_DIR/verify.sh" ] || [ -L "$YZ_VERIFY_DIR/verify.sh" ] ||
+	[ ! -f "$YZ_VERIFY_DIR/verify.sh.sha256" ] ||
+	[ -L "$YZ_VERIFY_DIR/verify.sh.sha256" ]; then
+	abort "! Missing verifier; please try downloading the ZIP again"
+fi
+YZ_VERIFY_HASH="$(cat "$YZ_VERIFY_DIR/verify.sh.sha256")"
+[ "${#YZ_VERIFY_HASH}" -eq 64 ] ||
+	abort "! Invalid verifier checksum; please try downloading the ZIP again"
+case "$YZ_VERIFY_HASH" in
+*[!0-9a-f]*) abort "! Invalid verifier checksum; please try downloading the ZIP again" ;;
+esac
+(cd "$YZ_VERIFY_DIR" && printf '%s  verify.sh\n' "$YZ_VERIFY_HASH" | sha256sum -c - >/dev/null) ||
+	abort "! Corrupted verifier; please try downloading the ZIP again"
+# shellcheck source=/dev/null
+. "$YZ_VERIFY_DIR/verify.sh"
+yz_verify_package
+
+# SKIPUNZIP also skips the installer's default ownership, modes and labels.
+set_perm_recursive "$MODPATH" 0 0 0755 0644
+
+[ -f "$MODPATH/bin/viola" ] || abort "! Missing Viola verifier"
+chmod 0755 "$MODPATH/bin/viola" || abort "! Cannot execute Viola"
+# Remove linker controls before starting the environment utility itself.
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_CONFIG_FILE LD_DEBUG LD_DEBUG_OUTPUT
+/system/bin/env -i PATH=/system/bin:/system/xbin "$MODPATH/bin/viola" verify --module-dir "$MODPATH" ||
+	abort "! YukiZygisk core verification failed"
 
 [ -f "$MODPATH/common.sh" ] || abort "! Missing module KMI helpers"
 # shellcheck source=/dev/null

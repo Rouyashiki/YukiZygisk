@@ -34,6 +34,10 @@ KEEP_BUILD=false
 STRIP_ANDROID=true
 VERBOSE=false
 ALL_KMIS=false
+SKIP_VIOLA=false
+VIOLA_CONTEXT="$BUILD_DIR/viola"
+VIOLA_PYTHON="${VIOLA_PYTHON:-python3}"
+VIOLA_PROFILE="${VIOLA_PROFILE:-official}"
 
 KMI_TARGETS=(
 	android12-5.10
@@ -50,7 +54,7 @@ usage() {
 YukiZygisk local build and module packager.
 
 Usage:
-  ./build.sh [package|kernel|daemon|ctl|payloads|clean] [options]
+  ./build.sh [prepare|viola|package|kernel|daemon|ctl|payloads|clean] [options]
 
 Options:
   -k, --kmi KMI              Build/package one DDK target (default: .ddk-version)
@@ -58,12 +62,16 @@ Options:
   -a, --abi ABI              Primary device ABI; compat ARM is always included
       --android-platform API Android platform (default: android-31)
       --ndk PATH             Android NDK path
+      --skip-viola           Reuse this build context's stripped Viola
       --skip-kernel          Reuse KMI-tagged modules in build/out/lkm
       --skip-daemon          Reuse build/out/zygiskd64 and zygiskd32
       --skip-ctl             Reuse build/out/yzctl
       --skip-payloads        Reuse dual-ABI build/out/lib*.so payloads
       --keep-build           Keep intermediate build directories
       --no-strip             Keep debug info in Android artifacts
+      --viola-profile PROFILE official or dev (default: official)
+      --viola-key FINGERPRINT Development signing subkey (dev only)
+      --viola-public-key FILE Development public certificate
   -v, --verbose              Verbose CMake configure output
   -h, --help                 Show this help
 EOF
@@ -89,6 +97,22 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--ndk)
 		ANDROID_NDK="$2"
+		shift 2
+		;;
+	--skip-viola)
+		SKIP_VIOLA=true
+		shift
+		;;
+	--viola-profile)
+		VIOLA_PROFILE="$2"
+		shift 2
+		;;
+	--viola-key)
+		VIOLA_KEY="$2"
+		shift 2
+		;;
+	--viola-public-key)
+		VIOLA_PUBLIC_KEY="$2"
 		shift 2
 		;;
 	--skip-kernel)
@@ -223,6 +247,7 @@ compute_version() {
 	count="$(git -C "$PROJECT_ROOT" rev-list --count HEAD 2>/dev/null || echo "0")"
 	VERSION_CODE=$((count + 10000))
 	VERSION_NAME="${version}-${VERSION_CODE}"
+	[[ "$VIOLA_PROFILE" != dev ]] || VERSION_NAME="${VERSION_NAME}-dev"
 	export VERSION_NAME VERSION_CODE
 }
 
@@ -235,6 +260,13 @@ stamp_module_prop() {
 	else
 		sed -i "s/^version=.*/version=$VERSION_NAME/" "$prop"
 		sed -i "s/^versionCode=.*/versionCode=$VERSION_CODE/" "$prop"
+	fi
+	if [[ "$VIOLA_PROFILE" == dev ]]; then
+		if [[ "$(uname -s)" == "Darwin" ]]; then
+			sed -i '' 's/^name=.*/name=YukiZygisk (Development)/' "$prop"
+		else
+			sed -i 's/^name=.*/name=YukiZygisk (Development)/' "$prop"
+		fi
 	fi
 }
 
@@ -286,12 +318,17 @@ build_one_kernel() {
 	output="$(lkm_output_path "$target")"
 
 	info "Build yukizygisk.ko with DDK ($target)"
+	local kmi_id=0 index
+	for index in "${!KMI_TARGETS[@]}"; do
+		[[ "${KMI_TARGETS[$index]}" != "$target" ]] || kmi_id=$((index + 1))
+	done
+	((kmi_id > 0)) || die "unsupported KMI: $target"
 	case "$target" in
 	android15-6.6 | android16-6.12)
-		ddk build --target "$target" -- W=1
+		ddk build --target "$target" -- W=1 VIOLA_KMI_ID="$kmi_id"
 		;;
 	*)
-		ddk build --target "$target"
+		ddk build --target "$target" -- VIOLA_KMI_ID="$kmi_id"
 		;;
 	esac
 	[[ -f "$PROJECT_ROOT/kernel/yukizygisk.ko" ]] ||
@@ -352,6 +389,7 @@ build_daemon() {
 			-DANDROID_ABI="$target_abi"
 			-DANDROID_PLATFORM="$ANDROID_PLATFORM"
 			-DCMAKE_BUILD_TYPE=Release
+			-DVIOLA_BUILD_DIR="$VIOLA_CONTEXT"
 		)
 		if [[ "$VERBOSE" == true ]]; then
 			cmake_args+=("--log-level=VERBOSE")
@@ -400,6 +438,7 @@ build_payloads() {
 			-DANDROID_ABI="$target_abi"
 			-DANDROID_PLATFORM="$ANDROID_PLATFORM"
 			-DCMAKE_BUILD_TYPE=Release
+			-DVIOLA_BUILD_DIR="$VIOLA_CONTEXT"
 		)
 		if [[ "$VERBOSE" == true ]]; then
 			cmake_args+=("--log-level=VERBOSE")
@@ -441,6 +480,7 @@ build_ctl() {
 		-DANDROID_ABI=arm64-v8a
 		-DANDROID_PLATFORM="$ANDROID_PLATFORM"
 		-DCMAKE_BUILD_TYPE=Release
+		-DVIOLA_BUILD_DIR="$VIOLA_CONTEXT"
 	)
 	if [[ "$VERBOSE" == true ]]; then
 		cmake_args+=("--log-level=VERBOSE")
@@ -459,6 +499,55 @@ validate_android_platform
 
 [[ "$ABI" == "arm64-v8a" ]] ||
 	die "standalone packages require an arm64-v8a device with optional ARM compat"
+
+prepare_viola() {
+	need_cmd "$VIOLA_PYTHON"
+	compute_version
+	find_ndk
+	local ndk_revision
+	ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK/source.properties" | tr -d '\r')"
+	local strip_mode=1
+	[[ "$STRIP_ANDROID" == true ]] || strip_mode=0
+	local config="api=${ANDROID_PLATFORM#android-};ndk=$ndk_revision;strip=$strip_mode;ddk=${DDK_RELEASE:-${YZ_DDK_RELEASE:-20260313}}"
+	local args=(prepare --out "$VIOLA_CONTEXT" --profile "$VIOLA_PROFILE"
+		--version-code "$VERSION_CODE" --build-config "$config")
+	[[ -z "${VIOLA_KEY:-}" ]] || args+=(--key "$VIOLA_KEY")
+	[[ -z "${VIOLA_PUBLIC_KEY:-}" ]] || args+=(--public-key "$VIOLA_PUBLIC_KEY")
+	[[ -z "${VIOLA_GPG:-}" ]] || args+=(--gpg "$VIOLA_GPG")
+	"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/viola.py" "${args[@]}"
+}
+
+build_viola() {
+	if [[ "$SKIP_VIOLA" != true ]]; then
+		check_common_deps
+		find_ndk
+		cmake -S "$PROJECT_ROOT" -B "$BUILD_DIR/viola-arm64" -G Ninja \
+			-DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+			-DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+			-DCMAKE_BUILD_TYPE=Release -DVIOLA_BUILD_DIR="$VIOLA_CONTEXT" \
+			-DYZ_BUILD_RUNTIME=OFF -DYZ_BUILD_ZYGISKD=OFF -DYZ_BUILD_YZCTL=OFF
+		cmake --build "$BUILD_DIR/viola-arm64" --target viola
+		mkdir -p "$OUT_DIR"
+		cp "$BUILD_DIR/viola-arm64/userspace/viola/viola" "$OUT_DIR/viola"
+		strip_android_file --strip-all "$OUT_DIR/viola"
+		chmod 0755 "$OUT_DIR/viola"
+	fi
+	[[ -f "$OUT_DIR/viola" ]] || die "missing build/out/viola"
+	"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/viola.py" loader \
+		--context "$VIOLA_CONTEXT" --image "$OUT_DIR/viola"
+}
+
+build_host_verifier() {
+	local compiler="${HOST_CC:-cc}"
+	need_cmd "$compiler"
+	mkdir -p "$OUT_DIR"
+	"$compiler" -std=c11 -O2 -I"$PROJECT_ROOT/shared/viola" -I"$VIOLA_CONTEXT" \
+		"$PROJECT_ROOT/userspace/viola/host_verify.c" \
+		"$PROJECT_ROOT/shared/viola/viola.c" \
+		"$PROJECT_ROOT/shared/viola/vendor/monocypher.c" \
+		"$PROJECT_ROOT/shared/viola/vendor/monocypher-ed25519.c" \
+		-o "$OUT_DIR/viola-host"
+}
 
 stage_payloads() {
 	local source destination payload
@@ -499,11 +588,6 @@ package_module() {
 	cp -R "$MODULE_TEMPLATE_DIR/." "$PACKAGE_DIR/"
 	cp -R "$WEBUI_DIR" "$PACKAGE_DIR/webroot"
 	stamp_module_prop
-	cp "$PROJECT_ROOT/LICENSE" "$PACKAGE_DIR/LICENSE"
-	cp "$PROJECT_ROOT/LICENSE-GPL-2.0" "$PACKAGE_DIR/LICENSE-GPL-2.0"
-	cp "$PROJECT_ROOT/NOTICE" "$PACKAGE_DIR/NOTICE"
-	cp "$PROJECT_ROOT/userspace/zygisk/third_party/lsplt/LICENSE" \
-		"$PACKAGE_DIR/LICENSE-LSPLT"
 	mkdir -p "$PACKAGE_DIR/lkm"
 	local target source
 	while IFS= read -r target; do
@@ -511,21 +595,34 @@ package_module() {
 		cp "$source" "$PACKAGE_DIR/lkm/${target}_yukizygisk.ko"
 	done < <(kernel_targets)
 	mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib64" "$PACKAGE_DIR/lib"
+	cp "$OUT_DIR/viola" "$PACKAGE_DIR/bin/viola"
 	cp "$OUT_DIR/zygiskd64" "$PACKAGE_DIR/bin/zygiskd64"
 	cp "$OUT_DIR/zygiskd32" "$PACKAGE_DIR/bin/zygiskd32"
 	cp "$OUT_DIR/yzctl" "$PACKAGE_DIR/bin/yzctl"
 	stage_payloads
+	# Legal texts remain in the source repository.  Keep generated module
+	# artifacts lean by excluding standalone license/notice files everywhere,
+	# including vendored WebUI assets.
+	find "$PACKAGE_DIR" -type f \( \
+		-iname 'license*' -o -iname 'notice*' -o -iname 'copying*' \
+	\) -delete
 
 	chmod 0644 "$PACKAGE_DIR/module.prop" "$PACKAGE_DIR"/lkm/*.ko \
-		"$PACKAGE_DIR"/lib64/*.so "$PACKAGE_DIR"/lib/*.so "$PACKAGE_DIR"/LICENSE* \
-		"$PACKAGE_DIR/NOTICE"
-	chmod 0755 "$PACKAGE_DIR/bin/zygiskd64" "$PACKAGE_DIR/bin/zygiskd32" \
+		"$PACKAGE_DIR"/lib64/*.so "$PACKAGE_DIR"/lib/*.so
+	chmod 0755 "$PACKAGE_DIR/bin/viola" "$PACKAGE_DIR/bin/zygiskd64" "$PACKAGE_DIR/bin/zygiskd32" \
 		"$PACKAGE_DIR/bin/yzctl" \
 		"$PACKAGE_DIR/post-fs-data.sh" \
 		"$PACKAGE_DIR/boot-completed.sh" "$PACKAGE_DIR/customize.sh" \
 		"$PACKAGE_DIR/action.sh" \
 		2>/dev/null || true
 	find "$PACKAGE_DIR/webroot" -type f -exec chmod 0644 {} +
+
+	build_host_verifier
+	local sign_args=(sign --context "$VIOLA_CONTEXT" --module-dir "$PACKAGE_DIR"
+		--verifier "$OUT_DIR/viola-host")
+	[[ -z "${VIOLA_GPG:-}" ]] || sign_args+=(--gpg "$VIOLA_GPG")
+	"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/viola.py" "${sign_args[@]}"
+	"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/module_checksums.py" "$PACKAGE_DIR"
 
 	local package_target="$KMI"
 	if [[ "$ALL_KMIS" == true ]]; then
@@ -553,19 +650,33 @@ clean() {
 }
 
 case "$COMMAND" in
+prepare)
+	prepare_viola
+	;;
+viola)
+	prepare_viola
+	build_viola
+	;;
 kernel)
+	prepare_viola
+	build_viola
 	build_kernel
 	;;
 daemon)
+	prepare_viola
 	build_daemon
 	;;
 ctl)
+	prepare_viola
 	build_ctl
 	;;
 payloads)
+	prepare_viola
 	build_payloads
 	;;
 package)
+	prepare_viola
+	build_viola
 	build_kernel
 	build_daemon
 	build_ctl

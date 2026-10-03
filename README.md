@@ -23,17 +23,19 @@ validation work. The kernel-side setresuid tracepoint monitor, SELinux policy
 adapter, and mount cleanup adapter are present in the standalone LKM, but still
 need device-side validation before they can be treated as runtime parity.
 
-The standalone control path no longer creates `/dev/yukizygisk`. The LKM arms a
-one-shot `prctl` bootstrap when loaded with a per-boot cookie; `zygiskd` claims
-an anonymous control fd immediately after startup and then reuses the
-`YZ_IOCTL_*` command surface on that fd. Root control clients use the separate
-`yzctl` binary, which requests an independently authenticated anonymous control
-fd and talks to the same kernel ioctl surface without going through zygiskd.
+The standalone control path uses process-bound anonymous control FDs. Viola
+verifies the signed core manifest, loads the verified KO buffer, and executes
+the verified daemon from a kernel-frozen file descriptor. The official KO
+checks its compiled Viola identity and independently verifies its own runtime
+payloads before handing them to a target process. Cookie-based startup is no
+longer accepted. Root management sessions can query status and request a reload;
+daemon initialization and runtime mutations require their assigned role.
 
-If zygiskd never claims the bootstrap fd, the kernel guard checks for zygote
-service sockets after a short delay. Once service startup is visible, the guard
-clears the bootstrap cookie, disables new control sessions, and fails closed.
-The later `boot-completed` health check performs the external module unload.
+Main and existing 32-bit/Tango daemon sessions are authorized separately.
+Forking, transferring a control FD, or executing another program does not
+transfer its authority. A failed or expired daemon session prevents new
+injection that depends on that daemon; independently verified early-native
+payloads retain their separate admission path.
 
 The standalone design remains root-implementation agnostic at its internal
 boundaries, but its current admission policy is deliberately narrow. Module
@@ -57,7 +59,7 @@ The standalone control ABI is `YZ_IOCTL_*` with ioctl magic `'Y'` only. It does
 not accept the integrated YukiSU/YukiZygisk `KSU_IOCTL_YZ_*`/`'K'` ABI.
 
 The default package is a normal module using the conventional Zygisk layout:
-`bin/zygiskd64`, `bin/zygiskd32`, and the arm64 `bin/yzctl` control client;
+`bin/viola`, `bin/zygiskd64`, `bin/zygiskd32`, and the arm64 `bin/yzctl` control client;
 the matching 64-bit payloads are under `lib64/`, and the 32-bit payloads are
 under `lib/`. The installed module also provides `bin/zygiskd` as a symlink to
 the active 64-bit daemon. A KMI-specific LKM directory is included, and a
@@ -74,9 +76,10 @@ A release package contains all supported KMIs and is produced with
 `./build.sh package --all-kmis` (or by CI's parallel matrix). During install
 and `post-fs-data`, the module derives the exact GKI KMI from `uname -r` and
 loads only the matching KO. Unknown releases and missing matches fail closed.
-The script then starts the daemon with the same bootstrap cookie. This gives
-up early-native injection by default; that capability can remain a future
-optional host backend rather than the baseline standalone path.
+The script delegates startup to Viola and waits for authenticated daemon
+readiness with a bounded timeout. Existing early-native sources are checked
+against the same signed core manifest; third-party Zygisk/ZN modules are not
+required to carry the project's signature.
 
 The packaged Material 3 Expressive WebUI has four pages: device/injection status, Zygisk
 and Native modules, settings, and about/credits. Settings save immediately
@@ -94,6 +97,92 @@ ioctl/prctl policy API or parses APatch's `package_config`, then atomically
 hands a bounded snapshot back through a sealed memfd on the authenticated
 anonymous control fd. The WebUI only selects whether matching processes skip
 injection or keep injection before mount cleanup.
+
+## Viola builds and verification
+
+Installation uses controlled extraction to check `files.list` and each packaged
+file against its SHA-256 sidecar, including Viola before its first execution.
+These checks detect incomplete or corrupted packages. Viola then authenticates
+the signed core payloads using its compiled OpenPGP trust anchors.
+
+Viola embeds [lkmloader](https://github.com/Rouyashiki/lkmloader) as a pinned
+source submodule; initialize it with `git submodule update --init --recursive`.
+It first loads the verified, read-only KO buffer normally. Only `ENOENT` or
+`ENOEXEC` enters compatibility loading: a sealed copy of those authenticated
+bytes is passed to the embedded loader, which resolves built-in kernel symbols
+and may retry once with an exact kernel-reported vermagic. The package on disk
+is unchanged. Both loading syscalls execute inside Viola's authenticated image.
+This compatibility path loads a transformed authenticated image, rather than
+claiming byte identity with the signed KO. It cannot repair incompatible kernel
+APIs, layouts or CFI types. No separate loader executable or shared C++ runtime
+is required.
+
+Build hosts need Python 3.10+ with `tools/requirements-viola.txt`, GnuPG, and a
+native C compiler in addition to the existing Android NDK/CMake/DDK tools.
+Windows uses `clang` for the host verifier (with the Visual C++ SDK), or the
+compiler selected by `VIOLA_HOST_CC`. `VIOLA_PYTHON` selects a Python environment;
+`VIOLA_GPG` selects a GnuPG executable. For example:
+
+```bash
+python3 -m venv build/viola-tools
+build/viola-tools/bin/python -m pip install -r tools/requirements-viola.txt
+export VIOLA_PYTHON="$PWD/build/viola-tools/bin/python"
+./build.sh viola
+./build.sh kernel -k android15-6.6
+```
+
+Public-only official builds do not need a private key. Creating an installable
+package does: official packages pin primary fingerprint
+`71B2B58C2A543472BE0DA0D8F580A2CEEF67DC98` and release subkey
+`C01D42FA249B2E23C28F4B0347E533340DE325A5`. Only that exact approved signing key
+is used. CI requires `GPG_PRIVATE_KEY` and, when necessary, `GPG_PASSPHRASE` in
+the independent repository. Store the ASCII-armored secret-subkey export
+directly in `GPG_PRIVATE_KEY` (not Base64); the primary private key is not needed.
+Missing signing material fails packaging; there is
+no unsigned or development fallback. PR builds produce compilation/test
+artifacts, not installable ZIPs.
+
+For local changes, create a separate Ed25519 OpenPGP development identity with
+an Ed25519 signing subkey, and select its **full subkey fingerprint**:
+
+```bash
+./build.sh package -k android15-6.6 --viola-profile dev \
+  --viola-key DEVELOPMENT_SIGNING_SUBKEY_FINGERPRINT
+```
+
+The corresponding PowerShell flags are the same. `--viola-public-key FILE`
+can supply its public certificate; signing uses the selected GnuPG home
+(`GNUPGHOME`). A passphrase can be supplied through the GnuPG agent or
+`VIOLA_GPG_PASSPHRASE`, never as a command-line argument. Do not commit private
+keys. Development packages still enforce every check and are not accepted by
+an official kernel/verifier. Switching a loaded release or trust profile
+requires rebooting into the matching complete package.
+
+The public build context is under `build/viola`. All components carry its
+release identity. The KO also embeds the final Viola digest, so a stale KO is
+rejected during packaging even if an old file was reused with `--skip-*`.
+The package contains a binary `viola.manifest`, standard GPG detached
+`viola.sig`, and public-only `viola.pgp`. Runtime trust comes from the compiled
+approved keys; replacing the bundled certificate cannot authorize another key.
+
+The installed verifier supports:
+
+```sh
+bin/viola verify --module-dir /absolute/path/to/module
+bin/viola launch --module-dir /absolute/path/to/module
+```
+
+`verify` does not load anything. `launch` is the sole supported startup path;
+repeating it can recover a lost daemon of the same loaded release. It does not
+restart zygotes. `yzctl status --json` includes the kernel's Viola catalog,
+release, daemon-session states, and last authorization error.
+
+This authenticates this project's core payloads without manager certificates
+or an online key service. It does not authenticate the whole installation
+script tree, provide online revocation/rollback protection, or establish trust
+against replacement of the verifier and its embedded keys together. Android
+execution policy, kernel integration, and boot timing still require target
+runtime validation; a successful host test or cross-build does not prove them.
 
 ## WebUI Development
 

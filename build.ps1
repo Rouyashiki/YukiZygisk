@@ -24,6 +24,9 @@ Options:
   --skip-lkm                  Reuse existing build/out/lkm/<KMI>_yukizygisk.ko
   -i, --install               Install resulting module zip with `ksud module install`
   --serial SERIAL             adb serial for installation
+  --viola-profile PROFILE     official or dev (default: official)
+  --viola-key FINGERPRINT     Development signing subkey
+  --viola-public-key FILE     Development public certificate
   --no-strip                  Keep unstripped artifacts in module zip
   -h, --help                  Show this help
 
@@ -32,6 +35,9 @@ Environment:
   ANDROID_NDK_HOME / ANDROID_NDK
   DDK_RELEASE / YZ_DDK_RELEASE (default: 20260313 for docker fallback)
   YZ_DDK_IMAGE (docker image override for kernel build fallback)
+  VIOLA_PYTHON (Python with tools/requirements-viola.txt installed)
+  VIOLA_HOST_CC (native host C compiler; default: clang)
+  VIOLA_GPG / GNUPGHOME / VIOLA_GPG_PASSPHRASE
   NUMBER_OF_PROCESSORS
 '@ | Write-Host
 }
@@ -227,6 +233,9 @@ function Stamp-ModuleProp {
 	$content = Get-Content -LiteralPath $Destination
 	$content = $content -replace '^version=.*', "version=$($script:VersionName)"
 	$content = $content -replace '^versionCode=.*', "versionCode=$($script:VersionCode)"
+	if ($script:ViolaProfile -eq 'dev') {
+		$content = $content -replace '^name=.*', 'name=YukiZygisk (Development)'
+	}
   Set-Content -LiteralPath $Destination -Value $content
 }
 
@@ -264,7 +273,8 @@ function Build-CMakeProject {
 		"-DANDROID_ABI=$Abi",
 		"-DANDROID_PLATFORM=android-$Platform",
 		'-DCMAKE_BUILD_TYPE=Release',
-		"-DCMAKE_MAKE_PROGRAM=$script:NinjaExe"
+		"-DCMAKE_MAKE_PROGRAM=$script:NinjaExe",
+		"-DVIOLA_BUILD_DIR=$script:ViolaContext"
 	)
 	Invoke-Native -FilePath $script:CMakeExe -ArgumentList $configureArguments
 	Invoke-Native -FilePath $script:CMakeExe -ArgumentList @('--build', $BuildDirectory, '--parallel', "$script:BuildJobs")
@@ -309,10 +319,10 @@ function Build-KernelLkm {
 	Write-Host ">>> [1/4] Build kernel LKM ($target) ..." -ForegroundColor Cyan
 	$ddkCommand = Ensure-Command 'ddk'
 	if ($ddkCommand) {
-		$ddkArguments = @('build', '--target', $target)
+		$ddkArguments = @('build', '--target', $target, '--', "VIOLA_KMI_ID=$script:KmiId")
 		switch ($target) {
-			'android15-6.6' { $ddkArguments += @('--', 'W=1') }
-			'android16-6.12' { $ddkArguments += @('--', 'W=1') }
+			'android15-6.6' { $ddkArguments += @('W=1') }
+			'android16-6.12' { $ddkArguments += @('W=1') }
 			default { }
 		}
 		Invoke-Native -FilePath $ddkCommand -ArgumentList $ddkArguments -WorkingDirectory $script:RepoRoot
@@ -323,7 +333,7 @@ function Build-KernelLkm {
 
 		$release = if ($env:DDK_RELEASE) { $env:DDK_RELEASE } elseif ($env:YZ_DDK_RELEASE) { $env:YZ_DDK_RELEASE } else { '20260313' }
 		$ddkImage = if ($env:YZ_DDK_IMAGE) { $env:YZ_DDK_IMAGE } else { "ghcr.io/ylarod/ddk:${target}-$release" }
-		$makeExtras = @('make', '-C', 'kernel', "-j$($script:BuildJobs)", 'KDIR=$KDIR', 'CC=clang')
+		$makeExtras = @('make', '-C', 'kernel', "-j$($script:BuildJobs)", 'KDIR=$KDIR', 'CC=clang', "VIOLA_KMI_ID=$script:KmiId")
 		if ($target -in @('android15-6.6', 'android16-6.12')) {
 			$makeExtras += 'W=1'
 		}
@@ -343,6 +353,39 @@ function Build-KernelLkm {
 	return $lkmOutput
 }
 
+function Invoke-ViolaTool {
+	param([string[]]$Arguments)
+	$toolArguments = @((Join-Path $script:RepoRoot 'tools/viola.py')) + $Arguments
+	if ($env:VIOLA_GPG -and $Arguments[0] -in @('prepare', 'sign')) {
+		$toolArguments += @('--gpg', $env:VIOLA_GPG)
+	}
+	Invoke-Native -FilePath $script:ViolaPython -ArgumentList $toolArguments
+}
+
+function Prepare-Viola {
+	$ndkLine = Get-Content (Join-Path $script:NdkRoot 'source.properties') | Where-Object { $_ -match '^Pkg.Revision\s*=' } | Select-Object -First 1
+	$ndkRevision = ($ndkLine -replace '^Pkg.Revision\s*=\s*', '').Trim()
+	$stripMode = if ($script:StripAndroid) { 1 } else { 0 }
+	$ddkRelease = if ($env:DDK_RELEASE) { $env:DDK_RELEASE } elseif ($env:YZ_DDK_RELEASE) { $env:YZ_DDK_RELEASE } else { '20260313' }
+	$buildConfig = "api=31;ndk=$ndkRevision;strip=$stripMode;ddk=$ddkRelease"
+	$prepareArguments = @('prepare', '--out', $script:ViolaContext, '--profile', $script:ViolaProfile, '--version-code', "$script:VersionCode", '--build-config', $buildConfig)
+	if ($script:ViolaKey) { $prepareArguments += @('--key', $script:ViolaKey) }
+	if ($script:ViolaPublicKey) { $prepareArguments += @('--public-key', $script:ViolaPublicKey) }
+	Invoke-ViolaTool -Arguments $prepareArguments
+}
+
+function Build-ViolaHost {
+	$compiler = if ($env:VIOLA_HOST_CC) { $env:VIOLA_HOST_CC } else { 'clang' }
+	$verifier = Join-Path $script:OutDir 'viola-host.exe'
+	$shared = Join-Path $script:RepoRoot 'shared/viola'
+	$compileArguments = @('-std=c11', '-O2', '-D_CRT_SECURE_NO_WARNINGS', "-I$shared", "-I$script:ViolaContext",
+		(Join-Path $script:RepoRoot 'userspace/viola/host_verify.c'),
+		(Join-Path $shared 'viola.c'), (Join-Path $shared 'vendor/monocypher.c'),
+		(Join-Path $shared 'vendor/monocypher-ed25519.c'), '-o', $verifier)
+	Invoke-Native -FilePath $compiler -ArgumentList $compileArguments | Out-Host
+	return $verifier
+}
+
 function Build-Userspace {
 	Write-Host '>>> [2/4] Build payloads/daemon/client ...' -ForegroundColor Cyan
 	$buildDirArm64 = Join-Path $script:RepoRoot 'build-win-arm64'
@@ -352,6 +395,7 @@ function Build-Userspace {
 	Build-CMakeProject -Name 'YukiZygisk payload + daemon (armv7)' -SourceDirectory $script:RepoRoot -BuildDirectory $buildDirArmv7 -Abi 'armeabi-v7a' -Platform 31
 
 	New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null
+	Copy-RequiredFile -Source (Join-Path $buildDirArm64 'userspace/viola/viola') -Destination (Join-Path $script:OutDir 'viola')
 	Copy-RequiredFile -Source (Join-Path $buildDirArm64 'userspace/zygisk/core/libzygisk64.so') -Destination (Join-Path $script:OutDir 'libzygisk64.so')
 	Copy-RequiredFile -Source (Join-Path $buildDirArm64 'userspace/zygisk/core/libyukilinker64.so') -Destination (Join-Path $script:OutDir 'libyukilinker64.so')
 	Copy-RequiredFile -Source (Join-Path $buildDirArm64 'userspace/zygisk/core/libyukizncore64.so') -Destination (Join-Path $script:OutDir 'libyukizncore64.so')
@@ -363,6 +407,7 @@ function Build-Userspace {
 	Copy-RequiredFile -Source (Join-Path $buildDirArmv7 'userspace/zygisk/core/libyukizncore32.so') -Destination (Join-Path $script:OutDir 'libyukizncore32.so')
 	Copy-RequiredFile -Source (Join-Path $buildDirArmv7 'userspace/zygisk/daemon/zygiskd32') -Destination (Join-Path $script:OutDir 'zygiskd32')
 
+	Strip-AndroidFile -FilePath (Join-Path $script:OutDir 'viola')
 	Strip-AndroidFile -FilePath (Join-Path $script:OutDir 'libzygisk64.so')
 	Strip-AndroidFile -FilePath (Join-Path $script:OutDir 'libyukilinker64.so')
 	Strip-AndroidFile -FilePath (Join-Path $script:OutDir 'libyukizncore64.so')
@@ -395,11 +440,6 @@ function Stage-Module {
 		Where-Object { $_.Extension -ieq '.sh' } |
 		ForEach-Object { Normalize-LineEndingsLf -Path $_.FullName }
 
-	Copy-RequiredFile -Source (Join-Path $script:RepoRoot 'LICENSE') -Destination (Join-Path $zipDir 'LICENSE')
-	Copy-RequiredFile -Source (Join-Path $script:RepoRoot 'LICENSE-GPL-2.0') -Destination (Join-Path $zipDir 'LICENSE-GPL-2.0')
-	Copy-RequiredFile -Source (Join-Path $script:RepoRoot 'NOTICE') -Destination (Join-Path $zipDir 'NOTICE')
-	Copy-RequiredFile -Source (Join-Path $script:RepoRoot 'userspace/zygisk/third_party/lsplt/LICENSE') -Destination (Join-Path $zipDir 'LICENSE-LSPLT')
-
 	$lkmDir = Join-Path $zipDir 'lkm'
 	New-Item -ItemType Directory -Path $lkmDir -Force | Out-Null
 	Copy-RequiredFile -Source $kernelOut -Destination (Join-Path $lkmDir "$(Split-Path -Leaf $kernelOut)")
@@ -408,6 +448,7 @@ function Stage-Module {
 	$lib64Dir = Join-Path $zipDir 'lib64'
 	$lib32Dir = Join-Path $zipDir 'lib'
 	New-Item -ItemType Directory -Path $binDir, $lib64Dir, $lib32Dir -Force | Out-Null
+	Copy-RequiredFile -Source (Join-Path $script:OutDir 'viola') -Destination (Join-Path $binDir 'viola')
 	Copy-RequiredFile -Source (Join-Path $script:OutDir 'zygiskd64') -Destination (Join-Path $binDir 'zygiskd64')
 	Copy-RequiredFile -Source (Join-Path $script:OutDir 'zygiskd32') -Destination (Join-Path $binDir 'zygiskd32')
 	Copy-RequiredFile -Source (Join-Path $script:OutDir 'yzctl') -Destination (Join-Path $binDir 'yzctl')
@@ -418,6 +459,12 @@ function Stage-Module {
 	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukilinker32.so') -Destination (Join-Path $lib32Dir 'libyukilinker.so')
 	Copy-RequiredFile -Source (Join-Path $script:OutDir 'libyukizncore32.so') -Destination (Join-Path $lib32Dir 'libyukizncore.so')
 
+	# Legal texts remain in the source repository.  Keep generated module
+	# artifacts lean by excluding standalone license/notice files everywhere,
+	# including vendored WebUI assets.
+	Get-ChildItem -LiteralPath $zipDir -Recurse -File |
+		Where-Object { $_.Name -match '^(?i:license|notice|copying)' } |
+		Remove-Item -Force
 	return $zipDir
 }
 
@@ -480,6 +527,12 @@ try {
 	$script:InstallPackage = $false
 	$script:StripAndroid = $true
 	$script:AdbSerial = $null
+	$script:ViolaProfile = if ($env:VIOLA_PROFILE) { $env:VIOLA_PROFILE } else { 'official' }
+	$script:ViolaKey = $env:VIOLA_KEY
+	$script:ViolaPublicKey = $env:VIOLA_PUBLIC_KEY
+	$script:ViolaPython = if ($env:VIOLA_PYTHON) { $env:VIOLA_PYTHON } else { 'python' }
+	$script:ViolaContext = Join-Path $script:RepoRoot 'build/viola'
+
 
 	for ($index = 0; $index -lt $args.Count; $index++) {
 		$argument = [string]$args[$index]
@@ -490,7 +543,17 @@ try {
 				$script:Kmi = [string]$args[$index]
 				break
 			}
-			'--clean' { $script:CleanBuild = $true; break }
+			{ $_ -in @('--viola-profile', '--viola-key', '--viola-public-key') } {
+				if ($index + 1 -ge $args.Count) { throw "$argument requires value" }
+				$index++
+				switch ($argument) {
+					'--viola-profile' { $script:ViolaProfile = [string]$args[$index] }
+					'--viola-key' { $script:ViolaKey = [string]$args[$index] }
+					'--viola-public-key' { $script:ViolaPublicKey = [string]$args[$index] }
+				}
+				break
+			}
+			'--clean'  { $script:CleanBuild = $true; break }
 			'--skip-lkm' { $script:SkipLkm = $true; break }
 			{ $_ -in @('-i', '--install') } { $script:InstallPackage = $true; break }
 			'--serial' {
@@ -508,6 +571,10 @@ try {
 	if (-not ($script:Kmi -match '^[A-Za-z0-9.-]+$')) {
 		throw "Invalid KMI: $($script:Kmi)"
 	}
+
+	$kmiNames = @('android12-5.10','android13-5.10','android13-5.15','android14-5.15','android14-6.1','android15-6.6','android16-6.12')
+	$script:KmiId = [Array]::IndexOf($kmiNames, $script:Kmi) + 1
+	if ($script:KmiId -le 0) { throw "Unsupported KMI: $script:Kmi" }
 
 	$script:SdkRoot = Resolve-AndroidSdk
 	$script:NdkRoot = Resolve-Ndk
@@ -538,9 +605,15 @@ try {
 	}
 
 	Get-ComputeVersion
-	$kmiKo = Build-KernelLkm
+	if ($script:ViolaProfile -eq 'dev') { $script:VersionName += '-dev' }
+	Prepare-Viola
 	Build-Userspace
+	Invoke-ViolaTool -Arguments @('loader', '--context', $script:ViolaContext, '--image', (Join-Path $script:OutDir 'viola'))
+	$kmiKo = Build-KernelLkm
+	$hostVerifier = Build-ViolaHost
 	$packageDir = Stage-Module
+	Invoke-ViolaTool -Arguments @('sign', '--context', $script:ViolaContext, '--module-dir', $packageDir, '--verifier', $hostVerifier)
+	Invoke-Native -FilePath $script:ViolaPython -ArgumentList @((Join-Path $script:RepoRoot 'tools/module_checksums.py'), $packageDir)
 	$zipPath = Compress-ModulePackage -PackageDir $packageDir
 
 	Get-Item -LiteralPath $zipPath | Format-List FullName,Length
