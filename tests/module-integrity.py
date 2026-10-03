@@ -252,6 +252,23 @@ class ModuleIntegrityTests(unittest.TestCase):
             self.changed_archive(missing=("lib64/libzygisk.so.sha256",)), "missing checksum"
         )
 
+    def test_symlinked_inventory_and_payload_checksums_are_rejected(self) -> None:
+        # The link target contains the correct digest, so rejection must come
+        # from the file-type check, not from a missing target or bad checksum.
+        target = self.root / "external-checksum"
+        for name in ("files.list", "bin/viola", "webroot/index.html"):
+            target.write_bytes(self.entries[name + ".sha256"])
+            archive = self.archive_with_symlink(name + ".sha256", str(target))
+            for shell_name, shell in self.shells:
+                with self.subTest(file=name, shell=shell_name):
+                    result, output, _, temporary = self.run_hook(shell, archive)
+                    sidecar = next(temporary.glob("yz-verify.*/hashes/" + name + ".sha256"))
+                    self.assertTrue(sidecar.is_symlink(), output)
+                    self.assertEqual(sidecar.read_bytes(), self.entries[name + ".sha256"])
+                    self.assertEqual(result.returncode, 1, output)
+                    self.assertNotIn(VIOLA_MARKER, output, output)
+                    self.assertIn("Missing checksum: " + name, output)
+
     def test_missing_payload_and_checksum(self) -> None:
         self.assert_rejected(
             self.changed_archive(missing=("webroot/index.html", "webroot/index.html.sha256")),

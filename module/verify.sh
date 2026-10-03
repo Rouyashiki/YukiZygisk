@@ -42,7 +42,9 @@ extract() {
 	fi
 	unzip -o "$verify_zip" "$verify_file.sha256" -d "$YZ_VERIFY_DIR/hashes" >&2 ||
 		abort_verify "Unable to extract $verify_file.sha256"
-	[ -f "$verify_hash_path" ] || abort_verify "Missing checksum: $verify_file"
+	if [ ! -f "$verify_hash_path" ] || [ -L "$verify_hash_path" ]; then
+		abort_verify "Missing checksum: $verify_file"
+	fi
 	verify_hash="$(cat "$verify_hash_path")"
 	[ "${#verify_hash}" -eq 64 ] || abort_verify "Invalid checksum: $verify_file"
 	case "$verify_hash" in
