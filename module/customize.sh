@@ -78,11 +78,29 @@ chmod 0644 "$MODPATH"/lkm/*.ko "$MODPATH/common.sh"
 chmod 0644 "$MODPATH"/lib64/*.so "$MODPATH"/lib/*.so
 chmod 0755 "$MODPATH/bin/zygiskd64" "$MODPATH/bin/zygiskd32" "$MODPATH/bin/yzctl" \
 	"$MODPATH/post-fs-data.sh" \
-	"$MODPATH/boot-completed.sh" "$MODPATH/action.sh"
+	"$MODPATH/boot-completed.sh" "$MODPATH/action.sh" \
+	"$MODPATH/cleanup.sh" "$MODPATH/uninstall.sh"
 
 BASE_DIR="/data/adb/yukizygisk"
 mkdir -p "$BASE_DIR/lib"
 chmod 0755 "$BASE_DIR" "$BASE_DIR/lib"
+
+if [ ! -f "$MODPATH/module.prop" ] || [ -L "$MODPATH/module.prop" ]; then
+	abort "! Missing regular module description"
+fi
+if [ ! -f "$MODPATH/cleanup.sh" ] || [ -L "$MODPATH/cleanup.sh" ]; then
+	abort "! Missing regular cleanup script"
+fi
+YZ_ORIG_TMP="$(mktemp "$MODPATH/.module.prop.orig.XXXXXX")" ||
+	abort "! Cannot save original module description"
+if ! cat "$MODPATH/module.prop" >"$YZ_ORIG_TMP" ||
+	! chmod 0644 "$YZ_ORIG_TMP" ||
+	! mv -f "$YZ_ORIG_TMP" "$MODPATH/module.prop.orig"; then
+	rm -f "$YZ_ORIG_TMP"
+	abort "! Cannot save original module description"
+fi
+sh "$MODPATH/cleanup.sh" --install-hook ||
+	abort "! Cannot install module cleanup hook"
 
 ui_print "- Selected kernel module: $KMI"
 ui_print "- YukiZygisk installed"

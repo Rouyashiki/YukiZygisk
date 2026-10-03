@@ -12,13 +12,16 @@
 #include "log.hpp"
 #endif
 #include "crash_monitor.hpp"
+#if defined(__LP64__)
+#include "module_description.hpp"
+#endif
+#include "kernel/uapi/viola.h"
 #include "native_modules.hpp"
 #include "root_policy.hpp"
-#include "kernel/uapi/viola.h"
 #include "uapi/yukizygisk.h"
-#include "viola_build.h"
 #include "userspace/zygisk/load_policy.hpp"
 #include "userspace/zygisk/settings.hpp"
+#include "viola_build.h"
 
 #include "json.hpp"
 
@@ -2341,6 +2344,33 @@ bool send_dlopen_offset() {
   return ret == 0;
 }
 
+#if defined(__LP64__)
+void refresh_module_description() {
+  const std::string module_dir = own_module_dir();
+  if (module_dir.empty())
+    return;
+  yz_viola_status viola{};
+  viola.size = sizeof(viola);
+  viola.version = YZ_VIOLA_VERSION;
+  if (yzhost::ctl(YZ_IOCTL_VIOLA_STATUS, &viola) != 0 ||
+      viola.size != sizeof(viola) || viola.version != YZ_VIOLA_VERSION ||
+      viola.role != YZ_VIOLA_DAEMON64 ||
+      viola.owner_pid != static_cast<uint32_t>(getpid()))
+    return;
+  std::vector<yz_runtime_record> records(YZ_RUNTIME_RECORD_MAX);
+  yz_runtime_query_cmd runtime{};
+  runtime.capacity = static_cast<uint32_t>(records.size());
+  runtime.entries =
+      static_cast<__aligned_u64>(reinterpret_cast<uintptr_t>(records.data()));
+  if (yzhost::ctl(YZ_IOCTL_GET_RUNTIME, &runtime) != 0 ||
+      runtime.count > records.size())
+    return;
+  (void)yukizygisk::description::update(
+      module_dir, yukizygisk::description::render(
+                      viola, runtime, records.data(), runtime.count));
+}
+#endif
+
 int run_daemon() {
   int ready_fd = consume_ready_fd();
   yzhost::load_env();
@@ -2443,7 +2473,20 @@ int run_daemon() {
         yzhost::config_path().c_str(), yzpolicy::source_name());
   notify_ready(ready_fd, true);
 
+#if defined(__LP64__)
+  refresh_module_description();
+  auto next_description_check =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+#endif
+
   for (;;) {
+#if defined(__LP64__)
+    if (std::chrono::steady_clock::now() >= next_description_check) {
+      refresh_module_description();
+      next_description_check =
+          std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    }
+#endif
     reap_terminating_companions();
     g_crash_monitor.tick();
     std::vector<pollfd> poll_fds;
@@ -2504,6 +2547,17 @@ int run_daemon() {
     }
     if (!g_terminating_companions.empty())
       poll_timeout = poll_timeout < 0 ? 1000 : std::min(poll_timeout, 1000);
+#if defined(__LP64__)
+    const auto description_wait =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            next_description_check - std::chrono::steady_clock::now())
+            .count();
+    const int description_timeout = static_cast<int>(
+        std::max<int64_t>(0, std::min<int64_t>(description_wait, INT_MAX)));
+    poll_timeout = poll_timeout < 0
+                       ? description_timeout
+                       : std::min(poll_timeout, description_timeout);
+#endif
 
     if (poll(poll_fds.data(), poll_fds.size(), poll_timeout) < 0) {
       if (errno == EINTR)
@@ -2549,6 +2603,12 @@ int run_daemon() {
 
     // Apply crash decisions before serving new module image requests.
     nl_drain(nlfd);
+#if defined(__LP64__)
+    if (poll_fds[1].revents & POLLIN)
+      next_description_check =
+          std::min(next_description_check,
+                   std::chrono::steady_clock::now() + std::chrono::seconds(1));
+#endif
     if (poll_fds[tombstone_watch_index].revents != 0)
       g_crash_monitor.drain();
     if (poll_fds[0].revents & POLLIN) {

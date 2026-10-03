@@ -21,7 +21,7 @@ set(ZYGISKD_SOURCES
   root_policy.cpp
   zygiskd.cpp)
 if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
-  list(APPEND ZYGISKD_SOURCES log.cpp)
+  list(APPEND ZYGISKD_SOURCES log.cpp module_description.cpp)
 endif()
 
 add_executable(${ZYGISKD_TARGET} ${ZYGISKD_SOURCES})

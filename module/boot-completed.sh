@@ -24,6 +24,8 @@ if "$MODDIR/bin/yzctl" status --json >/dev/null 2>>"$LOG_FILE"; then
 fi
 
 log "kernel control unavailable; unloading yukizygisk.ko"
+"$MODDIR/bin/yzctl" description kernel-unavailable --module-dir "$MODDIR" \
+	>>"$LOG_FILE" 2>&1 || log "failed to update module description"
 if ! grep -q '^yukizygisk ' /proc/modules 2>/dev/null; then
 	log "yukizygisk.ko already absent"
 	exit 0

@@ -93,8 +93,22 @@ log() {
 	echo "post-fs-data: $*" >>"$LOG_FILE"
 }
 
+set_description() {
+	"$MODDIR/bin/yzctl" description "$1" --module-dir "$MODDIR" \
+		>>"$LOG_FILE" 2>&1 || log "failed to update module description"
+}
+
+set_description starting
+
+if [ ! -e /data/adb/service.d/.yz_cleanup.sh ] &&
+	[ ! -L /data/adb/service.d/.yz_cleanup.sh ]; then
+	sh "$MODDIR/cleanup.sh" --install-hook ||
+		log "failed to restore module cleanup hook"
+fi
+
 if [ ! -x "$MODDIR/bin/viola" ]; then
 	log "missing executable Viola verifier"
+	set_description startup-failed
 	exit 0
 fi
 
@@ -102,5 +116,6 @@ log "starting authenticated YukiZygisk core"
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_CONFIG_FILE LD_DEBUG LD_DEBUG_OUTPUT
 if ! /system/bin/env -i PATH=/system/bin:/system/xbin "$MODDIR/bin/viola" launch --module-dir "$MODDIR" >>"$LOG_FILE" 2>&1; then
 	log "Viola refused startup; see verification error above"
+	set_description startup-failed
 fi
 exit 0

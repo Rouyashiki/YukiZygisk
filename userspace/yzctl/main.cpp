@@ -9,6 +9,7 @@
 
 #include "host.hpp"
 #include "status.hpp"
+#include "userspace/zygisk/daemon/module_description.hpp"
 #include "userspace/zygisk/settings.hpp"
 
 #include "uapi/yukizygisk.h"
@@ -26,6 +27,8 @@ void usage(FILE *stream) {
           "Usage:\n"
           "  yzctl status [--json] [--modules-dir DIR] [--config FILE]\n"
           "  yzctl reload\n"
+          "  yzctl description {starting|startup-failed|kernel-unavailable} "
+          "--module-dir DIR\n"
           "  yzctl config get\n"
           "  yzctl config set KEY VALUE [KEY VALUE ...]\n");
 }
@@ -125,6 +128,30 @@ int reload_command(int argc) {
   return 0;
 }
 
+int description_command(int argc, char **argv) {
+  if (argc < 5) {
+    usage(stderr);
+    return 2;
+  }
+  const char *state = nullptr;
+  if (strcmp(argv[2], "starting") == 0)
+    state = "daemon⏳ kernel⏳";
+  else if (strcmp(argv[2], "startup-failed") == 0)
+    state = "startup❌ | daemon❔ kernel❔";
+  else if (strcmp(argv[2], "kernel-unavailable") == 0)
+    state = "status❌ | daemon❔ kernel❔";
+  if (state == nullptr || strcmp(argv[3], "--module-dir") != 0 ||
+      argv[4][0] == '\0' || argc != 5) {
+    usage(stderr);
+    return 2;
+  }
+  if (!yukizygisk::description::update(argv[4], state)) {
+    fprintf(stderr, "yzctl: module description update failed\n");
+    return 1;
+  }
+  return 0;
+}
+
 int config_command(int argc, char **argv) {
   constexpr char path[] = "/data/adb/yukizygisk/yzconfig.json";
   if (argc == 3 && strcmp(argv[2], "get") == 0) {
@@ -162,6 +189,8 @@ int main(int argc, char **argv) {
     return status_command(argc, argv);
   if (strcmp(argv[1], "reload") == 0)
     return reload_command(argc);
+  if (strcmp(argv[1], "description") == 0)
+    return description_command(argc, argv);
   if (strcmp(argv[1], "config") == 0)
     return config_command(argc, argv);
   if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
