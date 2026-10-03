@@ -398,6 +398,10 @@ class ViolaTests(unittest.TestCase):
             path.write_bytes(original)
 
     def launcher_verify(self, directory=None, environment=None):
+        if environment is None:
+            # Match the clean launcher entry points without changing Python's environment.
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("LD_")}
         # Never call launch: this exercises only the production verify command.
         return subprocess.run([str(self.launcher_verifier), "verify", "--module-dir",
                                str(directory or self.module)], capture_output=True,
@@ -416,11 +420,13 @@ class ViolaTests(unittest.TestCase):
                     path.unlink()
                     path.write_bytes(saved)
 
-    def test_direct_launcher_rejects_loader_environment_controls(self):
-        environment = dict(os.environ, LD_LIBRARY_PATH=str(self.module / "lib64"))
-        result = self.launcher_verify(environment=environment)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b"loader environment", result.stderr)
+    def test_launcher_cleans_inherited_but_rejects_explicit_loader_controls(self):
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": str(self.module / "lib64")}):
+            result = self.launcher_verify()
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            result = self.launcher_verify(environment=dict(os.environ))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"loader environment", result.stderr)
 
     def test_compat_recovery_waits_for_kernel_ready_and_rejects_stale_or_failed_owner(self):
         import errno
