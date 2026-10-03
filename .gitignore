@@ -44,5 +44,9 @@ build/
 /build-win-*/
 /userspace/zygisk/core/build-*/
 
+# Viola host tooling caches
+__pycache__/
+*.pyc
+
 # Telegram bot session (contains authorization data)
 scripts/.yzbot_session

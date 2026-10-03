@@ -1,0 +1,9 @@
+Monocypher 4.0.3
+Upstream: https://github.com/LoupVaillant/Monocypher
+Commit: ab2b16dd619ad5f6979a4fbe69cfa324a6fcc35f
+License: BSD-2-Clause OR CC0-1.0 (full terms retained in each source file)
+
+Files copied from src/ and src/optional/ at the pinned commit.
+Local change: monocypher.h uses ../viola_port.h for Linux kernel types.
+Local change: VIOLA_NO_ARGON2 excludes the unused Argon2 block from kernel
+builds, preserving kernel stack-frame checks. Verification arithmetic is unchanged.

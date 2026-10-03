@@ -8,16 +8,20 @@ Current state:
 - `feature/zygote_*.c` and matching headers are imported from YukiSU commit
   `754182ed55923beba83484fa6624250a8c78cf39`.
 - `core/module.c` provides an independent module entry/exit path.
-- `core/bootstrap.c` installs a one-shot `prctl` kprobe bootstrap. The module
-  takes `bootstrap_cookie_lo` and optional `bootstrap_cookie_hi`; zygiskd calls
-  `prctl(YZ_PRCTL_BOOTSTRAP_OPTION, YZ_PRCTL_BOOTSTRAP_MAGIC_YUKIHOOK,
-  cookie_lo, cookie_hi, &fd)` and receives the control fd through the out
-  pointer before returning to userspace. If nobody claims the fd, the
-  `bootstrap_guard_delay_sec`/`bootstrap_guard_max_sec` guard watches for
-  zygote service sockets, then removes the hook and requests a best-effort
-  self-unload through `toybox rmmod yukizygisk`.
-- `core/control.c` exposes the YukiZygisk `YZ_IOCTL_*` UAPI through that
-  anonymous fd. There is no standalone `/dev/yukizygisk` misc device.
+- `core/bootstrap.c` queues `prctl` control-session requests into process
+  context. It performs no image reads or hashing in the kprobe callback.
+- `core/auth.c` authenticates the compiled Viola image before business hooks,
+  checks the signed core catalog, and owns process/mm/generation-bound roles.
+  A frozen approved file is required for each daemon exec transition. The main
+  daemon delegates a separate limited session for the existing 32-bit path.
+- `core/control.c` exposes the YukiZygisk `YZ_IOCTL_*` UAPI through anonymous
+  FDs. Root query/reload access cannot initialize a daemon or mutate runtime
+  targets. Queued mutations carry the original authorization generation and
+  target mm; owner exit/exec revokes authority independently of FD lifetime.
+- Self-owned loader/core/native payloads are checked from their actual staging
+  buffer, then sealed before FD delivery. Third-party module images retain the
+  generic staging path. Early-native admission uses the authenticated catalog;
+  ordinary and Tango paths also require the corresponding daemon readiness.
 - `host/host.h` and `host/adapter.c` are the temporary host adapter. They
   preserve source-level build boundaries while the remaining SELinux,
   root-backend, and daemon integrations are extracted.
@@ -48,16 +52,16 @@ owners; other root states are currently unsupported. The remaining hard
 dependencies are documented in `docs/source-inventory.md`.
 
 The standalone ioctl ABI uses only `YZ_IOCTL_*` with magic `'Y'`, but the ioctl
-file is delivered by one-shot bootstrap instead of a public device node. Do not
+file is delivered through authenticated startup instead of a public device node. Do not
 add `KSU_IOCTL_YZ_*` or magic `'K'` here; that ABI remains with the integrated
 YukiSU/YukiZygisk module.
 
-The intended standalone package shape is a normal module: `post-fs-data.sh`
-detects the exact GKI KMI from `uname -r`, loads the matching
-`lkm/<kmi>_yukizygisk.ko` with a per-boot cookie, starts `zygiskd`, and lets
-zygiskd claim the anonymous control fd immediately through the bootstrap call.
-Unknown or missing KMI targets fail closed. This intentionally gives up the
-early-native snapshot path as the default mode.
+The standalone package delegates startup to `bin/viola`. Viola chooses the
+matching KMI, verifies the signed manifest and exact KO buffer, and calls
+`init_module` itself. Cookie module parameters and the old cookie bootstrap
+are no longer accepted. An invalid catalog or core image fails closed without
+killing a target process. Existing metadata-based early-native images must
+match the same authenticated core catalog.
 
 Build shape:
 
@@ -68,3 +72,10 @@ Build shape:
 
 The default single target is pinned by `.ddk-version`; KMI-tagged outputs are
 written under `build/out/lkm/`.
+
+The build first prepares `build/viola` and the final stripped Viola digest.
+Direct kernel builds must provide `VIOLA_KMI_ID` (1 through 7 in the build
+script's target order); `VIOLA_BUILD_DIR` defaults to the sibling
+`build/viola`. Both the image identity and expected loader digest are preserved
+as ELF notes and checked by the package signer. See the top-level README for
+public-only official builds and independent development signing.

@@ -14,6 +14,8 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/mount.h>
+#include <linux/module.h>
+#include <linux/mm.h>
 #include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/pid.h>
@@ -28,6 +30,7 @@
 #include <uapi/linux/mount.h>
 
 #include "host/host.h"
+#include "core/auth.h"
 #include "host/mount.h"
 #include "host/runtime.h"
 
@@ -219,6 +222,8 @@ out_free:
 
 struct yz_umount_tw {
 	struct callback_head cb;
+	struct yz_auth_ticket ticket;
+	struct mm_struct *mm;
 };
 
 static void yz_umount_tw_func(struct callback_head *cb)
@@ -227,7 +232,8 @@ static void yz_umount_tw_func(struct callback_head *cb)
 	const struct cred *old_cred;
 	int ret;
 
-	if (current->flags & PF_EXITING)
+	if (current->flags & PF_EXITING || current->mm != tw->mm ||
+	    !yz_auth_ticket_begin(&tw->ticket))
 		goto out;
 
 	/* Runs as task_work in the target app, so /proc/self/mountinfo and
@@ -238,9 +244,12 @@ static void yz_umount_tw_func(struct callback_head *cb)
 	if (ret)
 		pr_info("yukizygisk: mount cleanup pid=%d failed: %d\n",
 			current->pid, ret);
+	yz_auth_end();
 
 out:
+	mmdrop(tw->mm);
 	kfree(tw);
+	module_put(THIS_MODULE);
 }
 
 int yz_host_umount_pid(pid_t pid)
@@ -258,6 +267,11 @@ int yz_host_umount_pid(pid_t pid)
 	rcu_read_unlock();
 	if (!task)
 		return -ESRCH;
+	ret = yz_auth_target_task(task);
+	if (ret) {
+		put_task_struct(task);
+		return ret;
+	}
 
 	uid = task_uid(task).val;
 	if (!yz_mount_is_appuid(uid)) {
@@ -273,9 +287,28 @@ int yz_host_umount_pid(pid_t pid)
 		return -ENOMEM;
 	}
 
+	ret = yz_auth_current_ticket(&tw->ticket);
+	if (ret || !try_module_get(THIS_MODULE)) {
+		kfree(tw);
+		put_task_struct(task);
+		return ret ?: -ENODEV;
+	}
+	task_lock(task);
+	tw->mm = task->mm;
+	if (tw->mm)
+		mmgrab(tw->mm);
+	task_unlock(task);
+	if (!tw->mm) {
+		module_put(THIS_MODULE);
+		kfree(tw);
+		put_task_struct(task);
+		return -ESRCH;
+	}
 	init_task_work(&tw->cb, yz_umount_tw_func);
 	ret = yz_task_work_add(task, &tw->cb, TWA_RESUME);
 	if (ret) {
+		mmdrop(tw->mm);
+		module_put(THIS_MODULE);
 		kfree(tw);
 		put_task_struct(task);
 		return -ESRCH;

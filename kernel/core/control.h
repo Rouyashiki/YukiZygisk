@@ -10,9 +10,13 @@
 #ifndef _YUKIZYGISK_CONTROL_H
 #define _YUKIZYGISK_CONTROL_H
 
+struct yz_auth_session;
+
 bool yukizygisk_control_available(void);
 int yukizygisk_control_init(void);
 void yukizygisk_control_exit(void);
-int yukizygisk_control_install_fd(bool bootstrap);
+int yukizygisk_control_install_fd(bool launcher);
+/* Takes ownership of session only on success. */
+int yukizygisk_control_install_session(struct yz_auth_session *session);
 
 #endif /* _YUKIZYGISK_CONTROL_H */

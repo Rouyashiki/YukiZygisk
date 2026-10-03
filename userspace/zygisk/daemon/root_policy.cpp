@@ -242,9 +242,12 @@ public:
     if (fd >= 0) {
       KsuGetInfoCmd info{};
       if (ioctl(fd, kKsuIoctlGetInfo, &info) == 0 && info.version != 0) {
-        fd_ = fd;
-        method_ = Method::Ioctl;
-        return true;
+        const int flags = fcntl(fd, F_GETFD);
+        if (flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0) {
+          fd_ = fd;
+          method_ = Method::Ioctl;
+          return true;
+        }
       }
       if (owns_fd)
         close(fd);
@@ -363,6 +366,7 @@ private:
 
 struct Context {
   bool enabled = false;
+  bool publish_cache = true;
   uint32_t owner = YZ_ROOT_OWNER_UAPI_NONE;
   uint32_t manager_appid = YZ_POLICY_REFRESH_ALL;
   uint32_t generation = 0;
@@ -442,6 +446,10 @@ bool parse_apatch(std::map<uint32_t, bool> *decisions) {
 }
 
 bool push_cache() {
+  // The compat daemon may consult the host locally, but only the primary
+  // daemon owns the kernel-wide cache and its generation sequence.
+  if (!g.publish_cache)
+    return true;
   if (g.control_fd < 0 || g.decisions.size() > YZ_POLICY_CACHE_MAX_ENTRIES)
     return false;
 
@@ -530,8 +538,9 @@ bool refresh_apatch() {
 
 } // namespace
 
-bool setup(int control_fd, const yz_root_status_cmd &status) {
+bool setup(int control_fd, const yz_root_status_cmd &status, bool publish_cache) {
   g.control_fd = control_fd;
+  g.publish_cache = publish_cache;
   g.owner = status.owner;
   g.enabled = (status.flags & YZ_ROOT_STATUS_POLICY_FALLBACK) != 0;
   if (!g.enabled)

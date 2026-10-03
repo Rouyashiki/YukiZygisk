@@ -14,8 +14,11 @@
 #include <linux/kallsyms.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/mm.h>
+#include <linux/sched/mm.h>
 #include <linux/path.h>
 #include <linux/printk.h>
+#include <linux/rcupdate.h>
 #include <linux/task_work.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -43,6 +46,7 @@ static int (*yz_task_work_add_fn)(struct task_struct *task,
 				  struct callback_head *twork,
 				  enum task_work_notify_mode mode);
 static typeof(&copy_from_kernel_nofault) yz_copy_from_kernel_nofault_fn;
+static typeof(&get_task_exe_file) yz_get_task_exe_file_fn;
 static typeof(&kallsyms_lookup_size_offset)
 	yz_kallsyms_lookup_size_offset_fn;
 
@@ -382,6 +386,31 @@ YZ_INDIRECT_CALL int yz_close_fd(unsigned int fd)
 	return yz_close_fd_fn ? yz_close_fd_fn(fd) : -ENOENT;
 }
 
+noinline struct file *yz_get_current_exe_file(void)
+{
+#if YZ_USE_KCFI
+	/* This declared API has a KCFI type word at its raw entry. */
+	return yz_get_task_exe_file_fn ? yz_get_task_exe_file_fn(current) : NULL;
+#else
+	struct mm_struct *mm = current->mm;
+	struct file *exe;
+
+	/* Older CFI kernels can export an anonymous jump-table slot while
+	 * kallsyms names only the raw body. Do not call that unchecked body.
+	 * Current holds its mm alive: acquire the executable through the
+	 * target headers' RCU and file-reference primitives instead. This
+	 * deliberately is not an arbitrary-task executable lookup. */
+	if (!mm)
+		return NULL;
+	rcu_read_lock();
+	exe = rcu_dereference(mm->exe_file);
+	if (exe && !get_file_rcu(exe))
+		exe = NULL;
+	rcu_read_unlock();
+	return exe;
+#endif
+}
+
 YZ_INDIRECT_CALL int yz_task_work_add(struct task_struct *task,
 				      struct callback_head *twork,
 				      enum task_work_notify_mode mode)
@@ -411,6 +440,12 @@ static int yz_resolve_runtime_symbols(void)
 	yz_close_fd_fn = (void *)yz_lookup_callable_quiet("close_fd");
 	yz_task_work_add_fn =
 		(void *)yz_lookup_callable_quiet("task_work_add");
+#if YZ_USE_KCFI
+	yz_get_task_exe_file_fn =
+		(typeof(yz_get_task_exe_file_fn))yz_lookup_callable_quiet("get_task_exe_file");
+	if (!yz_get_task_exe_file_fn)
+		return -ENOENT;
+#endif
 
 	if (!yz_prepare_creds_fn || !yz_abort_creds_fn ||
 	    !yz_override_creds_fn || !yz_revert_creds_fn || !yz_filp_open ||
@@ -471,6 +506,7 @@ void yz_host_runtime_exit(void)
 	yz_path_put_fn = NULL;
 	yz_close_fd_fn = NULL;
 	yz_task_work_add_fn = NULL;
+	yz_get_task_exe_file_fn = NULL;
 	yz_kallsyms_lookup_name = NULL;
 	yz_kallsyms_on_each_symbol = NULL;
 	yz_kallsyms_on_each_match_symbol = NULL;

@@ -20,10 +20,14 @@ struct yz_safemode_status_cmd;
 struct yz_zygote_variants_cmd;
 struct cred;
 struct file;
+struct task_struct;
 
 void yz_zygote_probe_init(void);
 void yz_zygote_probe_exit(void);
 bool yz_zygote_probe_is_native_runtime(pid_t pid, u64 start_boottime);
+u8 yz_zygote_probe_runtime_abi(pid_t pid);
+u8 yz_zygote_probe_task_abi(struct task_struct *task);
+u8 yz_zygote_probe_report_abi(u32 pid, u32 generation);
 void yz_zygote_probe_set_dlopen_off(u64 dlopen_off, u64 dlsym_off);
 void yz_zygote_probe_set_dlopen32_off(u64 dlopen_off, u64 dlsym_off);
 void yz_zygote_probe_set_yukilinker(bool enabled);

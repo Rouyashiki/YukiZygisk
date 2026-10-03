@@ -21,11 +21,44 @@ License
 
 Third-party components
 
+  - Viola statically includes lkmloader by Anatdx under the MIT License.
+    Its unmodified source and license are pinned in the submodule
+    userspace/viola/third_party/lkmloader. Generated packages do not carry
+    a separate loader executable or license files.
+    Source: https://github.com/Rouyashiki/lkmloader/tree/7c170534097d1d6c58e77b3e5198d30eb72ebf43
+
+  - module/verify.sh is adapted from RikkaApps/Riru-ModuleTemplate under
+    the MIT License. Copyright (c) 2020 Rikka. The source copy of the full
+    notice is module/LICENSE-ModuleTemplate; generated packages do not carry
+    standalone license or notice files.
+    Source: https://github.com/RikkaApps/Riru-ModuleTemplate/tree/98a1203492fe56258fa15e06d5239333f3b342d0
+
+    MIT License (Rikka, 2020): Permission is hereby granted, free of charge,
+    to any person obtaining a copy of this software and associated
+    documentation files (the "Software"), to deal in the Software without
+    restriction, including without limitation the rights to use, copy,
+    modify, merge, publish, distribute, sublicense, and/or sell copies of the
+    Software, and to permit persons to whom the Software is furnished to do
+    so, subject to the following conditions: The above copyright notice and
+    this permission notice shall be included in all copies or substantial
+    portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
+    WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+    THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+    LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+    CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH
+    THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  - Viola includes Monocypher 4.0.3 by Loup Vaillant under
+    BSD-2-Clause OR CC0-1.0. The source retains the original notices;
+    generated packages do not carry standalone license files.
+    Source: https://github.com/LoupVaillant/Monocypher/tree/4.0.3
+
   - The Zygisk public API header is derived from Magisk and is distributed
     under its original ISC terms. Copyright (c) 2022-2023 John "topjohnwu" Wu.
   - LSPlt is distributed under LGPL-3.0. Copyright (c) 2022 LSPosed.
     The complete linked source and build files are available in this source
-    tree; packaged builds include the LSPlt license as LICENSE-LSPLT.
+    tree; generated packages do not carry standalone license files.
   - XZ Embedded is by Lasse Collin and Igor Pavlov and has been placed in the
     public domain by its authors.
   - The AArch64 TLSDESC resolver assembly includes work from the Android Open
@@ -34,7 +67,8 @@ Third-party components
     userspace/zygisk/core/src/yukilinker_tlsdesc.S.
   - The WebUI bridge and static frontend structure are adapted from
     KOWX712/ksu-webui-demo under the MIT License. Copyright (c) 2025 KOWX712.
-    The license is included in webui/LICENSE and packaged with the WebUI.
+    The license is retained in webui/LICENSE in the source tree; generated
+    packages do not carry standalone license files.
   - Material Web 2.5.0 is by Google LLC and is distributed under Apache-2.0.
     Its selected components are bundled in webui/assets/material.js with
     their original copyright notices. The complete license is included in

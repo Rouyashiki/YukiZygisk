@@ -21,9 +21,70 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VIOLA_NDK_VERSION: "29.0.14206865"
 
 jobs:
+  prepare-viola:
+    name: Prepare public Viola build context
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Install certificate verification dependencies
+        run: python3 -m pip install -r tools/requirements-viola.txt
+
+      - name: Select fixed Android NDK
+        run: |
+          set -euo pipefail
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+
+      - name: Test Viola verification
+        run: python3 -m unittest discover -s tests/viola -p 'test_*.py'
+
+      - name: Build fixed-trust Viola and loader identity
+        run: |
+          set -euo pipefail
+          test -n "${ANDROID_NDK_HOME:-}"
+          ./build.sh viola
+
+      - name: Upload public build context
+        uses: actions/upload-artifact@v6
+        with:
+          name: yukizygisk-viola-context
+          path: |
+            build/viola/context.json
+            build/viola/publisher.pgp
+            build/viola/viola_build.h
+            build/viola/viola_loader.h
+          if-no-files-found: error
+
+      - name: Upload frozen Viola executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: yukizygisk-viola-arm64-v8a
+          path: build/out/viola
+          if-no-files-found: error
+
   build-lkm:
+    needs: prepare-viola
     strategy:
       fail-fast: false
       matrix:
@@ -39,9 +100,11 @@ jobs:
     with:
       kmi: ${{ matrix.kmi }}
       ddk_release: "20260313"
+      viola_context_artifact: yukizygisk-viola-context
 
   build-userspace:
-    name: Build arm64 userspace
+    name: Build ARM userspace
+    needs: prepare-viola
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -49,6 +112,39 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Install certificate verification dependencies
+        run: python3 -m pip install -r tools/requirements-viola.txt
+
+      - name: Install module integrity shell tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends busybox dash
+
+      - name: Select fixed Android NDK
+        run: |
+          set -euo pipefail
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+
+      - name: Download shared public build context
+        uses: actions/download-artifact@v7
+        with:
+          name: yukizygisk-viola-context
+          path: build/viola
 
       - name: Validate module scripts
         run: |
@@ -57,6 +153,7 @@ jobs:
           sh -n module/*.sh
           shellcheck build.sh tests/module-kmi.sh module/*.sh
           ./tests/module-kmi.sh
+          python3 tests/module-integrity.py
 
       - name: Build daemon, control client, and runtime payloads
         run: |
@@ -84,7 +181,9 @@ jobs:
 
   package:
     name: Package all KMIs
+    if: github.event_name != 'pull_request'
     needs:
+      - prepare-viola
       - build-lkm
       - build-userspace
     runs-on: ubuntu-latest
@@ -94,6 +193,40 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Install certificate verification dependencies
+        run: python3 -m pip install -r tools/requirements-viola.txt
+
+      - name: Select fixed Android NDK
+        run: |
+          set -euo pipefail
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+
+      - name: Download shared public build context
+        uses: actions/download-artifact@v7
+        with:
+          name: yukizygisk-viola-context
+          path: build/viola
+
+      - name: Download frozen Viola executable
+        uses: actions/download-artifact@v7
+        with:
+          name: yukizygisk-viola-arm64-v8a
+          path: build/out
 
       - name: Download all kernel modules
         uses: actions/download-artifact@v7
@@ -108,10 +241,27 @@ jobs:
           name: yukizygisk-userspace-arm64-v8a
           path: build/out
 
-      - name: Create all-KMI module package
+      - name: Sign and verify all-KMI module package
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          VIOLA_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
-          ./build.sh package --all-kmis --skip-kernel --skip-daemon --skip-ctl --skip-payloads
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "Official packaging requires GPG_PRIVATE_KEY."
+            exit 1
+          fi
+          VIOLA_SIGNING_HOME="$(mktemp -d)"
+          export GNUPGHOME="$VIOLA_SIGNING_HOME"
+          chmod 0700 "$VIOLA_SIGNING_HOME"
+          cleanup_signing() {
+            gpgconf --homedir "$VIOLA_SIGNING_HOME" --kill gpg-agent >/dev/null 2>&1 || true
+            rm -rf -- "$VIOLA_SIGNING_HOME"
+          }
+          trap cleanup_signing EXIT
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          unset GPG_PRIVATE_KEY
+          ./build.sh package --all-kmis --skip-viola --skip-kernel --skip-daemon --skip-ctl --skip-payloads
           unzip -Z1 build/out/YukiZygisk-*-all-kmi-arm64-v8a.zip | sort
 
       - name: Upload module package

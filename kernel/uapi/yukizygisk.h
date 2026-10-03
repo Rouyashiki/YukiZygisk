@@ -28,6 +28,7 @@ enum yz_event_type {
 	YZ_EV_SAFEMODE = 3,
 	YZ_EV_POLICY_REFRESH = 4,
 	YZ_EV_ZYGOTE_EXIT = 5,
+	YZ_EV_VIOLA_RECOVERY = 6,
 };
 
 #define YZ_POLICY_REFRESH_ALL ((__u32)~0U)

@@ -1,3 +1,6 @@
 [submodule "userspace/zygisk/third_party/lsplt"]
 	path = userspace/zygisk/third_party/lsplt
 	url = https://github.com/Anatdx/LSPlt.git
+[submodule "userspace/viola/third_party/lkmloader"]
+	path = userspace/viola/third_party/lkmloader
+	url = https://github.com/Rouyashiki/lkmloader.git

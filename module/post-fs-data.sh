@@ -18,7 +18,6 @@ PREVIOUS_RUNTIME_LOG="$RUNTIME_LOG_DIR/zygiskd64.old.log"
 PREVIOUS_ROLLOVER_LOG="$RUNTIME_LOG_DIR/zygiskd64.1.old.log"
 LOG_FILE="$BASE_DIR/zygiskd.log"
 CONFIG_FILE="$BASE_DIR/yzconfig.json"
-MODULES_DIR="/data/adb/modules"
 
 mkdir -p "$BASE_DIR" "$LIB_DIR" "$RUN_DIR" "$RUNTIME_LOG_DIR"
 chmod 0755 "$BASE_DIR" "$LIB_DIR" "$RUN_DIR"
@@ -94,91 +93,14 @@ log() {
 	echo "post-fs-data: $*" >>"$LOG_FILE"
 }
 
-if [ ! -f "$MODDIR/common.sh" ]; then
-	log "missing module KMI helpers"
-	exit 0
-fi
-# shellcheck source=/dev/null
-. "$MODDIR/common.sh"
-
-KERNEL_RELEASE="$(uname -r 2>/dev/null)"
-if ! KMI="$(yz_detect_kmi "$KERNEL_RELEASE")"; then
-	log "cannot detect GKI KMI from kernel release: $KERNEL_RELEASE"
-	exit 0
-fi
-KERNEL_MODULE="$(yz_kmi_ko "$MODDIR" "$KMI")"
-if [ ! -f "$KERNEL_MODULE" ]; then
-	SUPPORTED_KMIS="$(yz_list_supported_kmis "$MODDIR" | tr '\n' ' ')"
-	log "missing kernel module for $KMI; available: ${SUPPORTED_KMIS:-none}"
+if [ ! -x "$MODDIR/bin/viola" ]; then
+	log "missing executable Viola verifier"
 	exit 0
 fi
 
-random_cookie() {
-	c="$(od -An -N8 -tx8 /dev/urandom 2>/dev/null | tr -d ' \n')"
-	if [ -n "$c" ]; then
-		echo "0x$c"
-	else
-		echo "0x$(date +%s)$$"
-	fi
-}
-
-COOKIE="$(random_cookie)"
-
-chmod 0755 "$MODDIR/bin/zygiskd64" "$MODDIR/bin/zygiskd32" "$MODDIR/bin/yzctl" \
-	2>/dev/null || true
-
-copy_payload() {
-	source="$1"
-	destination="$2"
-	if [ ! -f "$source" ]; then
-		log "missing payload ${source##*/}"
-		exit 0
-	fi
-	if ! cp "$source" "$LIB_DIR/$destination.tmp" 2>>"$LOG_FILE"; then
-		log "copy ${source##*/} failed"
-		exit 0
-	fi
-	mv "$LIB_DIR/$destination.tmp" "$LIB_DIR/$destination" 2>>"$LOG_FILE" || exit 0
-	chmod 0644 "$LIB_DIR/$destination" 2>/dev/null || true
-}
-
-copy_payload "$MODDIR/lib64/libzygisk.so" libzygisk64.so
-copy_payload "$MODDIR/lib64/libyukilinker.so" libyukilinker64.so
-copy_payload "$MODDIR/lib64/libyukizncore.so" libyukizncore64.so
-copy_payload "$MODDIR/lib/libzygisk.so" libzygisk32.so
-copy_payload "$MODDIR/lib/libyukilinker.so" libyukilinker32.so
-copy_payload "$MODDIR/lib/libyukizncore.so" libyukizncore32.so
-
-if ! rm -f "$LIB_DIR/libzygisk.so" "$LIB_DIR/libyukilinker.so" \
-	"$LIB_DIR/libyukizncore.so" 2>>"$LOG_FILE"; then
-	log "remove legacy payloads failed"
-	exit 0
+log "starting authenticated YukiZygisk core"
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_CONFIG_FILE LD_DEBUG LD_DEBUG_OUTPUT
+if ! /system/bin/env -i PATH=/system/bin:/system/xbin "$MODDIR/bin/viola" launch --module-dir "$MODDIR" >>"$LOG_FILE" 2>&1; then
+	log "Viola refused startup; see verification error above"
 fi
-
-if grep -q '^yukizygisk ' /proc/modules 2>/dev/null; then
-	log "yukizygisk.ko already loaded"
-	exit 0
-fi
-
-INSMOD="$(command -v insmod 2>/dev/null || echo /system/bin/insmod)"
-KSU_MODULE_PRESENT=0
-if yz_ksu_module_loaded; then
-	KSU_MODULE_PRESENT=1
-	log "KernelSU module detected by lsmod"
-fi
-log "loading $KERNEL_MODULE for $KMI (release=$KERNEL_RELEASE) cookie=$COOKIE ksu_module_present=$KSU_MODULE_PRESENT"
-if ! "$INSMOD" "$KERNEL_MODULE" bootstrap_cookie_lo="$COOKIE" \
-	ksu_module_present="$KSU_MODULE_PRESENT" \
-	>>"$LOG_FILE" 2>&1; then
-	log "insmod failed"
-	exit 0
-fi
-
-log "starting zygiskd"
-YUKIZYGISK_BOOTSTRAP_COOKIE_LO="$COOKIE" \
-YUKIZYGISK_CONFIG="$CONFIG_FILE" \
-YUKIZYGISK_LOG_DIR="$RUNTIME_LOG_DIR" \
-YUKIZYGISK_MODULES_DIR="$MODULES_DIR" \
-"$MODDIR/bin/zygiskd64" >>"$LOG_FILE" 2>&1 &
-
 exit 0

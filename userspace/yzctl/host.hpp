@@ -8,6 +8,8 @@
  */
 #pragma once
 
+#include "kernel/uapi/viola.h"
+
 #include <string>
 
 namespace yzctl {
@@ -22,6 +24,8 @@ public:
 
   bool open(std::string *error);
   int call(unsigned long request, void *arg) const;
+  bool query_viola(yz_viola_status *status, bool *supported,
+                   std::string *error) const;
   bool available() const;
 
 private:

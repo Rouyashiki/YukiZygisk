@@ -20,6 +20,11 @@ on:
         required: false
         default: "20260313"
         type: string
+      viola_context_artifact:
+        description: Public Viola context artifact from the caller's prepare job
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       kmi:
@@ -38,10 +43,69 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VIOLA_NDK_VERSION: "29.0.14206865"
 
 jobs:
+  prepare-viola:
+    name: Prepare standalone Viola build context
+    if: inputs.viola_context_artifact == ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Prepare public context and frozen loader identity
+        env:
+          DDK_RELEASE: ${{ inputs.ddk_release }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install -r tools/requirements-viola.txt
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          export ANDROID_NDK_HOME="$viola_ndk_root" ANDROID_NDK="$viola_ndk_root"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+          ./build.sh viola
+
+      - name: Upload standalone public build context
+        uses: actions/upload-artifact@v6
+        with:
+          name: yukizygisk-viola-context-${{ inputs.kmi }}
+          path: |
+            build/viola/context.json
+            build/viola/publisher.pgp
+            build/viola/viola_build.h
+            build/viola/viola_loader.h
+          if-no-files-found: error
+
+      - name: Upload corresponding Viola executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: yukizygisk-viola-${{ inputs.kmi }}
+          path: build/out/viola
+          if-no-files-found: error
+
   build-lkm:
     name: Build ${{ inputs.kmi }}_yukizygisk.ko
+    needs: prepare-viola
+    if: >-
+      !cancelled() &&
+      (needs.prepare-viola.result == 'success' ||
+       (needs.prepare-viola.result == 'skipped' && inputs.viola_context_artifact != ''))
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
@@ -50,6 +114,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download public Viola build context
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.viola_context_artifact || format('yukizygisk-viola-context-{0}', inputs.kmi) }}
+          path: build/viola
 
       - name: Build kernel module
         env:
@@ -61,8 +134,20 @@ jobs:
             echo "KDIR is unavailable in the DDK container: ${KDIR:-<empty>}"
             exit 1
           fi
+          test -s build/viola/viola_build.h
+          test -s build/viola/viola_loader.h
+          case "$KMI" in
+            android12-5.10) kmi_id=1 ;;
+            android13-5.10) kmi_id=2 ;;
+            android13-5.15) kmi_id=3 ;;
+            android14-5.15) kmi_id=4 ;;
+            android14-6.1) kmi_id=5 ;;
+            android15-6.6) kmi_id=6 ;;
+            android16-6.12) kmi_id=7 ;;
+            *) echo "Unsupported KMI: $KMI"; exit 1 ;;
+          esac
 
-          make_args=(-C kernel -j"$(nproc --all)" KDIR="$KDIR" CC=clang)
+          make_args=(-C kernel -j"$(nproc --all)" KDIR="$KDIR" CC=clang VIOLA_KMI_ID="$kmi_id")
           case "$KMI" in
             android15-6.6|android16-6.12) make_args+=(W=1) ;;
           esac
