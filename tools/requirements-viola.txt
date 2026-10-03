@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# YukiZygisk - Viola build-time certificate verification dependencies
+# License: Apache-2.0
+# Author: Anatdx
+cryptography>=46.0.0,<47
