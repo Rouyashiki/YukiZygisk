@@ -5,8 +5,14 @@ YukiZygisk code currently implemented inside YukiSU.
 
 Current state:
 
-- `feature/zygote_*.c` and matching headers are imported from YukiSU commit
-  `754182ed55923beba83484fa6624250a8c78cf39`.
+- The feature implementation was initially extracted from YukiSU commit
+  `754182ed55923beba83484fa6624250a8c78cf39` and now uses focused units in
+  `feature/`: configuration, runtime records, safe mode, load policies,
+  early-native packets, payload staging, exec hooks, injection, lifecycle,
+  events and FD handoff. `api.h` exposes the core-facing interfaces;
+  `internal.h` holds interfaces shared by the feature units.
+- `feature/tango.c` retains the translated ARM32 bootstrap, and
+  `feature/zygote_exit.c` retains generation-bound exit diagnostics.
 - `core/module.c` provides an independent module entry/exit path.
 - `core/bootstrap.c` queues `prctl` control-session requests into process
   context. It performs no image reads or hashing in the kprobe callback.
@@ -37,7 +43,7 @@ Current state:
   `security_hook_heads` on older kernels.
 - `host/patch_text.c` provides the arm64 patch primitive used by the LSM
   backend.
-- `feature/zygote_orch.c` monitors successful `setresuid` through syscall
+- `feature/lifecycle.c` monitors successful `setresuid` through syscall
   tracepoints and defers specialize notifications through a workqueue. Do not
   add a direct syscall-table fallback here; use a host backend if a target lacks
   usable syscall tracepoints.

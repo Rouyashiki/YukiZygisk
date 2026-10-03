@@ -18,7 +18,7 @@
 
 #include "uapi/yukizygisk.h"
 #include "zygote_exit.h"
-#include "zygote_nl.h"
+#include "internal.h"
 
 #define YZ_EXIT_CAPACITY 16
 
@@ -45,7 +45,7 @@ static void yz_exit_work_fn(struct work_struct *work)
 		event = yz_exit_pending[yz_exit_tail];
 		yz_exit_tail = (yz_exit_tail + 1) % YZ_EXIT_CAPACITY;
 		spin_unlock_irqrestore(&yz_exit_lock, flags);
-		yz_zygote_nl_emit_zygote_exit(&event);
+		yz_events_emit_zygote_exit(&event);
 	}
 }
 

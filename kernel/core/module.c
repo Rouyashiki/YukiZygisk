@@ -14,14 +14,11 @@
 #include <linux/mutex.h>
 #include <linux/printk.h>
 
+#include "feature/api.h"
 #include "core/bootstrap.h"
 #include "core/auth.h"
 #include "core/control.h"
 #include "core/lifecycle.h"
-#include "feature/zygote_ctl.h"
-#include "feature/zygote_nl.h"
-#include "feature/zygote_orch.h"
-#include "feature/zygote_probe.h"
 #include "host/host.h"
 #include "uapi/yukizygisk.h"
 #include <viola.h>
@@ -31,19 +28,21 @@ VIOLA_EMBED_IDENTITY(VIOLA_ROLE_KO, VIOLA_ABI_ARM64, VIOLA_BUILD_KMI);
 
 static unsigned int yz_init_stage_mask = 0x3f;
 module_param_named(init_stage_mask, yz_init_stage_mask, uint, 0644);
-MODULE_PARM_DESC(init_stage_mask, "Debug stage mask: 0x01 probe, 0x02 nl, 0x04 orch, 0x08 ctl, 0x10 control, 0x20 bootstrap");
+MODULE_PARM_DESC(init_stage_mask,
+		 "Debug stage mask: 0x01 exec, 0x02 events, 0x04 lifecycle, "
+		 "0x08 fd_handoff, 0x10 control, 0x20 bootstrap");
 
-#define YZ_INIT_STAGE_PROBE 0x01u
-#define YZ_INIT_STAGE_NL 0x02u
-#define YZ_INIT_STAGE_ORCH 0x04u
-#define YZ_INIT_STAGE_CTL 0x08u
+#define YZ_INIT_STAGE_EXEC 0x01u
+#define YZ_INIT_STAGE_EVENTS 0x02u
+#define YZ_INIT_STAGE_LIFECYCLE 0x04u
+#define YZ_INIT_STAGE_FD_HANDOFF 0x08u
 #define YZ_INIT_STAGE_CONTROL 0x10u
 #define YZ_INIT_STAGE_BOOTSTRAP 0x20u
 
-static bool yz_stage_probe_active;
-static bool yz_stage_nl_active;
-static bool yz_stage_orch_active;
-static bool yz_stage_ctl_active;
+static bool yz_stage_exec_active;
+static bool yz_stage_events_active;
+static bool yz_stage_lifecycle_active;
+static bool yz_stage_fd_handoff_active;
 static bool yz_stage_control_active;
 static bool yz_stage_bootstrap_active;
 static bool yz_stage_lsm_active;
@@ -63,21 +62,21 @@ static void yukizygisk_deactivate_locked(bool skip_bootstrap)
 		yukizygisk_control_exit();
 		yz_stage_control_active = false;
 	}
-	if (yz_stage_ctl_active) {
-		yz_zygote_ctl_exit();
-		yz_stage_ctl_active = false;
+	if (yz_stage_fd_handoff_active) {
+		yz_fd_handoff_exit();
+		yz_stage_fd_handoff_active = false;
 	}
-	if (yz_stage_orch_active) {
-		yz_zygote_orch_exit();
-		yz_stage_orch_active = false;
+	if (yz_stage_lifecycle_active) {
+		yz_lifecycle_exit();
+		yz_stage_lifecycle_active = false;
 	}
-	if (yz_stage_nl_active) {
-		yz_zygote_nl_exit();
-		yz_stage_nl_active = false;
+	if (yz_stage_events_active) {
+		yz_events_exit();
+		yz_stage_events_active = false;
 	}
-	if (yz_stage_probe_active) {
-		yz_zygote_probe_exit();
-		yz_stage_probe_active = false;
+	if (yz_stage_exec_active) {
+		yz_exec_exit();
+		yz_stage_exec_active = false;
 	}
 	if (yz_stage_lsm_active) {
 		yz_host_lsm_exit();
@@ -127,44 +126,44 @@ static int __init yukizygisk_init(void)
 	yz_stage_lsm_active = true;
 	pr_info("yukizygisk: init step lsm done\n");
 
-	if (yz_init_stage_mask & YZ_INIT_STAGE_PROBE) {
-		pr_info("yukizygisk: init step zygote_probe\n");
-		yz_zygote_probe_init();
-		yz_stage_probe_active = true;
-		pr_info("yukizygisk: init step zygote_probe done\n");
+	if (yz_init_stage_mask & YZ_INIT_STAGE_EXEC) {
+		pr_info("yukizygisk: init step exec\n");
+		yz_exec_init();
+		yz_stage_exec_active = true;
+		pr_info("yukizygisk: init step exec done\n");
 	} else {
-		pr_info("yukizygisk: init step zygote_probe skipped\n");
+		pr_info("yukizygisk: init step exec skipped\n");
 	}
-	if (yz_init_stage_mask & YZ_INIT_STAGE_NL) {
-		pr_info("yukizygisk: init step zygote_nl\n");
-		yz_zygote_nl_init();
-		yz_stage_nl_active = true;
+	if (yz_init_stage_mask & YZ_INIT_STAGE_EVENTS) {
+		pr_info("yukizygisk: init step events\n");
+		yz_events_init();
+		yz_stage_events_active = true;
 		if (yz_host_policy_uses_fallback()) {
 			struct yz_host_root_status status = { 0 };
 
 			yz_host_get_root_status(&status);
-			yz_zygote_nl_emit_policy_refresh(
-				status.owner, YZ_POLICY_REFRESH_ALL);
+			yz_events_emit_policy_refresh(status.owner,
+						      YZ_POLICY_REFRESH_ALL);
 		}
-		pr_info("yukizygisk: init step zygote_nl done\n");
+		pr_info("yukizygisk: init step events done\n");
 	} else {
-		pr_info("yukizygisk: init step zygote_nl skipped\n");
+		pr_info("yukizygisk: init step events skipped\n");
 	}
-	if (yz_init_stage_mask & YZ_INIT_STAGE_ORCH) {
-		pr_info("yukizygisk: init step zygote_orch\n");
-		yz_zygote_orch_init();
-		yz_stage_orch_active = true;
-		pr_info("yukizygisk: init step zygote_orch done\n");
+	if (yz_init_stage_mask & YZ_INIT_STAGE_LIFECYCLE) {
+		pr_info("yukizygisk: init step lifecycle\n");
+		yz_lifecycle_init();
+		yz_stage_lifecycle_active = true;
+		pr_info("yukizygisk: init step lifecycle done\n");
 	} else {
-		pr_info("yukizygisk: init step zygote_orch skipped\n");
+		pr_info("yukizygisk: init step lifecycle skipped\n");
 	}
-	if (yz_init_stage_mask & YZ_INIT_STAGE_CTL) {
-		pr_info("yukizygisk: init step zygote_ctl\n");
-		yz_zygote_ctl_init();
-		yz_stage_ctl_active = true;
-		pr_info("yukizygisk: init step zygote_ctl done\n");
+	if (yz_init_stage_mask & YZ_INIT_STAGE_FD_HANDOFF) {
+		pr_info("yukizygisk: init step fd_handoff\n");
+		yz_fd_handoff_init();
+		yz_stage_fd_handoff_active = true;
+		pr_info("yukizygisk: init step fd_handoff done\n");
 	} else {
-		pr_info("yukizygisk: init step zygote_ctl skipped\n");
+		pr_info("yukizygisk: init step fd_handoff skipped\n");
 	}
 
 	{

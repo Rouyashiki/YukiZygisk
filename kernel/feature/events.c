@@ -14,19 +14,18 @@
 #include <net/netlink.h>
 #include <net/sock.h>
 
-#include "feature/zygote_nl.h"
-#include "uapi/yukizygisk.h"
+#include "internal.h"
 #include "klog.h" // IWYU pragma: keep
 
-static struct sock *yz_sock;
+static struct sock *yz_events_sock;
 
-static void yz_zygote_nl_emit_event(u32 type, u32 pid, u32 appid)
+static void yz_events_emit_event(u32 type, u32 pid, u32 appid)
 {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
 	struct yz_event *ev;
 
-	if (!yz_sock)
+	if (!yz_events_sock)
 		return;
 
 	skb = nlmsg_new(sizeof(*ev), GFP_ATOMIC);
@@ -45,41 +44,41 @@ static void yz_zygote_nl_emit_event(u32 type, u32 pid, u32 appid)
 	ev->appid = appid;
 
 	/* -ESRCH just means no zygiskd is listening yet -- harmless. */
-	nlmsg_multicast(yz_sock, skb, 0, YZ_NL_GROUP_EVENTS, GFP_ATOMIC);
+	nlmsg_multicast(yz_events_sock, skb, 0, YZ_NL_GROUP_EVENTS, GFP_ATOMIC);
 }
 
-void yz_zygote_nl_emit_specialize(u32 pid, u32 appid)
+void yz_events_emit_specialize(u32 pid, u32 appid)
 {
-	yz_zygote_nl_emit_event(YZ_EV_SPECIALIZE, pid, appid);
+	yz_events_emit_event(YZ_EV_SPECIALIZE, pid, appid);
 }
 
 /* Ask every listening zygiskd to re-read yzconfig.json (manager changed it). */
-void yz_zygote_nl_emit_reload(void)
+void yz_events_emit_reload(void)
 {
-	yz_zygote_nl_emit_event(YZ_EV_RELOAD, 0, 0);
+	yz_events_emit_event(YZ_EV_RELOAD, 0, 0);
 }
 
-void yz_zygote_nl_emit_viola_recovery(u32 owner)
+void yz_events_emit_viola_recovery(u32 owner)
 {
-	yz_zygote_nl_emit_event(YZ_EV_VIOLA_RECOVERY, owner, 0);
+	yz_events_emit_event(YZ_EV_VIOLA_RECOVERY, owner, 0);
 }
 
-void yz_zygote_nl_emit_safemode(u32 pid, u32 crashes)
+void yz_events_emit_safemode(u32 pid, u32 crashes)
 {
-	yz_zygote_nl_emit_event(YZ_EV_SAFEMODE, pid, crashes);
+	yz_events_emit_event(YZ_EV_SAFEMODE, pid, crashes);
 }
 
-void yz_zygote_nl_emit_policy_refresh(u32 owner, u32 uid)
+void yz_events_emit_policy_refresh(u32 owner, u32 uid)
 {
-	yz_zygote_nl_emit_event(YZ_EV_POLICY_REFRESH, owner, uid);
+	yz_events_emit_event(YZ_EV_POLICY_REFRESH, owner, uid);
 }
 
-void yz_zygote_nl_emit_zygote_exit(const struct yz_zygote_exit_event *event)
+void yz_events_emit_zygote_exit(const struct yz_zygote_exit_event *event)
 {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
 
-	if (!yz_sock)
+	if (!yz_events_sock)
 		return;
 	skb = nlmsg_new(sizeof(*event), GFP_KERNEL);
 	if (!skb)
@@ -90,26 +89,28 @@ void yz_zygote_nl_emit_zygote_exit(const struct yz_zygote_exit_event *event)
 		return;
 	}
 	memcpy(nlmsg_data(nlh), event, sizeof(*event));
-	nlmsg_multicast(yz_sock, skb, 0, YZ_NL_GROUP_EVENTS, GFP_KERNEL);
+	nlmsg_multicast(yz_events_sock, skb, 0, YZ_NL_GROUP_EVENTS, GFP_KERNEL);
 }
 
-void yz_zygote_nl_init(void)
+void yz_events_init(void)
 {
 	struct netlink_kernel_cfg cfg = {
 	    .groups = YZ_NL_GROUP_EVENTS,
 	};
 
-	yz_sock = netlink_kernel_create(&init_net, YZ_NETLINK_PROTO, &cfg);
-	if (!yz_sock)
-		pr_err("zygote_nl: netlink_kernel_create failed\n");
+	yz_events_sock =
+	    netlink_kernel_create(&init_net, YZ_NETLINK_PROTO, &cfg);
+	if (!yz_events_sock)
+		pr_err("yukizygisk: events: netlink_kernel_create failed\n");
 	else
-		pr_info("zygote_nl: channel up (proto=%d)\n", YZ_NETLINK_PROTO);
+		pr_info("yukizygisk: events: channel up (proto=%d)\n",
+			YZ_NETLINK_PROTO);
 }
 
-void yz_zygote_nl_exit(void)
+void yz_events_exit(void)
 {
-	if (yz_sock) {
-		netlink_kernel_release(yz_sock);
-		yz_sock = NULL;
+	if (yz_events_sock) {
+		netlink_kernel_release(yz_events_sock);
+		yz_events_sock = NULL;
 	}
 }

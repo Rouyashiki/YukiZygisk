@@ -28,12 +28,10 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
+#include "feature/api.h"
 #include "core/bootstrap.h"
 #include "core/auth.h"
 #include "core/control.h"
-#include "feature/zygote_ctl.h"
-#include "feature/zygote_nl.h"
-#include "feature/zygote_probe.h"
 #include "host/host.h"
 #include "host/runtime.h"
 #include "uapi/yukizygisk.h"
@@ -59,7 +57,7 @@ static int yz_ioctl_set_dlopen(void __user *arg)
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
-	yz_zygote_probe_set_dlopen_off(cmd.dlopen_offset, cmd.dlsym_offset);
+	yz_config_set_linker_offsets(cmd.dlopen_offset, cmd.dlsym_offset);
 	return 0;
 }
 
@@ -69,7 +67,8 @@ static int yz_ioctl_set_dlopen32(void __user *arg)
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
-	yz_zygote_probe_set_dlopen32_off(cmd.dlopen_offset, cmd.dlsym_offset);
+	yz_config_set_compat_linker_offsets(cmd.dlopen_offset,
+					    cmd.dlsym_offset);
 	return 0;
 }
 
@@ -79,7 +78,7 @@ static int yz_ioctl_set_yukilinker(void __user *arg)
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
-	yz_zygote_probe_set_yukilinker(cmd.enabled != 0);
+	yz_config_set_first_stage_loader(cmd.enabled != 0);
 	return 0;
 }
 
@@ -91,7 +90,7 @@ static int yz_ioctl_set_native_targets(void __user *arg)
 	cmd = memdup_user(arg, sizeof(*cmd));
 	if (IS_ERR(cmd))
 		return PTR_ERR(cmd);
-	ret = yz_zygote_probe_set_native_targets(cmd);
+	ret = yz_config_set_native_targets(cmd);
 	kfree(cmd);
 	return ret;
 }
@@ -112,7 +111,7 @@ static int yz_ioctl_restore_native_load_policy(void __user *arg)
 		put_task_struct(task);
 	if (ret)
 		return ret;
-	return yz_zygote_probe_restore_native_policy((pid_t)cmd.pid);
+	return yz_load_policy_restore_native((pid_t)cmd.pid);
 }
 
 static int yz_ioctl_allow_module_load_policy(void __user *arg)
@@ -158,12 +157,12 @@ static int yz_ioctl_allow_module_load_policy(void __user *arg)
 	}
 	if (!yz_host_is_zygote(cred) &&
 	    !(source_image &&
-	      yz_zygote_probe_is_native_runtime(
-		  task->tgid, READ_ONCE(task->start_boottime)))) {
+	      yz_runtime_is_native(task->tgid,
+				   READ_ONCE(task->start_boottime)))) {
 		ret = -EPERM;
 		goto out_fd;
 	}
-	ret = yz_zygote_probe_allow_module_policy(task->tgid, file, cred);
+	ret = yz_load_policy_allow_module(task->tgid, file, cred);
 out_fd:
 	fdput(payload);
 out_cred:
@@ -179,7 +178,7 @@ static int yz_ioctl_get_safemode(void __user *arg)
 	struct yz_safemode_status_cmd cmd;
 	int ret;
 
-	ret = yz_zygote_probe_get_safemode(&cmd);
+	ret = yz_safemode_get_status(&cmd);
 	if (ret)
 		return ret;
 	if (copy_to_user(arg, &cmd, sizeof(cmd)))
@@ -192,7 +191,7 @@ static int yz_ioctl_get_zygote_variants(void __user *arg)
 	struct yz_zygote_variants_cmd cmd;
 	int ret;
 
-	ret = yz_zygote_probe_get_variants(&cmd);
+	ret = yz_safemode_get_variants(&cmd);
 	if (ret)
 		return ret;
 	if (copy_to_user(arg, &cmd, sizeof(cmd)))
@@ -223,7 +222,7 @@ static int yz_ioctl_get_runtime(void __user *arg)
 	}
 
 	cmd.count = 0;
-	ret = yz_zygote_probe_get_runtime(entries, capacity, &cmd);
+	ret = yz_runtime_query(entries, capacity, &cmd);
 	if (!ret && cmd.count &&
 	    copy_to_user(user_entries, entries, cmd.count * sizeof(*entries)))
 		ret = -EFAULT;
@@ -244,7 +243,7 @@ static int yz_ioctl_report_runtime(void __user *arg)
 	if (ret)
 		return ret;
 	cmd.module_id[sizeof(cmd.module_id) - 1] = '\0';
-	return yz_zygote_probe_report_runtime(&cmd);
+	return yz_runtime_report(&cmd);
 }
 
 static int yz_ioctl_get_root_status(void __user *arg)
@@ -258,8 +257,8 @@ static int yz_ioctl_get_root_status(void __user *arg)
 	cmd.flags = status.flags;
 	if (yz_host_policy_uses_fallback() &&
 	    !yz_host_policy_cache_ready())
-		yz_zygote_nl_emit_policy_refresh(
-			status.owner, YZ_POLICY_REFRESH_ALL);
+		yz_events_emit_policy_refresh(status.owner,
+					      YZ_POLICY_REFRESH_ALL);
 
 	if (copy_to_user(arg, &cmd, sizeof(cmd)))
 		return -EFAULT;
@@ -280,8 +279,7 @@ static int yz_ioctl_uid_should_umount(void __user *arg)
 			struct yz_host_root_status status = { 0 };
 
 			yz_host_get_root_status(&status);
-			yz_zygote_nl_emit_policy_refresh(
-				status.owner, cmd.uid);
+			yz_events_emit_policy_refresh(status.owner, cmd.uid);
 		}
 		return ret;
 	}
@@ -548,13 +546,13 @@ static long yukizygisk_ioctl_dispatch(struct file *file,
 
 	switch (request) {
 	case YZ_IOCTL_HANDOFF:
-		return yz_zygote_ctl_handoff(uarg);
+		return yz_fd_handoff_submit(uarg);
 	case YZ_IOCTL_SET_DLOPEN:
 		return yz_ioctl_set_dlopen(uarg);
 	case YZ_IOCTL_SET_DLOPEN32:
 		return yz_ioctl_set_dlopen32(uarg);
 	case YZ_IOCTL_RELOAD:
-		yz_zygote_nl_emit_reload();
+		yz_events_emit_reload();
 		return 0;
 	case YZ_IOCTL_SET_YUKILINKER:
 		return yz_ioctl_set_yukilinker(uarg);

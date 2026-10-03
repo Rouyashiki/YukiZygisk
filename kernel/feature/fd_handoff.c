@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0 */
 /*
- * YukiZygisk - Kernel control plane and fd broker.
+ * YukiZygisk - Authenticated module fd handoff.
  *
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
@@ -21,13 +21,12 @@
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
 
+#include "internal.h"
 #include "core/auth.h"
-#include "feature/zygote_ctl.h"
 #include "host/runtime.h"
-#include "uapi/yukizygisk.h"
 #include "klog.h"
 
-struct yz_pending {
+struct yz_fd_handoff_pending {
 	struct list_head list;
 	struct callback_head twork;
 	struct yz_auth_ticket ticket;
@@ -38,24 +37,25 @@ struct yz_pending {
 	struct file *files[YZ_MAX_MODULE_FDS];
 };
 
-#define YZ_MAX_PENDING 64
-static LIST_HEAD(yz_pending_list);
-static DEFINE_SPINLOCK(yz_ctl_lock);
-static u32 yz_pending_count;
+#define YZ_FD_HANDOFF_MAX_PENDING 64
+static LIST_HEAD(yz_fd_handoff_pending_list);
+static DEFINE_SPINLOCK(yz_fd_handoff_lock);
+static u32 yz_fd_handoff_pending_count;
 
-static void yz_deliver_cb(struct callback_head *head)
+static void yz_fd_handoff_deliver(struct callback_head *head)
 {
-	struct yz_pending *p = container_of(head, struct yz_pending, twork);
+	struct yz_fd_handoff_pending *p =
+	    container_of(head, struct yz_fd_handoff_pending, twork);
 	unsigned long flags;
 	u32 i;
 	int fd;
 	bool cancelled;
 
-	spin_lock_irqsave(&yz_ctl_lock, flags);
+	spin_lock_irqsave(&yz_fd_handoff_lock, flags);
 	list_del(&p->list);
-	yz_pending_count--;
+	yz_fd_handoff_pending_count--;
 	cancelled = p->cancelled;
-	spin_unlock_irqrestore(&yz_ctl_lock, flags);
+	spin_unlock_irqrestore(&yz_fd_handoff_lock, flags);
 	if (cancelled || current->flags & PF_EXITING || current->mm != p->mm ||
 	    !yz_auth_ticket_begin(&p->ticket))
 		goto out;
@@ -76,10 +76,10 @@ out:
 	module_put(THIS_MODULE);
 }
 
-int yz_zygote_ctl_handoff(void __user *arg)
+int yz_fd_handoff_submit(void __user *arg)
 {
 	struct yz_handoff_cmd cmd;
-	struct yz_pending *p, *old;
+	struct yz_fd_handoff_pending *p, *old;
 	struct task_struct *task;
 	unsigned long flags;
 	u32 i;
@@ -127,30 +127,30 @@ int yz_zygote_ctl_handoff(void __user *arg)
 		ret = -ENODEV;
 		goto fail_task;
 	}
-	init_task_work(&p->twork, yz_deliver_cb);
-	spin_lock_irqsave(&yz_ctl_lock, flags);
-	if (yz_pending_count >= YZ_MAX_PENDING) {
-		spin_unlock_irqrestore(&yz_ctl_lock, flags);
+	init_task_work(&p->twork, yz_fd_handoff_deliver);
+	spin_lock_irqsave(&yz_fd_handoff_lock, flags);
+	if (yz_fd_handoff_pending_count >= YZ_FD_HANDOFF_MAX_PENDING) {
+		spin_unlock_irqrestore(&yz_fd_handoff_lock, flags);
 		module_put(THIS_MODULE);
 		ret = -ENOSPC;
 		goto fail_task;
 	}
 	/* A replaced callback keeps its own allocation until it runs. Never
 	 * overwrite/requeue the callback_head of an already queued handoff. */
-	list_for_each_entry(old, &yz_pending_list, list)
+	list_for_each_entry (old, &yz_fd_handoff_pending_list, list)
 		if (old->pid == p->pid)
 			old->cancelled = true;
-	list_add_tail(&p->list, &yz_pending_list);
-	yz_pending_count++;
-	spin_unlock_irqrestore(&yz_ctl_lock, flags);
+	list_add_tail(&p->list, &yz_fd_handoff_pending_list);
+	yz_fd_handoff_pending_count++;
+	spin_unlock_irqrestore(&yz_fd_handoff_lock, flags);
 	ret = yz_task_work_add(task, &p->twork, TWA_RESUME);
 	put_task_struct(task);
 	if (!ret)
 		return 0;
-	spin_lock_irqsave(&yz_ctl_lock, flags);
+	spin_lock_irqsave(&yz_fd_handoff_lock, flags);
 	list_del(&p->list);
-	yz_pending_count--;
-	spin_unlock_irqrestore(&yz_ctl_lock, flags);
+	yz_fd_handoff_pending_count--;
+	spin_unlock_irqrestore(&yz_fd_handoff_lock, flags);
 	module_put(THIS_MODULE);
 	goto fail;
 fail_task:
@@ -165,26 +165,26 @@ fail:
 	return ret;
 }
 
-void yz_zygote_ctl_release(pid_t pid)
+void yz_fd_handoff_release(pid_t pid)
 {
-	struct yz_pending *p;
+	struct yz_fd_handoff_pending *p;
 	unsigned long flags;
 
-	spin_lock_irqsave(&yz_ctl_lock, flags);
-	list_for_each_entry(p, &yz_pending_list, list)
+	spin_lock_irqsave(&yz_fd_handoff_lock, flags);
+	list_for_each_entry (p, &yz_fd_handoff_pending_list, list)
 		if (p->pid == pid)
 			p->cancelled = true;
-	spin_unlock_irqrestore(&yz_ctl_lock, flags);
+	spin_unlock_irqrestore(&yz_fd_handoff_lock, flags);
 }
 
-void yz_zygote_ctl_init(void)
+void yz_fd_handoff_init(void)
 {
-	pr_info("zygote_ctl: authenticated fd broker armed\n");
+	pr_info("yukizygisk: fd_handoff: authenticated fd broker armed\n");
 }
 
-void yz_zygote_ctl_exit(void)
+void yz_fd_handoff_exit(void)
 {
 	/* Every queued callback pins THIS_MODULE and owns its files/mm until
 	 * execution or task exit; module exit cannot race its code lifetime. */
-	WARN_ON(!list_empty(&yz_pending_list));
+	WARN_ON(!list_empty(&yz_fd_handoff_pending_list));
 }

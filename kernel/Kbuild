@@ -25,12 +25,19 @@ yukizygisk-objs := \
 	host/patch_text.o \
 	host/lsm.o \
 	host/adapter.o \
-	feature/zygote_probe.o \
+	feature/config.o \
+	feature/load_policy.o \
+	feature/safemode.o \
+	feature/runtime.o \
+	feature/early_native.o \
+	feature/payload.o \
+	feature/injector.o \
+	feature/exec.o \
 	feature/tango.o \
-	feature/zygote_orch.o \
-	feature/zygote_nl.o \
+	feature/lifecycle.o \
+	feature/events.o \
 	feature/zygote_exit.o \
-	feature/zygote_ctl.o
+	feature/fd_handoff.o
 
 ccflags-y += -I$(src)
 VIOLA_BUILD_DIR ?= $(src)/../build/viola

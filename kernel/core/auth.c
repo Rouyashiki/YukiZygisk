@@ -39,10 +39,9 @@
 #include <viola.h>
 #include <viola_build.h>
 #include <viola_loader.h>
+#include "feature/api.h"
 #include "core/auth.h"
 #include "core/control.h"
-#include "feature/zygote_probe.h"
-#include "feature/zygote_nl.h"
 #include "host/runtime.h"
 #include "uapi/viola.h"
 #include "uapi/yukizygisk.h"
@@ -658,12 +657,12 @@ static int yz_auth_target_abi(u8 abi)
 
 int yz_auth_target_task(struct task_struct *task)
 {
-	return yz_auth_target_abi(yz_zygote_probe_task_abi(task));
+	return yz_auth_target_abi(yz_runtime_task_abi(task));
 }
 
 int yz_auth_target_report(u32 pid, u32 generation)
 {
-	return yz_auth_target_abi(yz_zygote_probe_report_abi(pid, generation));
+	return yz_auth_target_abi(yz_runtime_report_abi(pid, generation));
 }
 
 static int yz_auth_catalog_install(void __user *arg)
@@ -912,7 +911,7 @@ static int yz_auth_recover(struct yz_auth_session *s,
 	/* A repeated request can retry a dropped notification, without granting
 	 * any daemon capability to its root management caller. */
 	if (main->recovery == 1)
-		yz_zygote_nl_emit_viola_recovery(pid_nr(main->owner));
+		yz_events_emit_viola_recovery(pid_nr(main->owner));
 	return 0;
 }
 
