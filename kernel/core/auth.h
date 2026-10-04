@@ -32,6 +32,8 @@ void yz_auth_end(void);
  * again in process context before applying its mutation. */
 int yz_auth_current_ticket(struct yz_auth_ticket *ticket);
 bool yz_auth_ticket_begin(const struct yz_auth_ticket *ticket);
+int yz_auth_query_ticket(struct yz_auth_ticket *ticket);
+bool yz_auth_query_ticket_begin(const struct yz_auth_ticket *ticket);
 int yz_auth_target_task(struct task_struct *task);
 int yz_auth_target_report(u32 pid, u32 generation);
 long yz_auth_ioctl(struct yz_auth_session *session, unsigned int request,

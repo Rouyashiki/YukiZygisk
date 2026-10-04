@@ -142,32 +142,31 @@ static void yz_policy_temp_add_locked(const struct yz_policy_key *key, u32 av)
 	}
 }
 
-static u32 yz_policy_temp_plan_release_locked(const struct yz_policy_key *key,
-					      u32 av)
+static int yz_policy_temp_plan_release_locked(const struct yz_policy_key *key,
+					      u32 av, u32 refs, u32 *clear_av)
 {
 	struct yz_policy_temp_rule *rule;
-	u32 clear_av = 0;
 	int i;
 
+	*clear_av = 0;
 	if (!av)
-		return 0;
-
+		return refs ? -EINVAL : 0;
 	rule = yz_policy_temp_find_locked(key);
-	if (!rule)
-		return av;
-
+	if (!rule || !refs)
+		return -EINVAL;
 	for (i = 0; i < YZ_POLICY_PERM_BITS; i++) {
 		if (!(av & (1U << i)))
 			continue;
-		if (rule->refs[i] <= 1)
-			clear_av |= 1U << i;
+		if (refs > rule->refs[i])
+			return -EINVAL;
+		if (refs == rule->refs[i])
+			*clear_av |= 1U << i;
 	}
-
-	return clear_av;
+	return 0;
 }
 
 static void yz_policy_temp_release_locked(const struct yz_policy_key *key,
-					  u32 av)
+					  u32 av, u32 refs)
 {
 	struct yz_policy_temp_rule *rule;
 	bool any = false;
@@ -183,8 +182,8 @@ static void yz_policy_temp_release_locked(const struct yz_policy_key *key,
 	for (i = 0; i < YZ_POLICY_PERM_BITS; i++) {
 		if (!(av & (1U << i)))
 			continue;
-		if (rule->refs[i])
-			rule->refs[i]--;
+		if (rule->refs[i] >= refs)
+			rule->refs[i] -= refs;
 	}
 
 	for (i = 0; i < YZ_POLICY_PERM_BITS; i++) {
@@ -231,10 +230,45 @@ static int yz_policy_temp_plan_allow_locked(const struct yz_policy_key *key,
 	return 0;
 }
 
-static int yz_host_policy_allow_file(
-	struct file *file, const struct cred *cred, bool include_dir,
-	enum yz_policy_tmpfs_access tmpfs_access,
-	struct yz_file_load_policy *state)
+static int yz_policy_temp_validate_batch_locked(
+    const struct yz_policy_file_load_keys *keys,
+    const struct yz_file_load_policy *state)
+{
+	const struct yz_policy_key *candidates[] = {
+	    &keys->file,
+	    &keys->dir,
+	    &keys->tmpfs,
+	};
+	u32 allowances[] = {
+	    state->added_av,
+	    state->dir_added_av,
+	    state->tmpfs_added_av,
+	};
+	unsigned int needed = 0, available = 0;
+	unsigned int i, j;
+
+	/* Individual validation sees the same free slot for each new key.
+	 * Reserve capacity for the whole grant before changing policy. */
+	for (i = 0; i < ARRAY_SIZE(candidates); i++) {
+		if (!allowances[i] || yz_policy_temp_find_locked(candidates[i]))
+			continue;
+		for (j = 0; j < i; j++)
+			if (allowances[j] &&
+			    yz_policy_temp_key_eq(candidates[i], candidates[j]))
+				break;
+		if (j == i)
+			needed++;
+	}
+	for (i = 0; i < YZ_POLICY_TEMP_RULE_MAX; i++)
+		if (!yz_policy_temp_rules[i].used)
+			available++;
+	return needed <= available ? 0 : -ENOSPC;
+}
+
+static int yz_host_policy_allow_file(struct file *file, const struct cred *cred,
+				     bool include_dir,
+				     enum yz_policy_tmpfs_access tmpfs_access,
+				     struct yz_file_load_policy *state)
 {
 	struct yz_policy_file_load_keys keys = {};
 	u32 file_commit_av = 0;
@@ -286,6 +320,9 @@ static int yz_host_policy_allow_file(
 	state->tmpfs_type = keys.tmpfs.tgt_type;
 	state->target_class = keys.file.tclass;
 	state->dir_class = keys.dir.tclass;
+	ret = yz_policy_temp_validate_batch_locked(&keys, state);
+	if (ret)
+		goto out_clear_state;
 
 	ret = yz_policy_base_commit_allow_locked(
 		&keys.file, file_commit_av, &keys.dir, dir_commit_av,
@@ -293,6 +330,9 @@ static int yz_host_policy_allow_file(
 	if (ret)
 		goto out_clear_state;
 
+	state->file_lease_refs = state->added_av ? 1 : 0;
+	state->dir_lease_refs = state->dir_added_av ? 1 : 0;
+	state->tmpfs_lease_refs = state->tmpfs_added_av ? 1 : 0;
 	yz_policy_temp_add_locked(&keys.file, state->added_av);
 	yz_policy_temp_add_locked(&keys.dir, state->dir_added_av);
 	yz_policy_temp_add_locked(&keys.tmpfs, state->tmpfs_added_av);
@@ -379,6 +419,7 @@ yz_host_policy_allow_execmem(const struct cred *cred,
 		goto out_unlock;
 	}
 
+	state->process_lease_refs = state->process_added_av ? 1 : 0;
 	yz_policy_temp_add_locked(&key, state->process_added_av);
 
 	if (state->process_added_av)
@@ -413,8 +454,15 @@ int yz_host_policy_restore(const struct yz_file_load_policy *state)
 	u32 process_clear_av = 0;
 	int ret;
 
-	if (!state || (!state->added_av && !state->tmpfs_added_av &&
-		       !state->process_added_av && !state->dir_added_av))
+	if (!state)
+		return 0;
+	if (!!state->added_av != !!state->file_lease_refs ||
+	    !!state->dir_added_av != !!state->dir_lease_refs ||
+	    !!state->tmpfs_added_av != !!state->tmpfs_lease_refs ||
+	    !!state->process_added_av != !!state->process_lease_refs)
+		return -EINVAL;
+	if (!state->added_av && !state->tmpfs_added_av &&
+	    !state->process_added_av && !state->dir_added_av)
 		return 0;
 
 	file_key.src_type = state->src_type;
@@ -434,34 +482,45 @@ int yz_host_policy_restore(const struct yz_file_load_policy *state)
 	if (ret)
 		return ret;
 
-	if (state->added_av)
-		file_clear_av = yz_policy_temp_plan_release_locked(
-			&file_key, state->added_av);
-	if (state->dir_added_av)
-		dir_clear_av = yz_policy_temp_plan_release_locked(
-			&dir_key, state->dir_added_av);
-	if (state->tmpfs_added_av)
-		tmpfs_clear_av = yz_policy_temp_plan_release_locked(
-			&tmpfs_key, state->tmpfs_added_av);
-	if (state->process_added_av)
-		process_clear_av = yz_policy_temp_plan_release_locked(
-			&process_key, state->process_added_av);
+	ret = yz_policy_temp_plan_release_locked(
+	    &file_key, state->added_av, state->file_lease_refs, &file_clear_av);
+	if (ret)
+		goto out_unlock;
+	ret = yz_policy_temp_plan_release_locked(&dir_key, state->dir_added_av,
+						 state->dir_lease_refs,
+						 &dir_clear_av);
+	if (ret)
+		goto out_unlock;
+	ret = yz_policy_temp_plan_release_locked(
+	    &tmpfs_key, state->tmpfs_added_av, state->tmpfs_lease_refs,
+	    &tmpfs_clear_av);
+	if (ret)
+		goto out_unlock;
+	ret = yz_policy_temp_plan_release_locked(
+	    &process_key, state->process_added_av, state->process_lease_refs,
+	    &process_clear_av);
+	if (ret)
+		goto out_unlock;
 
 	ret = yz_policy_base_commit_restore_locked(
 		&file_key, file_clear_av, &dir_key, dir_clear_av, &tmpfs_key,
 		tmpfs_clear_av, &process_key, process_clear_av);
 	if (!ret) {
-		yz_policy_temp_release_locked(&file_key, state->added_av);
-		yz_policy_temp_release_locked(&dir_key, state->dir_added_av);
-		yz_policy_temp_release_locked(&tmpfs_key,
-					      state->tmpfs_added_av);
+		yz_policy_temp_release_locked(&file_key, state->added_av,
+					      state->file_lease_refs);
+		yz_policy_temp_release_locked(&dir_key, state->dir_added_av,
+					      state->dir_lease_refs);
+		yz_policy_temp_release_locked(&tmpfs_key, state->tmpfs_added_av,
+					      state->tmpfs_lease_refs);
 		yz_policy_temp_release_locked(&process_key,
-					      state->process_added_av);
+					      state->process_added_av,
+					      state->process_lease_refs);
 		pr_info("yukizygisk: policy restore file=0x%x dir=0x%x tmpfs=0x%x process=0x%x\n",
 			file_clear_av, dir_clear_av, tmpfs_clear_av,
 			process_clear_av);
 	}
 
+out_unlock:
 	yz_policy_base_unlock();
 	return ret;
 }

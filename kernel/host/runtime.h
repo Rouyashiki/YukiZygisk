@@ -67,4 +67,9 @@ bool yz_kernel_read_nofault(void *dst, unsigned long src, size_t size);
 int yz_task_work_add(struct task_struct *task, struct callback_head *twork,
 		     enum task_work_notify_mode mode);
 
+struct callback_head *
+yz_task_work_cancel_match(struct task_struct *task,
+			  bool (*match)(struct callback_head *, void *),
+			  void *data);
+
 #endif /* _YUKIZYGISK_HOST_RUNTIME_H */

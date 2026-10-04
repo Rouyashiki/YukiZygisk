@@ -172,7 +172,6 @@ void yz_exec_init(void)
 void yz_exec_exit(void)
 {
 	yz_tango_disable();
-	yz_load_policy_cleanup();
 #if YZ_ENABLE_LSM_INJECTOR
 	if (yz_exec_lsm_enabled)
 		yz_host_unregister_lsm_hook(&yz_exec_hook);

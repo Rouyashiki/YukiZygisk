@@ -8,9 +8,10 @@
  * Author: Anatdx
  */
 
+#include <linux/compat.h>
 #include <linux/cred.h>
 #include <linux/errno.h>
-#include <linux/compat.h>
+#include <linux/hashtable.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
@@ -27,19 +28,21 @@
 #include <trace/events/syscalls.h>
 #endif
 
-#include "internal.h"
-#include "feature/zygote_exit.h"
 #include "host/host.h"
+#include "internal.h"
 #include "klog.h" // IWYU pragma: keep
 
 enum yz_lifecycle_state {
 	YZ_LIFECYCLE_FORKED, /* born from zygote; identity not yet known */
 	YZ_LIFECYCLE_SPECIALIZED, /* dropped to its app uid */
+	YZ_LIFECYCLE_EXITED,
 };
 
 struct yz_lifecycle_child {
+	struct hlist_node pid_node;
 	pid_t pid; /* tgid of the app process; 0 == free slot */
 	uid_t uid;
+	u64 start_boottime;
 	enum yz_lifecycle_state state;
 };
 
@@ -48,6 +51,7 @@ struct yz_lifecycle_child {
 static struct yz_lifecycle_child
     yz_lifecycle_children[YZ_LIFECYCLE_MAX_CHILDREN];
 static DEFINE_SPINLOCK(yz_lifecycle_lock);
+static DEFINE_HASHTABLE(yz_lifecycle_pids, 9);
 static bool yz_lifecycle_trace_sys_exit_registered;
 static struct tracepoint *yz_lifecycle_trace_sys_exit_tp;
 static struct tracepoint *yz_lifecycle_trace_fork_tp;
@@ -71,32 +75,72 @@ static void yz_lifecycle_specialize_work_fn(struct work_struct *work);
 static DECLARE_WORK(yz_lifecycle_specialize_work,
 		    yz_lifecycle_specialize_work_fn);
 
-/* caller holds yz_lifecycle_lock */
+static void yz_lifecycle_reset(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&yz_lifecycle_lock, flags);
+	memset(yz_lifecycle_children, 0, sizeof(yz_lifecycle_children));
+	hash_init(yz_lifecycle_pids);
+	spin_unlock_irqrestore(&yz_lifecycle_lock, flags);
+}
+
+/* yz_lifecycle_lock must be held. */
 static int yz_lifecycle_slot_of(pid_t pid)
 {
+	struct yz_lifecycle_child *child;
 	int i;
 
-	for (i = 0; i < YZ_LIFECYCLE_MAX_CHILDREN; i++)
-		if (yz_lifecycle_children[i].pid == pid)
-			return i;
+	if (!pid) {
+		for (i = 0; i < YZ_LIFECYCLE_MAX_CHILDREN; i++)
+			if (!yz_lifecycle_children[i].pid)
+				return i;
+		return -1;
+	}
+	hash_for_each_possible(yz_lifecycle_pids, child, pid_node, pid)
+	{
+		if (child->pid == pid)
+			return child - yz_lifecycle_children;
+	}
 	return -1;
 }
 
-static void yz_lifecycle_track(pid_t pid)
+static void yz_lifecycle_track(struct task_struct *task)
+{
+	pid_t pid = task->tgid;
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&yz_lifecycle_lock, flags);
+	i = yz_lifecycle_slot_of(pid);
+	if (i < 0)
+		i = yz_lifecycle_slot_of(0);
+	if (i >= 0 &&
+	    (!yz_lifecycle_children[i].pid ||
+	     yz_lifecycle_children[i].start_boottime != task->start_boottime)) {
+		hash_del(&yz_lifecycle_children[i].pid_node);
+		yz_lifecycle_children[i].pid = pid;
+		yz_lifecycle_children[i].uid = (uid_t)-1;
+		yz_lifecycle_children[i].start_boottime = task->start_boottime;
+		yz_lifecycle_children[i].state = YZ_LIFECYCLE_FORKED;
+		hash_add(yz_lifecycle_pids, &yz_lifecycle_children[i].pid_node,
+			 pid);
+	}
+	spin_unlock_irqrestore(&yz_lifecycle_lock, flags);
+}
+
+void yz_lifecycle_on_exit(struct task_struct *task)
 {
 	unsigned long flags;
 	int i;
 
 	spin_lock_irqsave(&yz_lifecycle_lock, flags);
-	if (yz_lifecycle_slot_of(pid) < 0) {
-		i = yz_lifecycle_slot_of(0);
-		if (i >= 0) {
-			yz_lifecycle_children[i].pid = pid;
-			yz_lifecycle_children[i].uid = (uid_t)-1;
-			yz_lifecycle_children[i].state = YZ_LIFECYCLE_FORKED;
-		}
-	}
+	i = yz_lifecycle_slot_of(task->tgid);
+	if (i >= 0 && yz_lifecycle_children[i].start_boottime ==
+			  READ_ONCE(task->group_leader->start_boottime))
+		yz_lifecycle_children[i].state = YZ_LIFECYCLE_EXITED;
 	spin_unlock_irqrestore(&yz_lifecycle_lock, flags);
+	yz_fd_handoff_release(task);
 }
 
 static void yz_lifecycle_queue_specialize_event(pid_t pid, uid_t uid, u32 appid)
@@ -345,7 +389,7 @@ static void yz_lifecycle_on_fork(void *data, struct task_struct *parent,
 	if (!from_zygote)
 		return;
 
-	yz_lifecycle_track(child->pid);
+	yz_lifecycle_track(child);
 	pr_info(
 	    "yukizygisk: lifecycle: [fork] app pid=%d born from zygote %d\n",
 	    child->pid, parent->pid);
@@ -365,9 +409,11 @@ static void yz_lifecycle_on_free(void *data, struct task_struct *p)
 
 	spin_lock_irqsave(&yz_lifecycle_lock, flags);
 	i = yz_lifecycle_slot_of(p->pid);
-	if (i >= 0) {
+	if (i >= 0 && yz_lifecycle_children[i].start_boottime ==
+			  READ_ONCE(p->start_boottime)) {
 		tracked = true;
 		uid = yz_lifecycle_children[i].uid;
+		hash_del(&yz_lifecycle_children[i].pid_node);
 		yz_lifecycle_children[i].pid = 0;
 	}
 	spin_unlock_irqrestore(&yz_lifecycle_lock, flags);
@@ -375,7 +421,7 @@ static void yz_lifecycle_on_free(void *data, struct task_struct *p)
 	if (tracked) {
 		pr_info("yukizygisk: lifecycle: [gone] app pid=%d uid=%u\n",
 			p->pid, uid);
-		yz_fd_handoff_release(p->pid);
+		yz_fd_handoff_release(p);
 	}
 }
 
@@ -405,18 +451,12 @@ void yz_lifecycle_init(void)
 		return;
 	}
 
-	ret = yz_zygote_exit_enable();
-	if (ret)
-		pr_warn(
-		    "yukizygisk: lifecycle: exit diagnostics unavailable: %d\n",
-		    ret);
 	yz_lifecycle_setresuid_monitor_init();
 	pr_info("yukizygisk: lifecycle: lifecycle state machine armed\n");
 }
 
 void yz_lifecycle_exit(void)
 {
-	yz_zygote_exit_disable();
 	yz_lifecycle_setresuid_monitor_exit();
 	yz_lifecycle_specialize_events_reset();
 	yz_lifecycle_unregister_tracepoint(&yz_lifecycle_trace_fork_tp,
@@ -424,6 +464,8 @@ void yz_lifecycle_exit(void)
 	yz_lifecycle_unregister_tracepoint(&yz_lifecycle_trace_free_tp,
 					   (void *)yz_lifecycle_on_free);
 	tracepoint_synchronize_unregister();
+	yz_lifecycle_reset();
+	yz_fd_handoff_cancel_all();
 }
 
 #else /* !CONFIG_TRACEPOINTS */
@@ -436,6 +478,8 @@ void yz_lifecycle_init(void)
 
 void yz_lifecycle_exit(void)
 {
+	yz_lifecycle_reset();
+	yz_fd_handoff_cancel_all();
 }
 
 #endif /* CONFIG_TRACEPOINTS */
@@ -464,7 +508,9 @@ void yz_lifecycle_on_setresuid(uid_t old_uid, uid_t new_uid)
 
 	spin_lock_irqsave(&yz_lifecycle_lock, flags);
 	i = yz_lifecycle_slot_of(pid);
-	if (i >= 0 && yz_lifecycle_children[i].state == YZ_LIFECYCLE_FORKED) {
+	if (i >= 0 && yz_lifecycle_children[i].state == YZ_LIFECYCLE_FORKED &&
+	    yz_lifecycle_children[i].start_boottime ==
+		current->start_boottime) {
 		yz_lifecycle_children[i].uid = new_uid;
 		yz_lifecycle_children[i].state = YZ_LIFECYCLE_SPECIALIZED;
 		specialized = true;

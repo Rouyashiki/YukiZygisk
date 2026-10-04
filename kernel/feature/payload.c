@@ -108,8 +108,6 @@ int yz_payload_stage_image(const char *path, const char *name,
 
 		pr_info("yukizygisk: payload: [2c-3b] shmem %s failed: %ld\n",
 			name, err);
-		if (policy_state)
-			yz_load_policy_restore_state(policy_state);
 		kvfree(buf);
 		return err;
 	}
@@ -125,8 +123,6 @@ int yz_payload_stage_image(const char *path, const char *name,
 		pr_info("yukizygisk: payload: [2c-3b] write staged %s short: "
 			"%zd/%lld\n",
 			path, r, (long long)sz);
-		if (policy_state)
-			yz_load_policy_restore_state(policy_state);
 		fput(mfd);
 		return r < 0 ? (int)r : -EIO;
 	}
@@ -215,8 +211,6 @@ int yz_payload_stage_file_fd(const char *path,
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
-		if (policy_state)
-			yz_load_policy_restore_state(policy_state);
 		yz_file_close(file, NULL);
 		return fd;
 	}

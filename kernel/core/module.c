@@ -15,6 +15,7 @@
 #include <linux/printk.h>
 
 #include "feature/api.h"
+#include "feature/process_exit.h"
 #include "core/bootstrap.h"
 #include "core/auth.h"
 #include "core/control.h"
@@ -48,6 +49,9 @@ static bool yz_stage_bootstrap_active;
 static bool yz_stage_lsm_active;
 static bool yz_stage_host_active;
 static bool yz_stage_auth_active;
+static bool yz_stage_process_exit_active;
+static bool yz_stage_history_active;
+static bool yz_stage_policy_active;
 static DEFINE_MUTEX(yz_lifecycle_lock);
 
 static void yukizygisk_deactivate_locked(bool skip_bootstrap)
@@ -70,13 +74,21 @@ static void yukizygisk_deactivate_locked(bool skip_bootstrap)
 		yz_lifecycle_exit();
 		yz_stage_lifecycle_active = false;
 	}
-	if (yz_stage_events_active) {
-		yz_events_exit();
-		yz_stage_events_active = false;
-	}
 	if (yz_stage_exec_active) {
 		yz_exec_exit();
 		yz_stage_exec_active = false;
+	}
+	if (yz_stage_process_exit_active) {
+		yz_process_exit_disable();
+		yz_stage_process_exit_active = false;
+	}
+	if (yz_stage_history_active) {
+		yz_exit_history_exit();
+		yz_stage_history_active = false;
+	}
+	if (yz_stage_events_active) {
+		yz_events_exit();
+		yz_stage_events_active = false;
 	}
 	if (yz_stage_lsm_active) {
 		yz_host_lsm_exit();
@@ -86,7 +98,18 @@ static void yukizygisk_deactivate_locked(bool skip_bootstrap)
 		yz_auth_exit();
 		yz_stage_auth_active = false;
 	}
-	if (yz_stage_host_active) {
+	if (yz_stage_policy_active) {
+		yz_load_policy_disable();
+		/* A failed restore retains its module reference and retry
+		 * state. Fail-close must keep the host available until that
+		 * lease is restored; normal unload cannot enter with those
+		 * references. */
+		if (!yz_load_policy_busy()) {
+			yz_load_policy_exit();
+			yz_stage_policy_active = false;
+		}
+	}
+	if (yz_stage_host_active && !yz_stage_policy_active) {
 		yz_host_exit();
 		yz_stage_host_active = false;
 	}
@@ -120,6 +143,14 @@ static int __init yukizygisk_init(void)
 	if (ret)
 		goto err_control;
 	yz_stage_auth_active = true;
+	yz_exit_history_init();
+	yz_stage_history_active = true;
+	ret = yz_process_exit_enable();
+	if (ret)
+		goto err_control;
+	yz_stage_process_exit_active = true;
+	yz_load_policy_enable();
+	yz_stage_policy_active = true;
 
 	pr_info("yukizygisk: init step lsm\n");
 	yz_host_lsm_init();

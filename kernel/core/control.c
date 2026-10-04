@@ -162,7 +162,7 @@ static int yz_ioctl_allow_module_load_policy(void __user *arg)
 		ret = -EPERM;
 		goto out_fd;
 	}
-	ret = yz_load_policy_allow_module(task->tgid, file, cred);
+	ret = yz_load_policy_allow_module(task, file, cred);
 out_fd:
 	fdput(payload);
 out_cred:
@@ -584,6 +584,10 @@ static long yukizygisk_ioctl_dispatch(struct file *file,
 		return yz_ioctl_allow_module_load_policy(uarg);
 	case YZ_IOCTL_GET_RUNTIME:
 		return yz_ioctl_get_runtime(uarg);
+	case YZ_IOCTL_GET_EXIT_HISTORY_FD:
+		return yz_exit_history_get_fd(uarg);
+	case YZ_IOCTL_GET_HEALTH:
+		return yz_exit_history_get_health(uarg);
 	case YZ_IOCTL_REPORT_RUNTIME:
 		return yz_ioctl_report_runtime(uarg);
 	case YZ_IOCTL_DAEMON_READY:
@@ -598,10 +602,17 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 {
 	long ret;
 
-	down_read(&yz_control_sem);
+	if (request == YZ_IOCTL_GET_HEALTH ||
+	    request == YZ_IOCTL_VIOLA_DAEMON_IDENTITY) {
+		if (!down_read_trylock(&yz_control_sem))
+			return -EAGAIN;
+	} else {
+		down_read(&yz_control_sem);
+	}
 	if (!atomic_read(&yz_control_available)) {
 		ret = -ENODEV;
 	} else if (request == YZ_IOCTL_DAEMON_READY ||
+		   request == YZ_IOCTL_VIOLA_DAEMON_IDENTITY ||
 		   request == YZ_IOCTL_VIOLA_STATUS ||
 		   request == YZ_IOCTL_VIOLA_CATALOG ||
 		   request == YZ_IOCTL_VIOLA_PIN_EXEC ||

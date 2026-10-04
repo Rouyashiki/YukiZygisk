@@ -30,6 +30,10 @@ struct yz_file_load_policy {
 	u32 tmpfs_added_av;
 	u32 process_added_av;
 	u32 dir_added_av;
+	u32 file_lease_refs;
+	u32 tmpfs_lease_refs;
+	u32 dir_lease_refs;
+	u32 process_lease_refs;
 };
 
 struct yz_host_root_status {

@@ -29,6 +29,7 @@ enum yz_event_type {
 	YZ_EV_POLICY_REFRESH = 4,
 	YZ_EV_ZYGOTE_EXIT = 5,
 	YZ_EV_VIOLA_RECOVERY = 6,
+	YZ_EV_TARGET_EXIT = 7,
 };
 
 #define YZ_POLICY_REFRESH_ALL ((__u32)~0U)
@@ -47,6 +48,17 @@ struct yz_zygote_exit_event {
 	__aligned_u64 observed_boottime;
 	__u8 abi;
 	__u8 reserved[7];
+};
+
+/* Process-group exit observation; appid carries the observed wait status. */
+struct yz_target_exit_event {
+	struct yz_event event;
+	__u32 generation;
+	__aligned_u64 start_boottime;
+	__aligned_u64 observed_boottime;
+	__u8 abi;
+	__u8 kind;
+	__u8 reserved[6];
 };
 
 #define YZ_MAX_MODULE_FDS 8
@@ -324,8 +336,134 @@ enum yz_runtime_abi {
 
 #define YZ_RUNTIME_F_EARLY_NATIVE (1U << 0)
 
+/* Saved pre-exit state; meaningful with YZ_RUNTIME_CAP_INJECTION_STATE. */
+#define YZ_RUNTIME_F_INJECTION_STATE_SHIFT 8
+#define YZ_RUNTIME_F_INJECTION_STATE_MASK                                      \
+	(7U << YZ_RUNTIME_F_INJECTION_STATE_SHIFT)
+
 #define YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY (1U << 0)
 #define YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT (1U << 1)
+#define YZ_RUNTIME_CAP_INJECTION_STATE (1U << 2)
+#define YZ_RUNTIME_CAP_EXIT_HISTORY (1U << 3)
+#define YZ_RUNTIME_CAP_HEALTH (1U << 4)
+
+#define YZ_HEALTH_VERSION 1
+#define YZ_HEALTH_POLICY_NONE 0
+#define YZ_HEALTH_POLICY_NATIVE 1
+#define YZ_HEALTH_POLICY_MODULE 2
+
+struct yz_health_history {
+	__aligned_u64 epoch;
+	__aligned_u64 oldest_sequence;
+	__aligned_u64 newest_sequence;
+	__aligned_u64 coverage_generation;
+	__u32 count;
+	__u32 observer_active;
+};
+
+struct yz_health_policy {
+	__u32 enabled;
+	__u32 states_current;
+	__u32 states_peak;
+	__u32 preparing;
+	__u32 native_active;
+	__u32 module_groups_active;
+	__u32 holders_current;
+	__u32 holders_peak;
+	__u32 retired_current;
+	__u32 restore_inflight;
+	__u32 retry_waiting;
+	__u32 reserved;
+	__aligned_u64 oldest_retired_boottime;
+	__aligned_u64 last_restore_boottime;
+	__aligned_u64 restore_attempts;
+	__aligned_u64 restore_failures;
+	__aligned_u64 restore_successes;
+	__s32 last_restore_errno;
+	__u32 last_restore_kind;
+};
+
+struct yz_health_cleanup {
+	__u32 queued_owners;
+	__u32 inflight_owners;
+	__u32 queue_peak;
+	__u32 reconcile_pending;
+	__aligned_u64 queue_enqueued;
+	__aligned_u64 queue_overflows;
+	__aligned_u64 owner_cleanup_calls;
+	__aligned_u64 owner_index_visits;
+	__aligned_u64 watch_index_visits;
+	__aligned_u64 fullscan_overflow;
+	__aligned_u64 fullscan_enable;
+	__aligned_u64 fullscan_missing_owner;
+	__aligned_u64 fullscan_disable;
+	__aligned_u64 fullscan_entries;
+	__aligned_u64 alive_checks_publish;
+	__aligned_u64 alive_checks_scan;
+	__aligned_u64 exit_worker_runs;
+	__aligned_u64 retry_worker_runs;
+};
+
+/* Sections are coherent separately within this boottime sampling window.
+ * Counters survive feature toggles and belong to the loaded kernel component.
+ */
+struct yz_health_query_cmd {
+	__u32 version;
+	__u32 size;
+	__u32 flags;
+	__u32 reserved;
+	__aligned_u64 sample_begin_boottime;
+	__aligned_u64 sample_end_boottime;
+	struct yz_health_history history;
+	struct yz_health_policy policy;
+	struct yz_health_cleanup cleanup;
+};
+
+#define YZ_IOCTL_GET_HEALTH _IOC(_IOC_READ | _IOC_WRITE, YZ_IOCTL_MAGIC, 82, 0)
+
+#define YZ_EXIT_HISTORY_VERSION 1
+#define YZ_EXIT_HISTORY_MAX 128
+#define YZ_EXIT_HISTORY_BATCH_MAX 32
+#define YZ_EXIT_HISTORY_F_RESET (1U << 0)
+#define YZ_EXIT_HISTORY_F_OVERFLOW (1U << 1)
+
+struct yz_exit_history_record {
+	__aligned_u64 sequence;
+	struct yz_target_exit_event event;
+	__u32 runtime_flags;
+	__u8 injection_state;
+	__u8 target_type;
+	__u8 reserved[2];
+	char process[YZ_RUNTIME_PROCESS_MAX];
+	char target[YZ_NATIVE_TARGET_VALUE_MAX];
+};
+
+struct yz_exit_history_header {
+	__u32 version;
+	__u32 record_size;
+	__u32 count;
+	__u32 flags;
+	__aligned_u64 epoch;
+	__aligned_u64 oldest_sequence;
+	__aligned_u64 newest_sequence;
+	__aligned_u64 next_sequence;
+	__aligned_u64 lost_first;
+	__aligned_u64 lost_last;
+	__aligned_u64 coverage_generation;
+	__u32 observer_active;
+	__u32 reserved;
+};
+
+/* Each successful read returns one header followed by count records. */
+struct yz_exit_history_fd_cmd {
+	__aligned_u64 epoch;
+	__aligned_u64 after_sequence;
+	__s32 fd;
+	__u32 flags;
+};
+
+#define YZ_IOCTL_GET_EXIT_HISTORY_FD                                           \
+	_IOC(_IOC_READ | _IOC_WRITE, YZ_IOCTL_MAGIC, 81, 0)
 
 struct yz_runtime_record {
 	__u32 pid;
@@ -378,5 +516,7 @@ struct yz_config {
 	__u8 dmesg_log;
 	__u8 memory_type;
 };
+
+#include "viola_health.h"
 
 #endif /* _UAPI_YUKIZYGISK_H */

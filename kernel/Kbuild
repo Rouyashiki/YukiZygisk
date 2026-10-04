@@ -36,7 +36,8 @@ yukizygisk-objs := \
 	feature/tango.o \
 	feature/lifecycle.o \
 	feature/events.o \
-	feature/zygote_exit.o \
+	feature/process_exit.o \
+	feature/exit_history.o \
 	feature/fd_handoff.o
 
 ccflags-y += -I$(src)

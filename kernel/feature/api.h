@@ -31,6 +31,7 @@ void yz_lifecycle_init(void);
 void yz_lifecycle_exit(void);
 void yz_fd_handoff_init(void);
 void yz_fd_handoff_exit(void);
+void yz_fd_handoff_cancel_all(void);
 int yz_fd_handoff_submit(void __user *arg);
 void yz_events_emit_reload(void);
 void yz_events_emit_viola_recovery(u32 owner);
@@ -41,7 +42,16 @@ void yz_config_set_compat_linker_offsets(u64 dlopen_off, u64 dlsym_off);
 void yz_config_set_first_stage_loader(bool enabled);
 int yz_config_set_native_targets(const struct yz_native_targets_cmd *cmd);
 int yz_load_policy_restore_native(pid_t tgid);
-int yz_load_policy_allow_module(pid_t tgid, struct file *dir,
+void yz_load_policy_cleanup(void);
+void yz_load_policy_enable(void);
+void yz_load_policy_disable(void);
+void yz_load_policy_exit(void);
+bool yz_load_policy_busy(void);
+void yz_exit_history_init(void);
+void yz_exit_history_exit(void);
+int yz_exit_history_get_fd(void __user *arg);
+int yz_exit_history_get_health(void __user *arg);
+int yz_load_policy_allow_module(struct task_struct *task, struct file *dir,
 				const struct cred *cred);
 int yz_safemode_get_status(struct yz_safemode_status_cmd *cmd);
 int yz_safemode_get_variants(struct yz_zygote_variants_cmd *cmd);

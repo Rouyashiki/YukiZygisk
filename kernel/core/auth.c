@@ -45,6 +45,7 @@
 #include "core/control.h"
 #include "host/runtime.h"
 #include "uapi/viola.h"
+#include "uapi/viola_health.h"
 #include "uapi/yukizygisk.h"
 
 #ifndef VIOLA_KMI_ID
@@ -511,6 +512,21 @@ static struct yz_auth_session *yz_auth_alloc(struct task_struct *owner, u32 role
 	return s;
 }
 
+static bool yz_auth_owner_alive(const struct yz_auth_session *s)
+{
+	struct task_struct *task;
+	bool alive = false;
+
+	if (!s)
+		return false;
+	rcu_read_lock();
+	task = pid_task(s->owner, PIDTYPE_TGID);
+	if (task)
+		alive = atomic_read(&task->signal->live) > 0;
+	rcu_read_unlock();
+	return alive;
+}
+
 struct yz_auth_session *yz_auth_open(bool launcher)
 {
 	struct yz_auth_session *s, *main;
@@ -529,7 +545,9 @@ struct yz_auth_session *yz_auth_open(bool launcher)
 	if (launcher) {
 		main = rcu_dereference_protected(yz_auth_main,
 			lockdep_is_held(&yz_auth_lock));
-		if (yz_auth_alive(main)) {
+		if (yz_auth_alive(main) || yz_auth_owner_alive(main) ||
+		    yz_auth_owner_alive(rcu_dereference_protected(
+			yz_auth_compat, lockdep_is_held(&yz_auth_lock)))) {
 			ret = -EBUSY;
 			goto fail;
 		}
@@ -609,6 +627,8 @@ static bool yz_auth_query_request(unsigned int request)
 	return request == YZ_IOCTL_GET_SAFEMODE ||
 	       request == YZ_IOCTL_GET_ROOT_STATUS ||
 	       request == YZ_IOCTL_GET_RUNTIME ||
+	       request == YZ_IOCTL_GET_EXIT_HISTORY_FD ||
+	       request == YZ_IOCTL_GET_HEALTH ||
 	       request == YZ_IOCTL_GET_ZYGOTE_VARIANTS ||
 	       request == YZ_IOCTL_UID_SHOULD_UMOUNT;
 }
@@ -620,7 +640,12 @@ int yz_auth_begin(struct yz_auth_session *s, unsigned int request,
 
 	(void)arg;
 
-	mutex_lock(&yz_auth_lock);
+	if (request == YZ_IOCTL_GET_HEALTH) {
+		if (!mutex_trylock(&yz_auth_lock))
+			return -EAGAIN;
+	} else {
+		mutex_lock(&yz_auth_lock);
+	}
 	if (!yz_auth_enabled || !s || !yz_auth_is_owner(s, true))
 		goto fail;
 	if (yz_auth_query_request(request))
@@ -691,6 +716,37 @@ bool yz_auth_ticket_begin(const struct yz_auth_ticket *ticket)
 		list_for_each_entry(s, &yz_auth_sessions, list) {
 			if (s->generation == ticket->generation && yz_auth_alive(s) &&
 			    (s->role == YZ_VIOLA_DAEMON64 || s->role == YZ_VIOLA_DAEMON32))
+				return true;
+		}
+	}
+	mutex_unlock(&yz_auth_lock);
+	return false;
+}
+
+int yz_auth_query_ticket(struct yz_auth_ticket *ticket)
+{
+	struct yz_auth_session *s;
+
+	lockdep_assert_held(&yz_auth_lock);
+	list_for_each_entry (s, &yz_auth_sessions, list) {
+		if (yz_auth_is_owner(s, true)) {
+			ticket->epoch = yz_auth_epoch;
+			ticket->generation = s->generation;
+			return 0;
+		}
+	}
+	return -EPERM;
+}
+
+bool yz_auth_query_ticket_begin(const struct yz_auth_ticket *ticket)
+{
+	struct yz_auth_session *s;
+
+	mutex_lock(&yz_auth_lock);
+	if (yz_auth_enabled && ticket->epoch == yz_auth_epoch) {
+		list_for_each_entry (s, &yz_auth_sessions, list) {
+			if (s->generation == ticket->generation &&
+			    yz_auth_is_owner(s, true))
 				return true;
 		}
 	}
@@ -851,7 +907,7 @@ static int yz_auth_delegate(struct yz_auth_session *parent, void __user *arg)
 		return -EINVAL;
 	existing = rcu_dereference_protected(yz_auth_compat,
 		lockdep_is_held(&yz_auth_lock));
-	if (yz_auth_alive(existing))
+	if (yz_auth_alive(existing) || yz_auth_owner_alive(existing))
 		return -EBUSY;
 	image = fget(cmd.viola_fd);
 	if (!image)
@@ -921,6 +977,54 @@ static u32 yz_auth_state(struct yz_auth_session *s)
 	return s->ready ? YZ_VIOLA_READY : YZ_VIOLA_STARTING;
 }
 
+static int yz_auth_daemon_identity(void __user *arg)
+{
+	struct yz_viola_daemon_identity_cmd cmd;
+	struct yz_auth_session *session;
+	struct task_struct *task;
+	bool valid;
+
+	if (copy_from_user(&cmd, arg, sizeof(cmd)))
+		return -EFAULT;
+	if (cmd.size != sizeof(cmd) ||
+	    cmd.version != YZ_VIOLA_DAEMON_IDENTITY_VERSION ||
+	    (cmd.abi != YZ_RUNTIME_ABI_32 && cmd.abi != YZ_RUNTIME_ABI_64) ||
+	    cmd.reserved || cmd.pid || cmd.state || cmd.owner_alive ||
+	    cmd.role || cmd.start_boottime_ns || cmd.epoch || cmd.generation)
+		return -EINVAL;
+	session = cmd.abi == YZ_RUNTIME_ABI_32
+		      ? rcu_dereference_protected(
+			    yz_auth_compat, lockdep_is_held(&yz_auth_lock))
+		      : rcu_dereference_protected(
+			    yz_auth_main, lockdep_is_held(&yz_auth_lock));
+	cmd.epoch = yz_auth_epoch;
+	cmd.state = session
+			? yz_auth_state(session)
+			: (cmd.abi == YZ_RUNTIME_ABI_32 ? yz_auth_compat_history
+							: yz_auth_main_history);
+	if (session) {
+		cmd.pid = pid_nr(session->owner);
+		cmd.generation = session->generation;
+		cmd.role = session->role;
+		task = get_pid_task(session->owner, PIDTYPE_TGID);
+		valid = false;
+		if (task) {
+			cmd.start_boottime_ns = READ_ONCE(task->start_boottime);
+			cmd.owner_alive = atomic_read(&task->signal->live) > 0;
+			task_lock(task);
+			valid =
+			    cmd.owner_alive && !(task->flags & PF_EXITING) &&
+			    task->mm == session->mm &&
+			    READ_ONCE(task->self_exec_id) == session->exec_id;
+			task_unlock(task);
+			put_task_struct(task);
+		}
+		if (!valid && cmd.state == YZ_VIOLA_READY)
+			cmd.state = YZ_VIOLA_LOST;
+	}
+	return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+}
+
 static int yz_auth_recover(struct yz_auth_session *s,
 			  struct yz_auth_session *main,
 			  struct yz_auth_session *compat,
@@ -935,6 +1039,11 @@ static int yz_auth_recover(struct yz_auth_session *s,
 			return -EPERM;
 		if (main->recovery != 1)
 			return -EAGAIN;
+		if (yz_auth_owner_alive(compat)) {
+			main->recovery = 0;
+			main->recovery_error = -EBUSY;
+			return -EBUSY;
+		}
 		main->recovery = 2;
 		return 0;
 	}
@@ -962,6 +1071,8 @@ static int yz_auth_recover(struct yz_auth_session *s,
 		return -ENODEV;
 	if (yz_auth_alive(compat))
 		return 0;
+	if (yz_auth_owner_alive(compat))
+		return -EBUSY;
 	if (!main->recovery) {
 		main->recovery = 1;
 		main->recovery_error = 0;
@@ -982,7 +1093,12 @@ long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request,
 	u32 failed_stage = YZ_VIOLA_STAGE_SESSION;
 	u32 failed_role = s ? yz_auth_session_payload(s->role) : 0;
 
-	mutex_lock(&yz_auth_lock);
+	if (request == YZ_IOCTL_VIOLA_DAEMON_IDENTITY) {
+		if (!mutex_trylock(&yz_auth_lock))
+			return -EAGAIN;
+	} else {
+		mutex_lock(&yz_auth_lock);
+	}
 	if (!yz_auth_enabled || !s)
 		goto out;
 	if (request == YZ_IOCTL_VIOLA_CLAIM) {
@@ -999,6 +1115,9 @@ long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request,
 	compat = rcu_dereference_protected(yz_auth_compat,
 		lockdep_is_held(&yz_auth_lock));
 	switch (request) {
+	case YZ_IOCTL_VIOLA_DAEMON_IDENTITY:
+		ret = yz_auth_daemon_identity(arg);
+		break;
 	case YZ_IOCTL_VIOLA_STATUS:
 		if (copy_from_user(&status, arg, sizeof(status))) {
 			ret = -EFAULT;

@@ -8,31 +8,43 @@
  * Author: Anatdx
  */
 
-#include <linux/errno.h>
 #include <linux/compat.h>
+#include <linux/errno.h>
+#include <linux/hashtable.h>
 #include <linux/mm.h>
-#include <linux/mutex.h>
+#include <linux/ktime.h>
 #include <linux/pid.h>
+#include <linux/pid_namespace.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/task.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
+#include "api.h"
 #include "internal.h"
-#include "klog.h"
-#include "zygote_exit.h"
+#include "uapi/yukizygisk.h"
 
-struct yz_runtime_entry {
+struct yz_runtime_slot {
+	struct hlist_node pid_node;
 	struct yz_runtime_record record;
 	u64 start_boottime;
+	u64 exit_boottime;
+	u32 exit_status;
+	bool exit_pending;
+	bool exit_observed;
 };
 
-static DEFINE_MUTEX(yz_runtime_lock);
-static struct yz_runtime_entry yz_runtime_records[YZ_RUNTIME_RECORD_MAX];
+static DEFINE_SPINLOCK(yz_runtime_lock);
+static struct yz_runtime_slot yz_runtime_records[YZ_RUNTIME_RECORD_MAX];
+static DEFINE_HASHTABLE(yz_runtime_pids, 8);
 static u32 yz_runtime_generation;
-static bool yz_runtime_next_arg(unsigned long *p, unsigned long end, char *arg,
-				size_t arg_len)
+static bool yz_runtime_reconcile_pending;
+
+static bool yz_next_arg(unsigned long *p, unsigned long end, char *arg,
+			size_t arg_len)
 {
 	char c = '\0';
 	int i = 0;
@@ -61,6 +73,522 @@ static bool yz_runtime_next_arg(unsigned long *p, unsigned long end, char *arg,
 	return true;
 }
 
+static u32 yz_runtime_advance_locked(void)
+{
+	if (++yz_runtime_generation == 0)
+		yz_runtime_generation = 1;
+	return yz_runtime_generation;
+}
+
+static int yz_runtime_get_task_start(u32 pid, u64 *start_boottime)
+{
+	struct task_struct *task;
+	int ret = -ESRCH;
+
+	rcu_read_lock();
+	task = pid_task(find_pid_ns((pid_t)pid, &init_pid_ns), PIDTYPE_TGID);
+	if (task && atomic_read(&task->signal->live) > 0) {
+		*start_boottime = READ_ONCE(task->start_boottime);
+		ret = 0;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static bool yz_runtime_task_alive(u32 pid, u64 start_boottime)
+{
+	u64 current_start;
+
+	return !yz_runtime_get_task_start(pid, &current_start) &&
+	       current_start == start_boottime;
+}
+
+static void yz_runtime_mark_exited_locked(struct yz_runtime_record *record)
+{
+	if (record->state == YZ_RUNTIME_STATE_EXITED)
+		return;
+	record->flags &= ~YZ_RUNTIME_F_INJECTION_STATE_MASK;
+	record->flags |= (u32)record->state
+			 << YZ_RUNTIME_F_INJECTION_STATE_SHIFT;
+	record->state = YZ_RUNTIME_STATE_EXITED;
+}
+
+static void yz_runtime_exit_slot_locked(struct yz_runtime_slot *slot,
+					struct task_struct *task)
+{
+	if (slot->exit_observed)
+		return;
+	slot->exit_observed = true;
+	slot->exit_status = READ_ONCE(task->signal->flags) & SIGNAL_GROUP_EXIT
+				? READ_ONCE(task->signal->group_exit_code)
+				: READ_ONCE(task->group_leader->exit_code);
+	slot->exit_boottime = ktime_get_boottime_ns();
+	slot->exit_pending = !slot->record.module_id[0];
+	yz_runtime_mark_exited_locked(&slot->record);
+	if (slot->exit_pending)
+		yz_exit_history_append(&slot->record, slot->start_boottime,
+				       slot->exit_boottime, slot->exit_status);
+	yz_runtime_advance_locked();
+}
+
+static bool yz_runtime_refresh_pid_locked(u32 pid, bool *checked)
+{
+	struct yz_runtime_slot *slot;
+	struct task_struct *task;
+	bool observed = false;
+	bool unsettled = false;
+
+	rcu_read_lock();
+	task = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_TGID);
+	hash_for_each_possible(yz_runtime_pids, slot, pid_node, pid)
+	{
+		if (slot->record.pid != pid)
+			continue;
+		if (checked)
+			checked[slot - yz_runtime_records] = true;
+		if (slot->record.state == YZ_RUNTIME_STATE_EXITED)
+			continue;
+		if (!task ||
+		    READ_ONCE(task->start_boottime) != slot->start_boottime) {
+			yz_runtime_mark_exited_locked(&slot->record);
+			yz_runtime_advance_locked();
+		} else if (!atomic_read(&task->signal->live)) {
+			if (READ_ONCE(task->exit_state)) {
+				yz_runtime_exit_slot_locked(slot, task);
+				observed |= slot->exit_pending;
+			} else {
+				/* The task may have passed the tracepoint
+				 * before monitoring started, but not published
+				 * status. */
+				unsettled = true;
+			}
+		}
+	}
+	rcu_read_unlock();
+	if (observed)
+		yz_process_exit_schedule();
+	return unsettled;
+}
+
+static void yz_runtime_refresh_exited_locked(void)
+{
+	bool checked[YZ_RUNTIME_RECORD_MAX] = {false};
+	bool unsettled = false;
+	u32 i;
+
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		struct yz_runtime_record *record =
+		    &yz_runtime_records[i].record;
+
+		if (checked[i] || !record->pid ||
+		    record->state == YZ_RUNTIME_STATE_EXITED)
+			continue;
+		unsettled |=
+		    yz_runtime_refresh_pid_locked(record->pid, checked);
+	}
+	yz_runtime_reconcile_pending = unsettled;
+}
+
+void yz_runtime_reconcile(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&yz_runtime_lock, flags);
+	yz_runtime_refresh_exited_locked();
+	spin_unlock_irqrestore(&yz_runtime_lock, flags);
+}
+
+bool yz_runtime_on_exit(struct task_struct *task)
+{
+	u64 start = READ_ONCE(task->group_leader->start_boottime);
+	struct yz_runtime_slot *slot;
+	unsigned long irqflags;
+	bool pending = false;
+
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	hash_for_each_possible(yz_runtime_pids, slot, pid_node, task->tgid)
+	{
+		if (slot->record.pid != (u32)task->tgid ||
+		    slot->start_boottime != start || slot->exit_observed)
+			continue;
+		yz_runtime_exit_slot_locked(slot, task);
+		pending |= slot->exit_pending;
+	}
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+	return pending;
+}
+
+bool yz_runtime_take_exit(struct yz_target_exit_event *event)
+{
+	unsigned long irqflags;
+	u32 i;
+	bool found = false;
+
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		struct yz_runtime_slot *slot = &yz_runtime_records[i];
+
+		if (!slot->exit_pending)
+			continue;
+		memset(event, 0, sizeof(*event));
+		event->event.type = YZ_EV_TARGET_EXIT;
+		event->event.pid = slot->record.pid;
+		event->event.appid = slot->exit_status;
+		event->generation = slot->record.generation;
+		event->start_boottime = slot->start_boottime;
+		event->observed_boottime = slot->exit_boottime;
+		event->abi = slot->record.abi;
+		event->kind = slot->record.kind;
+		slot->exit_pending = false;
+		found = true;
+		break;
+	}
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+	return found;
+}
+
+static struct yz_runtime_slot *
+yz_runtime_alloc_slot_locked(const struct yz_runtime_slot *avoid)
+{
+	struct yz_runtime_slot *oldest_exited = NULL;
+	struct yz_runtime_slot *oldest_module = NULL;
+	u32 i;
+
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		struct yz_runtime_slot *slot = &yz_runtime_records[i];
+
+		if (slot == avoid || slot->exit_pending)
+			continue;
+		if (!slot->record.pid)
+			return slot;
+		if (slot->record.state == YZ_RUNTIME_STATE_EXITED &&
+		    (!oldest_exited || slot->record.generation <
+					   oldest_exited->record.generation))
+			oldest_exited = slot;
+		if (slot->record.module_id[0] &&
+		    (!oldest_module || slot->record.generation <
+					   oldest_module->record.generation))
+			oldest_module = slot;
+	}
+	return oldest_exited ? oldest_exited : oldest_module;
+}
+
+void yz_runtime_read_process(struct mm_struct *mm, char *process,
+			     size_t process_len)
+{
+	unsigned long p, end;
+
+	if (!process_len)
+		return;
+	process[0] = '\0';
+	if (!mm)
+		return;
+	p = READ_ONCE(mm->arg_start);
+	end = READ_ONCE(mm->arg_end);
+	if (!p || end <= p)
+		return;
+	if (!yz_next_arg(&p, end, process, process_len))
+		process[0] = '\0';
+}
+
+u32 yz_runtime_begin(u8 kind, u8 abi, u8 target_type, u32 flags,
+		     const char *process, const char *target)
+{
+	struct yz_runtime_slot *slot = NULL;
+	u64 start_boottime = READ_ONCE(current->group_leader->start_boottime);
+	u32 restarts = 0;
+	u32 pid = (u32)current->tgid;
+	unsigned long irqflags;
+	u32 i;
+
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	if (!yz_process_exit_active() || yz_runtime_reconcile_pending)
+		yz_runtime_refresh_exited_locked();
+	else
+		yz_runtime_refresh_pid_locked(pid, NULL);
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		struct yz_runtime_slot *candidate = &yz_runtime_records[i];
+
+		if (!candidate->exit_pending && candidate->record.pid == pid &&
+		    candidate->start_boottime == start_boottime &&
+		    !candidate->record.module_id[0])
+			slot = candidate;
+	}
+	if (kind == YZ_RUNTIME_KIND_ZYGOTE) {
+		for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+			struct yz_runtime_slot *candidate =
+			    &yz_runtime_records[i];
+
+			if (!candidate->record.pid ||
+			    candidate->record.kind != kind ||
+			    candidate->record.abi != abi ||
+			    candidate->record.module_id[0] ||
+			    strcmp(candidate->record.target, target))
+				continue;
+			restarts =
+			    max(restarts, candidate->record.restarts + 1);
+			if (!slot && !candidate->exit_pending &&
+			    candidate->record.state == YZ_RUNTIME_STATE_EXITED)
+				slot = candidate;
+		}
+	}
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
+		struct yz_runtime_record *record =
+		    &yz_runtime_records[i].record;
+
+		if (record->pid != pid || !record->module_id[0] ||
+		    record->state == YZ_RUNTIME_STATE_EXITED)
+			continue;
+		yz_runtime_mark_exited_locked(record);
+		yz_runtime_advance_locked();
+	}
+	if (!slot)
+		slot = yz_runtime_alloc_slot_locked(NULL);
+	if (!slot || (slot->record.pid &&
+		      slot->record.state != YZ_RUNTIME_STATE_EXITED &&
+		      slot->record.module_id[0])) {
+		yz_runtime_refresh_exited_locked();
+		slot = yz_runtime_alloc_slot_locked(NULL);
+	}
+	if (!slot) {
+		spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+		return 0;
+	}
+
+	hash_del(&slot->pid_node);
+	memset(slot, 0, sizeof(*slot));
+	slot->record.pid = pid;
+	slot->record.generation = yz_runtime_advance_locked();
+	slot->record.restarts = restarts;
+	slot->record.kind = kind;
+	slot->record.state = YZ_RUNTIME_STATE_DETECTED;
+	slot->record.abi = abi;
+	slot->record.target_type = target_type;
+	slot->record.flags = flags & ~YZ_RUNTIME_F_INJECTION_STATE_MASK;
+	yz_copy_name(slot->record.process, sizeof(slot->record.process),
+		     process);
+	yz_copy_name(slot->record.target, sizeof(slot->record.target), target);
+	slot->start_boottime = start_boottime;
+	hash_add(yz_runtime_pids, &slot->pid_node, pid);
+	i = slot->record.generation;
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+	return i;
+}
+
+void yz_runtime_set_state(u32 pid, u32 generation, u8 state)
+{
+	struct yz_runtime_slot *slot;
+	unsigned long irqflags;
+
+	if (!generation)
+		return;
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	hash_for_each_possible(yz_runtime_pids, slot, pid_node, pid)
+	{
+		struct yz_runtime_record *record = &slot->record;
+
+		if (record->pid != pid || record->generation != generation ||
+		    record->module_id[0] ||
+		    record->state == YZ_RUNTIME_STATE_EXITED)
+			continue;
+		if (record->state != state) {
+			if (state == YZ_RUNTIME_STATE_EXITED)
+				yz_runtime_mark_exited_locked(record);
+			else
+				record->state = state;
+			yz_runtime_advance_locked();
+		}
+		break;
+	}
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+}
+
+int yz_runtime_query(struct yz_runtime_record *entries, u32 capacity,
+		     struct yz_runtime_query_cmd *query)
+{
+	unsigned long irqflags;
+	u32 count = 0;
+	u32 i;
+
+	if (!query || capacity > YZ_RUNTIME_RECORD_MAX ||
+	    (capacity && !entries))
+		return -EINVAL;
+
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	if (!yz_process_exit_active() || yz_runtime_reconcile_pending)
+		yz_runtime_refresh_exited_locked();
+	for (i = 0; i < YZ_RUNTIME_RECORD_MAX && count < capacity; i++) {
+		if (!yz_runtime_records[i].record.pid)
+			continue;
+		entries[count++] = yz_runtime_records[i].record;
+	}
+	query->count = count;
+	query->generation = yz_runtime_generation;
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+
+	yz_safemode_fill_runtime_query(query);
+	query->capabilities = YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY |
+			      YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT |
+			      YZ_RUNTIME_CAP_INJECTION_STATE |
+			      YZ_RUNTIME_CAP_EXIT_HISTORY |
+			      YZ_RUNTIME_CAP_HEALTH;
+	return 0;
+}
+
+bool yz_runtime_is_native(pid_t pid, u64 start_boottime)
+{
+	struct yz_runtime_slot *slot;
+	unsigned long irqflags;
+	bool found = false;
+
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	hash_for_each_possible(yz_runtime_pids, slot, pid_node, pid)
+	{
+		const struct yz_runtime_record *record = &slot->record;
+
+		if (record->pid == (u32)pid &&
+		    slot->start_boottime == start_boottime &&
+		    record->kind == YZ_RUNTIME_KIND_NATIVE &&
+		    !record->module_id[0] &&
+		    (record->state == YZ_RUNTIME_STATE_REDIRECTED ||
+		     record->state == YZ_RUNTIME_STATE_INJECTED)) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+	return found;
+}
+
+int yz_runtime_report(const struct yz_runtime_report_cmd *report)
+{
+	unsigned long irqflags;
+	struct yz_runtime_slot *base = NULL;
+	struct yz_runtime_slot *module = NULL;
+	struct yz_runtime_slot *slot;
+	char module_id[YZ_NATIVE_MODULE_ID_MAX];
+	u64 start_boottime;
+	u8 state;
+
+	if (!report || !report->pid || !report->generation ||
+	    (report->kind != YZ_RUNTIME_KIND_ZYGOTE &&
+	     report->kind != YZ_RUNTIME_KIND_NATIVE) ||
+	    (report->kind == YZ_RUNTIME_KIND_NATIVE && !report->module_id[0]) ||
+	    (report->module_state &&
+	     report->module_state != YZ_RUNTIME_STATE_INJECTED &&
+	     report->module_state != YZ_RUNTIME_STATE_FAILED &&
+	     report->module_state != YZ_RUNTIME_STATE_SAFEMODE) ||
+	    (!report->module_id[0] && report->module_state &&
+	     report->module_state != YZ_RUNTIME_STATE_INJECTED))
+		return -EINVAL;
+	state = report->module_state ? report->module_state
+				     : YZ_RUNTIME_STATE_INJECTED;
+	yz_copy_name(module_id, sizeof(module_id), report->module_id);
+	if (yz_runtime_get_task_start(report->pid, &start_boottime))
+		return -ESRCH;
+
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
+	hash_for_each_possible(yz_runtime_pids, slot, pid_node, report->pid)
+	{
+		if (slot->record.pid != report->pid ||
+		    slot->record.generation != report->generation ||
+		    slot->record.kind != report->kind ||
+		    slot->start_boottime != start_boottime ||
+		    slot->record.module_id[0] ||
+		    slot->record.state == YZ_RUNTIME_STATE_EXITED)
+			continue;
+		if (!base || slot->record.generation > base->record.generation)
+			base = slot;
+	}
+	if (!base) {
+		spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+		return -ESRCH;
+	}
+	if (!yz_runtime_task_alive(base->record.pid, base->start_boottime)) {
+		yz_runtime_refresh_pid_locked(base->record.pid, NULL);
+		spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+		return -ESRCH;
+	}
+	if (base->record.state != YZ_RUNTIME_STATE_REDIRECTED &&
+	    base->record.state != YZ_RUNTIME_STATE_INJECTED) {
+		spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+		return -EAGAIN;
+	}
+
+	if ((!report->module_id[0] || report->kind == YZ_RUNTIME_KIND_NATIVE) &&
+	    state == YZ_RUNTIME_STATE_INJECTED &&
+	    base->record.state != YZ_RUNTIME_STATE_INJECTED) {
+		base->record.state = YZ_RUNTIME_STATE_INJECTED;
+		yz_runtime_advance_locked();
+	}
+	if (report->module_id[0]) {
+		hash_for_each_possible(yz_runtime_pids, slot, pid_node,
+				       report->pid)
+		{
+			if (slot->record.pid == report->pid &&
+			    slot->record.kind == report->kind &&
+			    slot->record.generation == report->generation &&
+			    slot->start_boottime == start_boottime &&
+			    !strcmp(slot->record.module_id, module_id)) {
+				module = slot;
+				break;
+			}
+		}
+		if (!module) {
+			module = yz_runtime_alloc_slot_locked(base);
+			if (!module ||
+			    (module->record.pid &&
+			     module->record.state != YZ_RUNTIME_STATE_EXITED)) {
+				yz_runtime_refresh_exited_locked();
+				if (base->record.state ==
+					YZ_RUNTIME_STATE_EXITED ||
+				    !yz_runtime_task_alive(
+					base->record.pid,
+					base->start_boottime)) {
+					yz_runtime_refresh_pid_locked(
+					    base->record.pid, NULL);
+					spin_unlock_irqrestore(&yz_runtime_lock,
+							       irqflags);
+					return -ESRCH;
+				}
+				module = yz_runtime_alloc_slot_locked(base);
+			}
+		}
+		if (!module) {
+			spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+			return -ENOSPC;
+		}
+		/* Preserve failed child loads for this Zygote generation. */
+		if (report->kind == YZ_RUNTIME_KIND_ZYGOTE &&
+		    module->record.generation == base->record.generation &&
+		    module->start_boottime == base->start_boottime &&
+		    !strcmp(module->record.module_id, module_id) &&
+		    (module->record.state == YZ_RUNTIME_STATE_FAILED ||
+		     module->record.state == YZ_RUNTIME_STATE_SAFEMODE))
+			state = module->record.state;
+		if (module->record.generation != base->record.generation ||
+		    module->record.state != state ||
+		    strcmp(module->record.module_id, module_id) ||
+		    module->start_boottime != base->start_boottime) {
+			struct yz_runtime_record record = base->record;
+
+			yz_copy_name(record.module_id, sizeof(record.module_id),
+				     module_id);
+			record.state = state;
+			record.flags &= ~YZ_RUNTIME_F_INJECTION_STATE_MASK;
+			hash_del(&module->pid_node);
+			memset(module, 0, sizeof(*module));
+			module->record = record;
+			module->start_boottime = base->start_boottime;
+			hash_add(yz_runtime_pids, &module->pid_node,
+				 report->pid);
+			yz_runtime_advance_locked();
+		}
+	}
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
+	return 0;
+}
+
 bool yz_runtime_parse_zygote_args(struct mm_struct *mm, char *socket_name,
 				  size_t socket_name_len)
 {
@@ -81,7 +609,7 @@ bool yz_runtime_parse_zygote_args(struct mm_struct *mm, char *socket_name,
 	while (p < end && argc++ < 64) {
 		static const char socket_prefix[] = "--socket-name=";
 
-		if (!yz_runtime_next_arg(&p, end, arg, sizeof(arg)))
+		if (!yz_next_arg(&p, end, arg, sizeof(arg)))
 			return false;
 		if (!strcmp(arg, "-Xzygote"))
 			found = true;
@@ -96,408 +624,9 @@ bool yz_runtime_parse_zygote_args(struct mm_struct *mm, char *socket_name,
 	return found;
 }
 
-static u32 yz_runtime_next_generation_locked(void)
-{
-	yz_runtime_generation++;
-	if (!yz_runtime_generation)
-		yz_runtime_generation++;
-	return yz_runtime_generation;
-}
-
-static int yz_runtime_get_task_start(u32 pid, u64 *start_boottime)
-{
-	struct task_struct *task;
-	int ret = -ESRCH;
-
-	rcu_read_lock();
-	task = get_pid_task(find_vpid((pid_t)pid), PIDTYPE_PID);
-	rcu_read_unlock();
-	if (!task)
-		return ret;
-
-	if (!READ_ONCE(task->exit_state)) {
-		*start_boottime = READ_ONCE(task->start_boottime);
-		ret = 0;
-	}
-	put_task_struct(task);
-	return ret;
-}
-
-static bool yz_runtime_task_alive(u32 pid, u64 start_boottime)
-{
-	u64 current_start;
-
-	return !yz_runtime_get_task_start(pid, &current_start) &&
-	       current_start == start_boottime;
-}
-
-static int yz_runtime_find_base_locked(u32 pid, u64 start_boottime, u8 kind,
-				       u32 generation)
-{
-	int i;
-
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		const struct yz_runtime_entry *entry = &yz_runtime_records[i];
-
-		if (entry->record.pid == pid &&
-		    entry->start_boottime == start_boottime &&
-		    entry->record.kind == kind &&
-		    entry->record.generation == generation &&
-		    !entry->record.module_id[0] &&
-		    entry->record.state != YZ_RUNTIME_STATE_EXITED)
-			return i;
-	}
-	return -1;
-}
-
-static int yz_runtime_find_native_pid_locked(u32 pid)
-{
-	int i;
-
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		const struct yz_runtime_record *record =
-		    &yz_runtime_records[i].record;
-
-		if (record->pid == pid &&
-		    record->kind == YZ_RUNTIME_KIND_NATIVE &&
-		    !record->module_id[0])
-			return i;
-	}
-	return -1;
-}
-
-static int yz_runtime_find_zygote_locked(const char *target, u8 abi)
-{
-	int i;
-
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		const struct yz_runtime_record *record =
-		    &yz_runtime_records[i].record;
-
-		if (record->pid && record->kind == YZ_RUNTIME_KIND_ZYGOTE &&
-		    record->abi == abi && !record->module_id[0] &&
-		    !strcmp(record->target, target))
-			return i;
-	}
-	return -1;
-}
-
-static int yz_runtime_find_module_locked(u32 pid, u64 start_boottime, u8 kind,
-					 u32 generation, const char *module_id)
-{
-	int i;
-
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		const struct yz_runtime_entry *entry = &yz_runtime_records[i];
-
-		if (entry->record.pid == pid && entry->record.kind == kind &&
-		    entry->record.generation == generation &&
-		    entry->start_boottime == start_boottime &&
-		    !strcmp(entry->record.module_id, module_id))
-			return i;
-	}
-	return -1;
-}
-
-static int yz_runtime_pick_slot_locked(int exclude)
-{
-	int exited = -1;
-	int module = -1;
-	int i;
-
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		const struct yz_runtime_record *record =
-		    &yz_runtime_records[i].record;
-
-		if (i == exclude)
-			continue;
-		if (!record->pid)
-			return i;
-		if (record->state == YZ_RUNTIME_STATE_EXITED &&
-		    (exited < 0 ||
-		     record->generation <
-			 yz_runtime_records[exited].record.generation))
-			exited = i;
-		if (record->module_id[0] &&
-		    (module < 0 ||
-		     record->generation <
-			 yz_runtime_records[module].record.generation))
-			module = i;
-	}
-	return exited >= 0 ? exited : module;
-}
-
-static void yz_runtime_set_state_locked(struct yz_runtime_entry *entry,
-					u8 state)
-{
-	if (entry->record.state == state)
-		return;
-	entry->record.state = state;
-	yz_runtime_next_generation_locked();
-}
-
-static void yz_runtime_refresh_exited_locked(void)
-{
-	int i;
-
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		struct yz_runtime_entry *entry = &yz_runtime_records[i];
-
-		if (!entry->record.pid ||
-		    entry->record.state == YZ_RUNTIME_STATE_EXITED)
-			continue;
-		if (!yz_runtime_task_alive(entry->record.pid,
-					   entry->start_boottime))
-			yz_runtime_set_state_locked(entry,
-						    YZ_RUNTIME_STATE_EXITED);
-	}
-}
-
-u32 yz_runtime_begin(u8 kind, u8 abi, u8 target_type, u32 flags,
-		     const char *process, const char *target)
-{
-	struct yz_runtime_entry *entry;
-	u64 start_boottime = READ_ONCE(current->start_boottime);
-	u32 pid = (u32)current->tgid;
-	u32 restarts = 0;
-	u32 generation = 0;
-	bool matched = false;
-	int slot;
-	int i;
-
-	mutex_lock(&yz_runtime_lock);
-	yz_runtime_refresh_exited_locked();
-	if (kind == YZ_RUNTIME_KIND_ZYGOTE) {
-		slot = yz_runtime_find_zygote_locked(target, abi);
-		matched = slot >= 0;
-		if (slot < 0)
-			slot = yz_runtime_pick_slot_locked(-1);
-	} else {
-		slot = yz_runtime_find_native_pid_locked(pid);
-		for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-			struct yz_runtime_entry *module =
-			    &yz_runtime_records[i];
-
-			if (module->record.pid == pid &&
-			    module->record.kind == YZ_RUNTIME_KIND_NATIVE &&
-			    module->record.module_id[0])
-				yz_runtime_set_state_locked(
-				    module, YZ_RUNTIME_STATE_EXITED);
-		}
-		if (slot < 0)
-			slot = yz_runtime_pick_slot_locked(-1);
-	}
-	if (slot < 0)
-		goto out;
-
-	entry = &yz_runtime_records[slot];
-	if (kind == YZ_RUNTIME_KIND_ZYGOTE && matched)
-		restarts = entry->record.restarts + 1;
-
-	memset(entry, 0, sizeof(*entry));
-	entry->record.pid = pid;
-	entry->record.generation = yz_runtime_next_generation_locked();
-	entry->record.restarts = restarts;
-	entry->record.kind = kind;
-	entry->record.state = YZ_RUNTIME_STATE_DETECTED;
-	entry->record.abi = abi;
-	entry->record.target_type = target_type;
-	entry->record.flags = flags;
-	yz_copy_name(entry->record.process, sizeof(entry->record.process),
-		     process);
-	yz_copy_name(entry->record.target, sizeof(entry->record.target),
-		     target);
-	entry->start_boottime = start_boottime;
-	generation = entry->record.generation;
-	if (kind == YZ_RUNTIME_KIND_ZYGOTE)
-		yz_zygote_exit_track(pid, start_boottime, generation, abi);
-out:
-	mutex_unlock(&yz_runtime_lock);
-	return generation;
-}
-
-void yz_runtime_set_state(u32 pid, u32 generation, u8 state)
-{
-	int i;
-
-	if (!generation)
-		return;
-	mutex_lock(&yz_runtime_lock);
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		struct yz_runtime_record *record =
-		    &yz_runtime_records[i].record;
-
-		if (record->pid != pid || record->generation != generation ||
-		    record->module_id[0])
-			continue;
-		yz_runtime_set_state_locked(&yz_runtime_records[i], state);
-		break;
-	}
-	mutex_unlock(&yz_runtime_lock);
-}
-
-void yz_runtime_read_process(struct mm_struct *mm, char *process,
-			     size_t process_len)
-{
-	unsigned long p;
-	unsigned long end;
-
-	if (!process_len)
-		return;
-	process[0] = '\0';
-	if (!mm)
-		return;
-	p = READ_ONCE(mm->arg_start);
-	end = READ_ONCE(mm->arg_end);
-	if (!p || end <= p)
-		return;
-	if (!yz_runtime_next_arg(&p, end, process, process_len))
-		process[0] = '\0';
-}
-
-int yz_runtime_query(struct yz_runtime_record *entries, u32 capacity,
-		     struct yz_runtime_query_cmd *query)
-{
-	u32 count = 0;
-	int i;
-
-	if (!query || capacity > YZ_RUNTIME_RECORD_MAX ||
-	    (capacity && !entries))
-		return -EINVAL;
-
-	mutex_lock(&yz_runtime_lock);
-	yz_runtime_refresh_exited_locked();
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		struct yz_runtime_entry *entry = &yz_runtime_records[i];
-
-		if (!entry->record.pid)
-			continue;
-		if (count < capacity)
-			entries[count++] = entry->record;
-	}
-	query->count = count;
-	query->generation = yz_runtime_generation;
-	mutex_unlock(&yz_runtime_lock);
-
-	yz_safemode_fill_runtime_query(query);
-	query->capabilities = YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY |
-			      YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT;
-	return 0;
-}
-
-int yz_runtime_report(const struct yz_runtime_report_cmd *report)
-{
-	struct yz_runtime_entry *base;
-	struct yz_runtime_entry *module;
-	char module_id[YZ_NATIVE_MODULE_ID_MAX];
-	u64 start_boottime;
-	u8 state;
-	int base_slot;
-	int module_slot;
-	int ret = 0;
-
-	if (!report || !report->pid || !report->generation ||
-	    (report->kind != YZ_RUNTIME_KIND_ZYGOTE &&
-	     report->kind != YZ_RUNTIME_KIND_NATIVE) ||
-	    (report->module_state &&
-	     report->module_state != YZ_RUNTIME_STATE_INJECTED &&
-	     report->module_state != YZ_RUNTIME_STATE_FAILED &&
-	     report->module_state != YZ_RUNTIME_STATE_SAFEMODE) ||
-	    (!report->module_id[0] && report->module_state &&
-	     report->module_state != YZ_RUNTIME_STATE_INJECTED))
-		return -EINVAL;
-	state = report->module_state ? report->module_state
-				     : YZ_RUNTIME_STATE_INJECTED;
-	yz_copy_name(module_id, sizeof(module_id), report->module_id);
-	if (report->kind == YZ_RUNTIME_KIND_NATIVE && !module_id[0])
-		return -EINVAL;
-	if (yz_runtime_get_task_start(report->pid, &start_boottime))
-		return -ESRCH;
-
-	mutex_lock(&yz_runtime_lock);
-	yz_runtime_refresh_exited_locked();
-	base_slot = yz_runtime_find_base_locked(
-	    report->pid, start_boottime, report->kind, report->generation);
-	if (base_slot < 0) {
-		ret = -ESRCH;
-		goto out;
-	}
-	base = &yz_runtime_records[base_slot];
-	if (!yz_runtime_task_alive(base->record.pid, base->start_boottime)) {
-		yz_runtime_set_state_locked(base, YZ_RUNTIME_STATE_EXITED);
-		ret = -ESRCH;
-		goto out;
-	}
-	if (base->record.state != YZ_RUNTIME_STATE_REDIRECTED &&
-	    base->record.state != YZ_RUNTIME_STATE_INJECTED) {
-		ret = -EAGAIN;
-		goto out;
-	}
-	if ((!module_id[0] || report->kind == YZ_RUNTIME_KIND_NATIVE) &&
-	    state == YZ_RUNTIME_STATE_INJECTED)
-		yz_runtime_set_state_locked(base, YZ_RUNTIME_STATE_INJECTED);
-	if (!module_id[0])
-		goto out;
-
-	module_slot = yz_runtime_find_module_locked(
-	    report->pid, start_boottime, report->kind, report->generation,
-	    module_id);
-	if (module_slot < 0)
-		module_slot = yz_runtime_pick_slot_locked(base_slot);
-	if (module_slot < 0) {
-		ret = -ENOSPC;
-		goto out;
-	}
-	module = &yz_runtime_records[module_slot];
-	/* Keep a failed child load visible for this Zygote generation. */
-	if (report->kind == YZ_RUNTIME_KIND_ZYGOTE &&
-	    module->record.generation == base->record.generation &&
-	    module->start_boottime == base->start_boottime &&
-	    !strcmp(module->record.module_id, module_id) &&
-	    (module->record.state == YZ_RUNTIME_STATE_FAILED ||
-	     module->record.state == YZ_RUNTIME_STATE_SAFEMODE))
-		state = module->record.state;
-	if (module->record.generation != base->record.generation ||
-	    module->record.state != state ||
-	    strcmp(module->record.module_id, module_id) ||
-	    module->start_boottime != base->start_boottime) {
-		*module = *base;
-		yz_copy_name(module->record.module_id,
-			     sizeof(module->record.module_id), module_id);
-		module->record.state = state;
-		yz_runtime_next_generation_locked();
-	}
-out:
-	mutex_unlock(&yz_runtime_lock);
-	return ret;
-}
-
-bool yz_runtime_is_native(pid_t pid, u64 start_boottime)
-{
-	bool found = false;
-	u32 i;
-
-	mutex_lock(&yz_runtime_lock);
-	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-		const struct yz_runtime_entry *slot = &yz_runtime_records[i];
-		const struct yz_runtime_record *record = &slot->record;
-
-		if (record->pid == (u32)pid &&
-		    slot->start_boottime == start_boottime &&
-		    record->kind == YZ_RUNTIME_KIND_NATIVE &&
-		    !record->module_id[0] &&
-		    (record->state == YZ_RUNTIME_STATE_REDIRECTED ||
-		     record->state == YZ_RUNTIME_STATE_INJECTED)) {
-			found = true;
-			break;
-		}
-	}
-	mutex_unlock(&yz_runtime_lock);
-	return found;
-}
-
 u8 yz_runtime_task_abi(struct task_struct *task)
 {
+	unsigned long irqflags;
 	struct {
 		pid_t pid;
 		u64 start;
@@ -517,12 +646,12 @@ u8 yz_runtime_task_abi(struct task_struct *task)
 		task = rcu_dereference(task->real_parent);
 	}
 	rcu_read_unlock();
-	mutex_lock(&yz_runtime_lock);
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
 	for (level = 0; level < n && !abi; level++) {
 		u32 newest = 0;
 
 		for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
-			const struct yz_runtime_entry *entry =
+			const struct yz_runtime_slot *entry =
 			    &yz_runtime_records[i];
 
 			if (entry->record.pid == lineage[level].pid &&
@@ -535,7 +664,7 @@ u8 yz_runtime_task_abi(struct task_struct *task)
 			}
 		}
 	}
-	mutex_unlock(&yz_runtime_lock);
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
 	return abi;
 }
 
@@ -556,11 +685,12 @@ u8 yz_runtime_abi(pid_t pid)
 
 u8 yz_runtime_report_abi(u32 pid, u32 generation)
 {
+	unsigned long irqflags;
 	u32 i;
 	u32 newest = 0;
 	u8 abi = YZ_RUNTIME_ABI_UNKNOWN;
 
-	mutex_lock(&yz_runtime_lock);
+	spin_lock_irqsave(&yz_runtime_lock, irqflags);
 	for (i = 0; i < YZ_RUNTIME_RECORD_MAX; i++) {
 		const struct yz_runtime_record *record =
 		    &yz_runtime_records[i].record;
@@ -577,6 +707,6 @@ u8 yz_runtime_report_abi(u32 pid, u32 generation)
 			abi = record->abi;
 		}
 	}
-	mutex_unlock(&yz_runtime_lock);
+	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
 	return abi;
 }

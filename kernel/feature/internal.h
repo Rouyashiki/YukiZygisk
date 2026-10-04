@@ -12,6 +12,7 @@
 #define YZ_FEATURE_INTERNAL_H
 
 #include "api.h"
+#include "process_exit.h"
 #include "uapi/yukizygisk.h"
 
 struct mm_struct;
@@ -64,7 +65,7 @@ void yz_events_emit_specialize(u32 pid, u32 appid);
 void yz_events_emit_safemode(u32 pid, u32 crashes);
 void yz_events_emit_zygote_exit(const struct yz_zygote_exit_event *event);
 void yz_lifecycle_on_setresuid(uid_t old_uid, uid_t new_uid);
-void yz_fd_handoff_release(pid_t pid);
+void yz_fd_handoff_release(struct task_struct *task);
 
 const char *yz_basename(const char *path);
 void yz_copy_name(char *dst, size_t dst_len, const char *src);
@@ -75,10 +76,10 @@ void yz_config_fill_linker_offsets(u64 dlopen, u64 dlsym, u64 dlopen32,
 u64 yz_config_dlopen_offset(bool compat);
 u64 yz_config_dlsym_offset(bool compat);
 bool yz_config_first_stage_loader(void);
+/* A successful begin is consumed exactly once by publish or restore. */
+struct yz_file_load_policy *yz_load_policy_begin(void);
 void yz_load_policy_restore_state(struct yz_file_load_policy *state);
-void yz_load_policy_publish_native(pid_t tgid,
-				   struct yz_file_load_policy *state);
-void yz_load_policy_cleanup(void);
+void yz_load_policy_publish_native(struct yz_file_load_policy *state);
 bool yz_safemode_is_active(void);
 bool yz_safemode_should_skip(const char *name);
 void yz_safemode_fill_runtime_query(struct yz_runtime_query_cmd *query);
@@ -111,5 +112,28 @@ int yz_payload_stage_file_fd(const char *path,
 bool yz_exec_injection_enabled(void);
 void yz_injector_schedule(bool native, u8 target_type, bool early_native,
 			  bool compat, const char *label);
+
+bool yz_runtime_on_exit(struct task_struct *task);
+void yz_runtime_reconcile(void);
+bool yz_runtime_take_exit(struct yz_target_exit_event *event);
+void yz_lifecycle_on_exit(struct task_struct *task);
+enum yz_policy_reap_reason {
+	YZ_POLICY_REAP_MISSING_OWNER,
+	YZ_POLICY_REAP_OVERFLOW,
+	YZ_POLICY_REAP_ENABLE,
+};
+void yz_load_policy_reap(enum yz_policy_reap_reason reason);
+void yz_load_policy_fill_health(struct yz_health_policy *policy,
+				struct yz_health_cleanup *cleanup);
+void yz_load_policy_note_exit_work(void);
+bool yz_load_policy_on_exit(struct task_struct *task);
+void yz_load_policy_drain_exits(void);
+void yz_exit_history_set_active(bool active);
+void yz_exit_history_wake_readers(void);
+void yz_exit_history_flush(void);
+void yz_exit_history_append(const struct yz_runtime_record *record,
+			    u64 start_boottime, u64 observed_boottime,
+			    u32 status);
+void yz_events_emit_target_exit(const struct yz_target_exit_event *event);
 
 #endif

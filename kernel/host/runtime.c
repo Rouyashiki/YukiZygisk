@@ -2,11 +2,11 @@
 /*
  * YukiZygisk - Host runtime symbol resolver.
  *
- * Derived from KernelSU infra/symbol_resolver.c.
+ * Derived from KernelSU infra/symbol_resolver.c and Linux kernel/task_work.c.
  *
  * License: GPL-2.0-only
  *
- * Author: KernelSU contributors and Anatdx
+ * Author: KernelSU contributors, Linux kernel contributors and Anatdx
  */
 
 #include <linux/err.h>
@@ -19,6 +19,7 @@
 #include <linux/path.h>
 #include <linux/printk.h>
 #include <linux/rcupdate.h>
+#include <linux/spinlock.h>
 #include <linux/task_work.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -54,6 +55,10 @@ static typeof(&kallsyms_lookup_size_offset)
 #define YZ_USE_KCFI 1
 #else
 #define YZ_USE_KCFI 0
+#endif
+
+#if YZ_USE_KCFI
+static typeof(&task_work_cancel_match) yz_task_work_cancel_match_fn;
 #endif
 
 #if !YZ_USE_KCFI
@@ -438,6 +443,13 @@ static int yz_resolve_runtime_symbols(void)
 	yz_kern_path_fn = (void *)yz_lookup_callable_quiet("kern_path");
 	yz_path_put_fn = (void *)yz_lookup_callable_quiet("path_put");
 	yz_close_fd_fn = (void *)yz_lookup_callable_quiet("close_fd");
+#if YZ_USE_KCFI
+	yz_task_work_cancel_match_fn =
+	    (typeof(yz_task_work_cancel_match_fn))yz_lookup_callable(
+		"task_work_cancel_match");
+	if (!yz_task_work_cancel_match_fn)
+		return -ENOENT;
+#endif
 	yz_task_work_add_fn =
 		(void *)yz_lookup_callable_quiet("task_work_add");
 #if YZ_USE_KCFI
@@ -467,6 +479,40 @@ static int yz_resolve_runtime_symbols(void)
 		pr_warn("yukizygisk: filp_close not found, falling back to fput\n");
 
 	return 0;
+}
+
+struct callback_head *
+yz_task_work_cancel_match(struct task_struct *task,
+			  bool (*match)(struct callback_head *, void *),
+			  void *data)
+{
+#if YZ_USE_KCFI
+	if (!yz_task_work_cancel_match_fn)
+		return NULL;
+	return yz_task_work_cancel_match_fn(task, match, data);
+#else
+	/* Linux 5.x does not expose an old-CFI jump-table entry for this
+	 * private symbol. Use its task_work.c cancellation algorithm locally;
+	 * never pass the raw entry to an unchecked indirect call. The target's
+	 * task_work_run() waits on pi_lock before executing a detached list. */
+	struct callback_head **pprev = &task->task_works;
+	struct callback_head *work;
+	unsigned long flags;
+
+	if (!READ_ONCE(task->task_works))
+		return NULL;
+	/* Failed cmpxchg leaves pprev in place: add may have prepended a new
+	 * node, or run may have exchanged the head for NULL/work_exited. */
+	raw_spin_lock_irqsave(&task->pi_lock, flags);
+	while ((work = READ_ONCE(*pprev))) {
+		if (!match(work, data))
+			pprev = &work->next;
+		else if (cmpxchg(pprev, work, work->next) == work)
+			break;
+	}
+	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+	return work;
+#endif
 }
 
 int yz_host_runtime_init(void)
@@ -506,6 +552,9 @@ void yz_host_runtime_exit(void)
 	yz_path_put_fn = NULL;
 	yz_close_fd_fn = NULL;
 	yz_task_work_add_fn = NULL;
+#if YZ_USE_KCFI
+	yz_task_work_cancel_match_fn = NULL;
+#endif
 	yz_get_task_exe_file_fn = NULL;
 	yz_kallsyms_lookup_name = NULL;
 	yz_kallsyms_on_each_symbol = NULL;

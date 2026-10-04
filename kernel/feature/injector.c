@@ -300,7 +300,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		    runtime_kind, runtime_abi, 0, 0, process, socket_name);
 	}
 
-	if (!mm)
+	if (!mm || !runtime_generation)
 		goto out;
 	dlopen_off = yz_config_dlopen_offset(compat);
 	dlsym_off = yz_config_dlsym_offset(compat);
@@ -385,7 +385,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		u8 compat_code[ARRAY_SIZE(compat_tmpl)];
 		struct yz_dlextinfo extinfo;
 		struct yz_compat_dlextinfo compat_extinfo;
-		struct yz_file_load_policy native_policy = {};
+		struct yz_file_load_policy *native_policy;
 		struct yz_early_packet_state early_packet;
 		unsigned long stub, dlopen_addr, dlsym_addr;
 		unsigned long redirected_entry;
@@ -421,15 +421,18 @@ static void yz_inject_tw_func(struct callback_head *cb)
 						  : YZ_NATIVE_CORE_PATH);
 		else
 			core_path = compat ? YZ_CORE32_PATH : YZ_CORE_PATH;
+		native_policy = yz_load_policy_begin();
+		if (IS_ERR(native_policy))
+			goto out;
 		yz_payload_cache_name(loader_name, sizeof(loader_name));
 		yz_payload_cache_name(core_name, sizeof(core_name));
 		if (yuki)
 			loader_fd = yz_payload_stage_image(
-			    loader_path, loader_name, &native_policy,
+			    loader_path, loader_name, native_policy,
 			    VIOLA_ROLE_LOADER, compat);
 		else
 			loader_fd = yz_payload_stage_image(
-			    core_path, core_name, &native_policy,
+			    core_path, core_name, native_policy,
 			    native ? VIOLA_ROLE_NATIVE : VIOLA_ROLE_CORE,
 			    compat);
 		if (loader_fd < 0) {
@@ -438,6 +441,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 				"loader "
 				"failed: %d, skipping\n",
 				current->pid, socket_name, loader_fd);
+			yz_load_policy_restore_state(native_policy);
 			goto out;
 		}
 		if (yuki) {
@@ -454,7 +458,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 				"core failed: %d, skipping\n",
 				current->pid, socket_name, core_fd);
 			yz_payload_close_fd(loader_fd);
-			yz_load_policy_restore_state(&native_policy);
+			yz_load_policy_restore_state(native_policy);
 			goto out;
 		}
 
@@ -474,7 +478,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 				yz_payload_close_fd(loader_fd);
 				if (yuki)
 					yz_payload_close_fd(core_fd);
-				yz_load_policy_restore_state(&native_policy);
+				yz_load_policy_restore_state(native_policy);
 				goto out;
 			}
 			early_packet_arg = early_packet.packet_fd + 1;
@@ -482,7 +486,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		{
 			int ret =
 			    yz_host_file_load_policy_allow_execmem_current(
-				&native_policy);
+				native_policy);
 
 			if (ret < 0) {
 				pr_info("yukizygisk: injector: [2c-3b] pid=%d "
@@ -492,7 +496,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 				if (yuki)
 					yz_payload_close_fd(core_fd);
 				yz_early_native_packet_close(&early_packet);
-				yz_load_policy_restore_state(&native_policy);
+				yz_load_policy_restore_state(native_policy);
 				goto out;
 			}
 		}
@@ -509,7 +513,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 			if (yuki)
 				yz_payload_close_fd(core_fd);
 			yz_early_native_packet_close(&early_packet);
-			yz_load_policy_restore_state(&native_policy);
+			yz_load_policy_restore_state(native_policy);
 			goto out;
 		}
 
@@ -595,7 +599,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 			if (yuki)
 				yz_payload_close_fd(core_fd);
 			yz_early_native_packet_close(&early_packet);
-			yz_load_policy_restore_state(&native_policy);
+			yz_load_policy_restore_state(native_policy);
 			goto out;
 		}
 		{
@@ -608,7 +612,7 @@ static void yz_inject_tw_func(struct callback_head *cb)
 				if (yuki)
 					yz_payload_close_fd(core_fd);
 				yz_early_native_packet_close(&early_packet);
-				yz_load_policy_restore_state(&native_policy);
+				yz_load_policy_restore_state(native_policy);
 				goto out;
 			}
 		}
@@ -635,10 +639,9 @@ static void yz_inject_tw_func(struct callback_head *cb)
 			if (yuki)
 				yz_payload_close_fd(core_fd);
 			yz_early_native_packet_close(&early_packet);
-			yz_load_policy_restore_state(&native_policy);
+			yz_load_policy_restore_state(native_policy);
 		} else {
-			yz_load_policy_publish_native(current->tgid,
-						      &native_policy);
+			yz_load_policy_publish_native(native_policy);
 			yz_runtime_set_state((u32)current->tgid,
 					     runtime_generation,
 					     YZ_RUNTIME_STATE_REDIRECTED);
@@ -662,7 +665,7 @@ bool yz_tango_active(void)
 
 int yz_tango_prepare(u32 *generation)
 {
-	struct yz_file_load_policy policy = {};
+	struct yz_file_load_policy *policy;
 	char socket_name[YZ_ZYGOTE_NAME_MAX];
 	char process[YZ_RUNTIME_PROCESS_MAX];
 	int fd;
@@ -675,27 +678,35 @@ int yz_tango_prepare(u32 *generation)
 	*generation =
 	    yz_runtime_begin(YZ_RUNTIME_KIND_ZYGOTE, YZ_RUNTIME_ABI_32, 0, 0,
 			     process, socket_name);
+	if (!*generation)
+		return -ENOSPC;
 	if (yz_safemode_should_skip(socket_name)) {
 		yz_runtime_set_state(current->tgid, *generation,
 				     YZ_RUNTIME_STATE_SAFEMODE);
 		return -ECANCELED;
 	}
-	fd = yz_payload_stage_image(YZ_CORE32_PATH, YZ_VMA_NAME, &policy,
+	policy = yz_load_policy_begin();
+	if (IS_ERR(policy)) {
+		yz_runtime_set_state(current->tgid, *generation,
+				     YZ_RUNTIME_STATE_FAILED);
+		return PTR_ERR(policy);
+	}
+	fd = yz_payload_stage_image(YZ_CORE32_PATH, YZ_VMA_NAME, policy,
 				    VIOLA_ROLE_CORE, true);
 	if (fd < 0) {
-		yz_load_policy_restore_state(&policy);
+		yz_load_policy_restore_state(policy);
 		yz_runtime_set_state(current->tgid, *generation,
 				     YZ_RUNTIME_STATE_FAILED);
 		return fd;
 	}
-	if (yz_host_file_load_policy_allow_execmem_current(&policy)) {
+	if (yz_host_file_load_policy_allow_execmem_current(policy)) {
 		yz_payload_close_fd(fd);
-		yz_load_policy_restore_state(&policy);
+		yz_load_policy_restore_state(policy);
 		yz_runtime_set_state(current->tgid, *generation,
 				     YZ_RUNTIME_STATE_FAILED);
 		return -EACCES;
 	}
-	yz_load_policy_publish_native(current->tgid, &policy);
+	yz_load_policy_publish_native(policy);
 	return fd;
 }
 
