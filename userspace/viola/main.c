@@ -8,11 +8,13 @@
  */
 #define _GNU_SOURCE
 #include "kernel/uapi/viola.h"
+#include "kernel/uapi/viola_health.h"
 #include "kernel/uapi/yukizygisk.h"
+#include "module_loader.h"
+#include "recovery.h"
 #include "vendor/monocypher-ed25519.h"
 #include "viola.h"
 #include "viola_build.h"
-#include "module_loader.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -39,6 +41,8 @@
 #endif
 
 #define VIOLA_BOOT_TIMEOUT_MS 30000
+#define VIOLA_ENSURE_TIMEOUT_MS 15000
+#define VIOLA_ENSURE_START_TIMEOUT_MS 5000
 #define VIOLA_BASE "/data/adb/yukizygisk"
 
 struct package {
@@ -50,6 +54,8 @@ struct package {
   size_t signature_size;
   struct viola_manifest_view catalog;
 };
+
+static int64_t monotonic_ms(void);
 
 static int failure(const char *stage, int error) {
   fprintf(stderr, "viola: %s: %s (%d)\n", stage,
@@ -181,7 +187,8 @@ static int load_package(struct package *package, const char *directory) {
   return result;
 }
 
-static int hash_fd(int fd, const struct viola_entry *entry) {
+static int hash_fd_before(int fd, const struct viola_entry *entry,
+                          int64_t deadline) {
   unsigned char chunk[16384], digest[64];
   crypto_sha512_ctx hash;
   struct stat st;
@@ -193,6 +200,11 @@ static int hash_fd(int fd, const struct viola_entry *entry) {
     return -EBADMSG;
   crypto_sha512_init(&hash);
   while (offset < entry->size) {
+    if (deadline >= 0) {
+      int64_t now = monotonic_ms();
+      if (now < 0 || now >= deadline)
+        return now < 0 ? -EIO : -ETIMEDOUT;
+    }
     size_t amount = entry->size - offset > sizeof(chunk)
                         ? sizeof(chunk)
                         : (size_t)(entry->size - offset);
@@ -208,6 +220,10 @@ static int hash_fd(int fd, const struct viola_entry *entry) {
   if (fstat(fd, &st) || (uint64_t)st.st_size != entry->size)
     return -EBADMSG;
   return crypto_verify64(digest, entry->sha512) ? -EBADMSG : 0;
+}
+
+static int hash_fd(int fd, const struct viola_entry *entry) {
+  return hash_fd_before(fd, entry, -1);
 }
 
 static int open_entry(struct package *package,
@@ -304,7 +320,8 @@ static int verify_core_directories(struct package *package) {
   return 0;
 }
 
-static int verify_package(struct package *package, uint32_t selected_kmi) {
+static int verify_package_before(struct package *package, uint32_t selected_kmi,
+                                 int64_t deadline) {
   int directory_result = verify_core_directories(package);
   if (directory_result)
     return directory_result;
@@ -326,7 +343,7 @@ static int verify_package(struct package *package, uint32_t selected_kmi) {
     int fd = open_entry(package, &entry);
     if (fd < 0)
       return fd;
-    result = hash_fd(fd, &entry);
+    result = hash_fd_before(fd, &entry, deadline);
     close(fd);
     if (result) {
       fprintf(stderr, "viola: payload role=%u abi=%u kmi=%u rejected\n",
@@ -335,6 +352,10 @@ static int verify_package(struct package *package, uint32_t selected_kmi) {
     }
   }
   return 0;
+}
+
+static int verify_package(struct package *package, uint32_t selected_kmi) {
+  return verify_package_before(package, selected_kmi, -1);
 }
 
 /* Admission syscalls must originate in Viola's authenticated executable VMA,
@@ -695,13 +716,11 @@ static int64_t monotonic_ms(void) {
   return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-static int recover_compat(int query, const struct yz_viola_status *initial) {
+static int recover_compat_before(int query,
+                                 const struct yz_viola_status *initial,
+                                 int64_t deadline) {
   struct yz_viola_recover_cmd command = {
       sizeof(command), YZ_VIOLA_VERSION, initial->epoch, initial->generation, 0, 0};
-  const int64_t start = monotonic_ms();
-  if (start < 0)
-    return -EIO;
-  const int64_t deadline = start + VIOLA_BOOT_TIMEOUT_MS;
   int requested = 0;
   for (;;) {
     struct yz_viola_status status;
@@ -728,7 +747,14 @@ static int recover_compat(int query, const struct yz_viola_status *initial) {
   }
 }
 
-static int launch(struct package *package) {
+static int recover_compat(int query, const struct yz_viola_status *initial) {
+  const int64_t start = monotonic_ms();
+  return start < 0 ? -EIO
+                   : recover_compat_before(query, initial,
+                                           start + VIOLA_BOOT_TIMEOUT_MS);
+}
+
+static int launch(struct package *package, int64_t deadline) {
   struct yz_viola_status status;
   int query = control_open(YZ_PRCTL_CONTROL_OPTION, YZ_PRCTL_CONTROL_MAGIC);
   int loaded = module_present("yukizygisk");
@@ -746,9 +772,11 @@ static int launch(struct package *package) {
     }
     if (status.daemon64 == YZ_VIOLA_READY) {
       uint32_t active_kmi = detect_kmi(package);
-      result = active_kmi ? verify_package(package, active_kmi) : -ENOTSUP;
+      result = active_kmi ? verify_package_before(package, active_kmi, deadline)
+                          : -ENOTSUP;
       if (!result)
-        result = recover_compat(query, &status);
+        result = deadline < 0 ? recover_compat(query, &status)
+                              : recover_compat_before(query, &status, deadline);
       close(query);
       return result;
     }
@@ -762,9 +790,14 @@ static int launch(struct package *package) {
   uint32_t kmi = detect_kmi(package);
   if (!kmi)
     return -ENOTSUP;
-  result = verify_package(package, kmi);
+  result = verify_package_before(package, kmi, deadline);
   if (result)
     return result;
+  if (deadline >= 0) {
+    int64_t now = monotonic_ms();
+    if (now < 0 || now >= deadline)
+      return now < 0 ? -EIO : -ETIMEDOUT;
+  }
   int pipefd[2];
   struct sigaction child_action;
   memset(&child_action, 0, sizeof(child_action));
@@ -799,7 +832,8 @@ static int launch(struct package *package) {
   }
   close(pipefd[1]);
   const int64_t start = monotonic_ms();
-  const int64_t deadline = start + VIOLA_BOOT_TIMEOUT_MS;
+  if (deadline < 0)
+    deadline = start + VIOLA_BOOT_TIMEOUT_MS;
   result = -ETIMEDOUT;
   while (start >= 0) {
     int64_t now = monotonic_ms();
@@ -813,7 +847,7 @@ static int launch(struct package *package) {
       break;
     char ready = 0;
     if (read(pipefd[0], &ready, 1) != 1 || ready != '1') {
-      result = -EIO;
+      result = ready == 'R' ? -EUCLEAN : -EIO;
       break;
     }
     query = control_open(YZ_PRCTL_CONTROL_OPTION, YZ_PRCTL_CONTROL_MAGIC);
@@ -829,9 +863,192 @@ static int launch(struct package *package) {
   if (result) {
     /* Only terminate our own child; never a zygote or an injection target. */
     (void)kill(child, SIGKILL);
-    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {
+    while (waitpid(child, NULL, WNOHANG) < 0 && errno == EINTR) {
     }
   }
+  return result;
+}
+
+static int daemon_missing(int query, unsigned abi) {
+  struct yz_viola_daemon_identity_cmd identity;
+  memset(&identity, 0, sizeof(identity));
+  identity.size = sizeof(identity);
+  identity.version = YZ_VIOLA_DAEMON_IDENTITY_VERSION;
+  identity.abi = abi;
+  if (ioctl(query, YZ_IOCTL_VIOLA_DAEMON_IDENTITY, &identity))
+    return -errno;
+  if (identity.size != sizeof(identity) ||
+      identity.version != YZ_VIOLA_DAEMON_IDENTITY_VERSION ||
+      identity.abi != abi || identity.reserved ||
+      identity.state > YZ_VIOLA_LOST)
+    return -EPROTO;
+  if (identity.state == YZ_VIOLA_READY || identity.state == YZ_VIOLA_STARTING)
+    return -EBUSY;
+  /* A revoked authorization does not prove the old process has exited. */
+  if (identity.owner_alive) {
+    fprintf(stderr, "viola: daemon%u owner is still alive; requires reboot\n",
+            abi == 1 ? 32 : 64);
+    return -EUCLEAN;
+  }
+  int lifetime = viola_daemon_lock(abi);
+  if (lifetime < 0)
+    return lifetime;
+  close(lifetime);
+  return 0;
+}
+
+static int health_result(const struct viola_health *health, unsigned abi) {
+  if (health->state != VIOLA_HEALTH_AVAILABLE) {
+    static const char *const states[] = {"available",      "missing",
+                                         "unresponsive",   "unsupported",
+                                         "identity_error", "error"};
+    const unsigned state = (unsigned)health->state;
+    fprintf(stderr, "viola: daemon%u %s\n", abi == 1 ? 32 : 64,
+            state < sizeof(states) / sizeof(states[0]) ? states[state]
+                                                       : "error");
+    return -EAGAIN;
+  }
+  if (health->reboot_required) {
+    fprintf(stderr, "viola: daemon%u requires reboot\n", abi == 1 ? 32 : 64);
+    return -EUCLEAN;
+  }
+  if (!health->ready || health->catalog_error)
+    return health->catalog_error > 0 ? -health->catalog_error : -EAGAIN;
+  printf("daemon%u ready (pid=%u)\n", abi == 1 ? 32 : 64, health->pid);
+  return 0;
+}
+
+static int health_timeout(int64_t deadline) {
+  int64_t now = monotonic_ms();
+  if (now < 0 || now >= deadline)
+    return 0;
+  return deadline - now < 1000 ? (int)(deadline - now) : 1000;
+}
+
+static int ensure_allowed(struct package *package, int query) {
+  static const char *const markers[] = {"disable", "remove"};
+  for (unsigned i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+    struct stat status;
+    if (!fstatat(package->dirfd, markers[i], &status, AT_SYMLINK_NOFOLLOW)) {
+      fprintf(stderr, "viola: module %s marker blocks recovery\n", markers[i]);
+      return -EPERM;
+    }
+    if (errno != ENOENT)
+      return -errno;
+  }
+  struct yz_safemode_status_cmd safemode;
+  memset(&safemode, 0, sizeof(safemode));
+  if (ioctl(query, YZ_IOCTL_GET_SAFEMODE, &safemode))
+    return -errno;
+  if (safemode.active) {
+    fputs("viola: kernel safe mode blocks recovery\n", stderr);
+    return -EPERM;
+  }
+  return 0;
+}
+
+static int ensure_daemons(struct package *package, unsigned abi) {
+  const int64_t start = monotonic_ms();
+  if (start < 0)
+    return -EIO;
+  const int64_t deadline = start + VIOLA_ENSURE_TIMEOUT_MS;
+  uint32_t kmi = detect_kmi(package);
+  int result = kmi ? verify_package_before(package, kmi, deadline) : -ENOTSUP;
+  if (result)
+    return result;
+  if (!health_timeout(deadline))
+    return -ETIMEDOUT;
+  int query = control_open(YZ_PRCTL_CONTROL_OPTION, YZ_PRCTL_CONTROL_MAGIC);
+  if (query < 0)
+    return query;
+  struct yz_viola_status initial, status;
+  struct viola_health health[2];
+  result = read_status(query, &initial);
+  if (!result)
+    result = ensure_allowed(package, query);
+  if (result)
+    goto out;
+  viola_daemon_health(query, health_timeout(deadline), health);
+  if (health[1].state == VIOLA_HEALTH_AVAILABLE) {
+    if (initial.daemon64 != YZ_VIOLA_READY ||
+        initial.owner_pid != health[1].pid) {
+      result = -ESTALE;
+      goto out;
+    }
+    result = health_result(&health[1], 2);
+    if (result || abi == 2)
+      goto out;
+    if (!initial.compat_required) {
+      result = abi == 1 ? -ENODEV : 0;
+      goto out;
+    }
+    if (health[0].state == VIOLA_HEALTH_AVAILABLE) {
+      result = initial.daemon32 == YZ_VIOLA_READY ? health_result(&health[0], 1)
+                                                  : -ESTALE;
+      goto out;
+    }
+    if (health[0].state != VIOLA_HEALTH_MISSING) {
+      result = health_result(&health[0], 1);
+      goto out;
+    }
+    result = daemon_missing(query, 1);
+    if (!result)
+      result = ensure_allowed(package, query);
+    if (!result)
+      result = recover_compat_before(query, &initial, deadline);
+  } else if (health[1].state == VIOLA_HEALTH_MISSING) {
+    /* A surviving compat process belongs to the old main generation. It
+     * cannot be adopted by a replacement launcher or silently terminated. */
+    if (health[0].state != VIOLA_HEALTH_MISSING) {
+      fprintf(stderr, "viola: daemon64 missing with surviving or uncertain "
+                      "daemon32; requires reboot\n");
+      result = -EUCLEAN;
+      goto out;
+    }
+    result = daemon_missing(query, 2);
+    if (!result)
+      result = daemon_missing(query, 1);
+    if (!result)
+      result = ensure_allowed(package, query);
+    if (!result) {
+      int64_t now = monotonic_ms();
+      if (now < 0 || now >= deadline)
+        result = -ETIMEDOUT;
+      else {
+        int64_t ready_deadline = now + VIOLA_ENSURE_START_TIMEOUT_MS;
+        if (ready_deadline > deadline)
+          ready_deadline = deadline;
+        puts("viola: starting authenticated daemon64 and required compat "
+             "daemon");
+        result = launch(package, ready_deadline);
+      }
+    }
+  } else {
+    result = health_result(&health[1], 2);
+  }
+  if (result)
+    goto out;
+  result = read_status(query, &status);
+  if (!result && status.epoch != initial.epoch)
+    result = -ESTALE;
+  if (result)
+    goto out;
+  if (!health_timeout(deadline)) {
+    result = -ETIMEDOUT;
+    goto out;
+  }
+  viola_daemon_health(query, health_timeout(deadline), health);
+  result = status.daemon64 == YZ_VIOLA_READY ? health_result(&health[1], 2)
+                                             : -EAGAIN;
+  if (!result && abi != 2) {
+    if (!status.compat_required)
+      result = abi == 1 ? -ENODEV : 0;
+    else
+      result = status.daemon32 == YZ_VIOLA_READY ? health_result(&health[0], 1)
+                                                 : -EAGAIN;
+  }
+out:
+  close(query);
   return result;
 }
 
@@ -853,9 +1070,10 @@ int main(int argc, char **argv) {
     }
   }
   const char *directory = NULL;
-  int control = -1, ready = -1;
+  int control = -1, ready = -1, abi = -1;
   if (argc < 4) {
-    fputs("usage: viola verify|launch --module-dir ABSOLUTE_DIRECTORY\n",
+    fputs("usage: viola verify|launch|ensure --module-dir ABSOLUTE_DIRECTORY "
+          "[--abi all|64|32]\n",
           stderr);
     return 2;
   }
@@ -872,13 +1090,23 @@ int main(int argc, char **argv) {
       ready = parse_fd(argv[i + 1]);
       if (ready < 0)
         return 2;
+    } else if (!strcmp(argv[i], "--abi") && abi < 0) {
+      abi = !strcmp(argv[i + 1], "all")  ? 0
+            : !strcmp(argv[i + 1], "32") ? 1
+            : !strcmp(argv[i + 1], "64") ? 2
+                                         : -1;
+      if (abi < 0)
+        return 2;
     } else
       return 2;
   }
   int verify = !strcmp(argv[1], "verify");
   int compat = !strcmp(argv[1], "launch-compat");
   int worker = !strcmp(argv[1], "launch-worker");
-  if (!directory || (!verify && !compat && !worker && strcmp(argv[1], "launch")) ||
+  int ensure = !strcmp(argv[1], "ensure");
+  if (!directory ||
+      (!verify && !compat && !worker && !ensure && strcmp(argv[1], "launch")) ||
+      (!ensure && abi >= 0) ||
       (compat && (control < 0 || ready < 0 || control == ready)) ||
       (worker && (control >= 0 || ready < 0)) ||
       (!compat && !worker && (control >= 0 || ready >= 0)))
@@ -909,8 +1137,20 @@ int main(int argc, char **argv) {
     result = kmi ? verify_package(package, kmi) : -ENOTSUP;
     if (!result)
       result = launch_worker(package, ready, 1, kmi);
-  } else if (!result)
-    result = launch(package);
+  } else if (!result) {
+    int base = open_directory(VIOLA_BASE, 1);
+    result = base < 0 ? base : 0;
+    if (base >= 0)
+      close(base);
+    int operation = result ? result : viola_recovery_lock();
+    if (operation < 0)
+      result = operation;
+    else {
+      result = ensure ? ensure_daemons(package, abi < 0 ? 0U : (unsigned)abi)
+                      : launch(package, -1);
+      close(operation);
+    }
+  }
   if (package->dirfd >= 0)
     close(package->dirfd);
   free(package);
@@ -918,5 +1158,5 @@ int main(int argc, char **argv) {
     failure(argv[1], result);
   else
     printf("viola: %s succeeded\n", argv[1]);
-  return result ? 1 : 0;
+  return result ? (ensure ? (result == -EUCLEAN ? 3 : 2) : 1) : 0;
 }
