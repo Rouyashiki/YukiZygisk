@@ -27,6 +27,7 @@ public:
   bool query_viola(yz_viola_status *status, bool *supported,
                    std::string *error) const;
   bool available() const;
+  int native_handle() const { return fd_; }
 
 private:
   int fd_ = -1;

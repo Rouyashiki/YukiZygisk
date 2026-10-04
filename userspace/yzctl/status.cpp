@@ -8,8 +8,10 @@
  */
 
 #include "status.hpp"
+#include "health.hpp"
 #include "userspace/zygisk/crash_evidence.hpp"
 #include "userspace/zygisk/crash_protection.hpp"
+#include "userspace/zygisk/native_exit_evidence.hpp"
 #include "userspace/zygisk/settings.hpp"
 
 #include "host.hpp"
@@ -28,6 +30,7 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -56,13 +59,15 @@ struct NativeDefinition {
 
 struct NativeInjection {
   uint32_t pid = 0;
+  uint32_t generation = 0;
   std::string process;
   std::string module_id;
   uint8_t target_type = 0;
   std::string target;
   uint8_t abi = YZ_RUNTIME_ABI_UNKNOWN;
-  std::string state;
   bool has_companion = false;
+  std::string state;
+  std::string process_state;
 };
 
 struct NativeModuleView {
@@ -83,6 +88,50 @@ const char *abi_name(uint8_t abi) {
     return "armeabi-v7a";
   case YZ_RUNTIME_ABI_64:
     return "arm64-v8a";
+  default:
+    return "unknown";
+  }
+}
+
+const char *monitor_state_name(uint8_t state) {
+  switch (state) {
+  case YZ_RUNTIME_STATE_INJECTED:
+    return "injected";
+  case YZ_RUNTIME_STATE_SAFEMODE:
+    return "crashed";
+  case YZ_RUNTIME_STATE_DETECTED:
+  case YZ_RUNTIME_STATE_REDIRECTED:
+    return "unknown";
+  case YZ_RUNTIME_STATE_FAILED:
+    return "failed";
+  default:
+    return "unknown";
+  }
+}
+
+const char *injection_state_name(const RuntimeSnapshot &snapshot,
+                                 const yz_runtime_record &record) {
+  uint8_t state = record.state;
+  if (state == YZ_RUNTIME_STATE_EXITED) {
+    if (!(snapshot.capabilities & YZ_RUNTIME_CAP_INJECTION_STATE))
+      return "unknown";
+    state = static_cast<uint8_t>(
+        (record.flags & YZ_RUNTIME_F_INJECTION_STATE_MASK) >>
+        YZ_RUNTIME_F_INJECTION_STATE_SHIFT);
+  }
+  return monitor_state_name(state);
+}
+
+const char *process_state_name(uint8_t state) {
+  switch (state) {
+  case YZ_RUNTIME_STATE_EXITED:
+    return "exited";
+  case YZ_RUNTIME_STATE_DETECTED:
+  case YZ_RUNTIME_STATE_REDIRECTED:
+  case YZ_RUNTIME_STATE_INJECTED:
+  case YZ_RUNTIME_STATE_FAILED:
+  case YZ_RUNTIME_STATE_SAFEMODE:
+    return "running";
   default:
     return "unknown";
   }
@@ -316,15 +365,17 @@ scan_native_modules(const std::string &modules_dir) {
   return modules;
 }
 
-const yz_runtime_record *find_ready_record(const RuntimeSnapshot &snapshot,
-                                           const yz_runtime_record &base,
-                                           const std::string &module_id) {
-  for (const auto &record : snapshot.records) {
+const yz_runtime_record *find_native_report(const RuntimeSnapshot &snapshot,
+                                            const yz_runtime_record &base,
+                                            const std::string &module_id) {
+  for (const yz_runtime_record &record : snapshot.records) {
     if (record.kind == YZ_RUNTIME_KIND_NATIVE && record.pid == base.pid &&
         record.generation == base.generation && record.abi == base.abi &&
-        bounded_string(record.module_id) == module_id &&
-        record.state != YZ_RUNTIME_STATE_EXITED)
+        record.target_type == base.target_type &&
+        bounded_string(record.target) == bounded_string(base.target) &&
+        bounded_string(record.module_id) == module_id) {
       return &record;
+    }
   }
   return nullptr;
 }
@@ -333,36 +384,65 @@ std::vector<NativeInjection>
 build_native_injections(const RuntimeSnapshot &snapshot,
                         const std::vector<NativeDefinition> &modules) {
   std::vector<NativeInjection> injections;
-  for (const auto &base : snapshot.records) {
-    if (base.kind != YZ_RUNTIME_KIND_NATIVE ||
-        base.state == YZ_RUNTIME_STATE_EXITED || base.module_id[0] != '\0')
+  using Scope = std::tuple<uint8_t, std::string, uint8_t>;
+  struct Instances {
+    std::vector<const yz_runtime_record *> active;
+    const yz_runtime_record *latest_exited = nullptr;
+  };
+  std::map<Scope, Instances> scopes;
+
+  for (const yz_runtime_record &base : snapshot.records) {
+    if (base.kind != YZ_RUNTIME_KIND_NATIVE || base.module_id[0] != '\0')
       continue;
-    const std::string target = bounded_string(base.target);
-    for (const auto &definition : modules) {
+    Instances &instances =
+        scopes[{base.target_type, bounded_string(base.target), base.abi}];
+    if (base.state != YZ_RUNTIME_STATE_EXITED) {
+      instances.active.push_back(&base);
+    } else if (instances.latest_exited == nullptr ||
+               base.generation > instances.latest_exited->generation) {
+      instances.latest_exited = &base;
+    }
+  }
+
+  for (auto &[scope, instances] : scopes) {
+    if (instances.active.empty() && instances.latest_exited != nullptr)
+      instances.active.push_back(instances.latest_exited);
+    const auto &[target_type, target, abi] = scope;
+    for (const NativeDefinition &definition : modules) {
       const NativeModule &module = definition.module;
-      if (definition.abi != base.abi ||
-          module.target_type != base.target_type || module.target != target)
+      if (definition.abi != abi || module.target_type != target_type ||
+          module.target != target) {
         continue;
-      const yz_runtime_record *ready =
-          find_ready_record(snapshot, base, module.module_id);
-      // A captured process without a module report is not proof of failure.
-      // Another module may have reported success for the same base record.
-      const char *state = "unknown";
-      if (ready != nullptr)
-        state = runtime_state_name(ready->state);
-      else if (base.state == YZ_RUNTIME_STATE_SAFEMODE)
-        state = "crashed";
-      else if (base.state == YZ_RUNTIME_STATE_FAILED)
-        state = "failed";
-      if (state == nullptr)
-        continue;
-      injections.push_back(NativeInjection{
-          base.pid, bounded_string(base.process), module.module_id,
-          base.target_type, target, base.abi, state, module.has_companion});
+      }
+      for (const yz_runtime_record *base : instances.active) {
+        const yz_runtime_record *report =
+            find_native_report(snapshot, *base, module.module_id);
+        const char *state = "unknown";
+        if (report != nullptr) {
+          state = injection_state_name(snapshot, *report);
+        } else {
+          const char *base_state = injection_state_name(snapshot, *base);
+          if (strcmp(base_state, "failed") == 0 ||
+              strcmp(base_state, "crashed") == 0)
+            state = base_state;
+        }
+        injections.push_back(NativeInjection{
+            base->pid,
+            base->generation,
+            bounded_string(base->process),
+            module.module_id,
+            target_type,
+            target,
+            abi,
+            module.has_companion,
+            state,
+            process_state_name(base->state),
+        });
+      }
     }
   }
   std::sort(injections.begin(), injections.end(),
-            [](const auto &left, const auto &right) {
+            [](const NativeInjection &left, const NativeInjection &right) {
               return std::tie(left.pid, left.module_id, left.target_type,
                               left.target, left.abi) <
                      std::tie(right.pid, right.module_id, right.target_type,
@@ -715,6 +795,10 @@ bool query_status(Host &host, const StatusOptions &options,
     output += ",\"state\":";
     const char *state = runtime_state_name(record.state);
     append_json_string(&output, state ? state : "exited");
+    output += ",\"injection_state\":";
+    append_json_string(&output, injection_state_name(runtime, record));
+    output += ",\"process_state\":";
+    append_json_string(&output, process_state_name(record.state));
     output += '}';
   }
   output += "],\"recent\":[],\"zygotes\":[";
@@ -763,11 +847,38 @@ bool query_status(Host &host, const StatusOptions &options,
     output += injection.has_companion ? "true" : "false";
     output += ",\"state\":";
     append_json_string(&output, injection.state);
+    output += ",\"process_state\":";
+    append_json_string(&output, injection.process_state);
+    output += ",\"generation\":" + std::to_string(injection.generation);
     output += '}';
   }
   output += "],\"crash_evidence\":" +
             json::dump(yukizygisk::crash::read_evidence(
                 "/data/adb/yukizygisk/diagnostics/current"));
+  json::Value native_exits = json::Value::array();
+  json::Value journals = json::Value::array();
+  for (const uint8_t abi : {uint8_t{1}, uint8_t{2}}) {
+    const auto evidence = yukizygisk::crash::read_native_exit_document(
+        "/data/adb/yukizygisk/diagnostics/current", abi);
+    for (const auto &item : evidence.exits.a)
+      native_exits.push_back(item);
+    if (evidence.journal_valid) {
+      auto journal =
+          yukizygisk::crash::native_exit_journal_json(evidence.journal);
+      journal["abi_id"] = json::Value(static_cast<double>(abi));
+      journal["abi"] = abi_name(abi);
+      journals.push_back(journal);
+    }
+  }
+  output += ",\"native_exit_evidence\":" + json::dump(native_exits);
+  output += ",\"native_exit_journal\":" + json::dump(journals);
+  output += ",\"native_exit_journal_source\":\"persisted\"";
+  output += ",\"exit_history_supported\":";
+  output +=
+      (runtime.capabilities & YZ_RUNTIME_CAP_EXIT_HISTORY) ? "true" : "false";
+  output += ",\"kernel_health\":" +
+            json::dump(kernel_health(host, runtime.capabilities));
+  output += ",\"daemon_health\":" + json::dump(daemon_health(host));
   const bool protection =
       yukizygisk::settings::protection_enabled(options.config_path);
   output += ",\"crash_protection\":";

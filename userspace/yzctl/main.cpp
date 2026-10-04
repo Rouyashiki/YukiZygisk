@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unistd.h>
 #include <utility>
 
 namespace {
@@ -27,6 +28,7 @@ void usage(FILE *stream) {
           "Usage:\n"
           "  yzctl status [--json] [--modules-dir DIR] [--config FILE]\n"
           "  yzctl reload\n"
+          "  yzctl ensure-daemon [--abi 32|64|all]\n"
           "  yzctl description {starting|startup-failed|kernel-unavailable} "
           "--module-dir DIR\n"
           "  yzctl config get\n"
@@ -128,6 +130,34 @@ int reload_command(int argc) {
   return 0;
 }
 
+int ensure_daemon_command(int argc, char **argv) {
+  std::string abi = "all";
+  for (int i = 2; i < argc; ++i) {
+    if (!option_value(argc, argv, &i, "--abi", &abi) ||
+        (abi != "all" && abi != "32" && abi != "64")) {
+      fprintf(stderr, "yzctl: expected ensure-daemon [--abi 32|64|all]\n");
+      return 2;
+    }
+  }
+  if (geteuid() != 0) {
+    fprintf(stderr, "yzctl: ensure-daemon requires root\n");
+    return 1;
+  }
+  char path[] = "/data/adb/modules/yukizygisk/bin/viola";
+  char operation[] = "ensure";
+  char module_option[] = "--module-dir";
+  char module[] = "/data/adb/modules/yukizygisk";
+  char abi_option[] = "--abi";
+  char environment_path[] = "PATH=/system/bin:/system/xbin";
+  char *arguments[] = {path,       operation,  module_option, module,
+                       abi_option, abi.data(), nullptr};
+  char *environment[] = {environment_path, nullptr};
+  execve(path, arguments, environment);
+  fprintf(stderr, "yzctl: cannot execute Viola recovery: %s\n",
+          strerror(errno));
+  return 2;
+}
+
 int description_command(int argc, char **argv) {
   if (argc < 5) {
     usage(stderr);
@@ -187,6 +217,8 @@ int main(int argc, char **argv) {
   }
   if (strcmp(argv[1], "status") == 0)
     return status_command(argc, argv);
+  if (strcmp(argv[1], "ensure-daemon") == 0)
+    return ensure_daemon_command(argc, argv);
   if (strcmp(argv[1], "reload") == 0)
     return reload_command(argc);
   if (strcmp(argv[1], "description") == 0)

@@ -10,6 +10,7 @@ add_executable(yzctl
   ${PROJECT_SOURCE_DIR}/userspace/common/cxx_slim.cpp
   ${PROJECT_SOURCE_DIR}/userspace/zygisk/daemon/module_description.cpp
   host.cpp
+  health.cpp
   main.cpp
   status.cpp
 )
