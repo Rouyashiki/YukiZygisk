@@ -400,17 +400,37 @@ static int module_present(const char *name) {
   return found;
 }
 
-static uint32_t detect_kmi(void) {
+static uint32_t detect_kmi(struct package *package) {
   struct utsname uts;
   char name[64];
   unsigned major, minor, android;
-  if (uname(&uts) || sscanf(uts.release, "%u.%u", &major, &minor) != 2)
+  if (uname(&uts))
     return 0;
   const char *part = strstr(uts.release, "android");
-  if (!part || sscanf(part, "android%u", &android) != 1)
+  if (sscanf(uts.release, "%u.%u", &major, &minor) == 2 && part &&
+      sscanf(part, "android%u", &android) == 1) {
+    snprintf(name, sizeof(name), "android%u-%u.%u", android, major, minor);
+    int kmi = viola_kmi_id(name);
+    return kmi > 0 ? (uint32_t)kmi : 0;
+  }
+
+  /* An installer choice is valid only for the same unidentifiable release.
+   * Catalog lookup and payload hashing still authenticate the selected KO. */
+  char selection[sizeof(uts.release) + sizeof(name)];
+  size_t size = 0;
+  if (read_small(package->dirfd, "kmi", selection, sizeof(selection) - 1,
+                 &size) ||
+      memchr(selection, '\0', size) || selection[size - 1] != '\n')
     return 0;
-  snprintf(name, sizeof(name), "android%u-%u.%u", android, major, minor);
-  return viola_kmi_id(name);
+  selection[size - 1] = '\0';
+  char *release = strchr(selection, '\n');
+  if (!release)
+    return 0;
+  *release++ = '\0';
+  if (strcmp(release, uts.release))
+    return 0;
+  int kmi = viola_kmi_id(selection);
+  return kmi > 0 ? (uint32_t)kmi : 0;
 }
 
 static int load_kernel(struct package *package, uint32_t kmi) {
@@ -718,7 +738,7 @@ static int launch(struct package *package) {
       return result;
     }
     if (status.daemon64 == YZ_VIOLA_READY) {
-      uint32_t active_kmi = detect_kmi();
+      uint32_t active_kmi = detect_kmi(package);
       result = active_kmi ? verify_package(package, active_kmi) : -ENOTSUP;
       if (!result)
         result = recover_compat(query, &status);
@@ -732,7 +752,7 @@ static int launch(struct package *package) {
   } else if (loaded) {
     return -EPROTONOSUPPORT;
   }
-  uint32_t kmi = detect_kmi();
+  uint32_t kmi = detect_kmi(package);
   if (!kmi)
     return -ENOTSUP;
   result = verify_package(package, kmi);
@@ -878,7 +898,7 @@ int main(int argc, char **argv) {
     if (!result)
       result = execute_daemon(package, control, ready, VIOLA_ABI_ARM32);
   } else if (!result && worker) {
-    uint32_t kmi = detect_kmi();
+    uint32_t kmi = detect_kmi(package);
     result = kmi ? verify_package(package, kmi) : -ENOTSUP;
     if (!result)
       result = launch_worker(package, ready, 1, kmi);

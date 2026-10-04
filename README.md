@@ -19,6 +19,8 @@ YukiZygisk is a standalone, kernel-based Zygisk implementation for rooted Androi
 3. Open your root manager, go to **Modules**, and install the ZIP from local storage.
 4. Reboot, then open YukiZygisk's **WebUI** from the module page to check its status.
 
+If the installer cannot identify your kernel's KMI, use **Volume Up** to cycle through the packaged KMIs and **Volume Down** to confirm. After installation, only the selected KMI's kernel module is kept to save space. Reinstall after switching kernels if the KMI changes or needs manual selection again.
+
 ## Usage
 
 - Install the Zygisk or ZN native modules you want through your root manager, then reboot.

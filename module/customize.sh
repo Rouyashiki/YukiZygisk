@@ -54,9 +54,13 @@ arm64-v8a) ;;
 *) abort "! Unsupported ABI for this package: $ABI" ;;
 esac
 
-KERNEL_RELEASE="$(uname -r 2>/dev/null)"
-KMI="$(yz_detect_kmi "$KERNEL_RELEASE")" ||
-	abort "! Cannot detect GKI KMI from kernel release: $KERNEL_RELEASE"
+KERNEL_RELEASE="$(uname -r 2>/dev/null)" || abort "! Cannot read kernel release"
+[ -n "$KERNEL_RELEASE" ] || abort "! Cannot read kernel release"
+if ! KMI="$(yz_detect_kmi "$KERNEL_RELEASE")"; then
+	ui_print "- Cannot detect GKI KMI from kernel release: $KERNEL_RELEASE"
+	yz_select_kmi "$MODPATH" ||
+		abort "! Cannot select KMI: no packaged LKM or volume-key input unavailable/timed out"
+fi
 KERNEL_MODULE="$(yz_kmi_ko "$MODPATH" "$KMI")"
 if [ ! -f "$KERNEL_MODULE" ]; then
 	SUPPORTED_KMIS="$(yz_list_supported_kmis "$MODPATH" | tr '\n' ' ')"
@@ -102,5 +106,17 @@ fi
 sh "$MODPATH/cleanup.sh" --install-hook ||
 	abort "! Cannot install module cleanup hook"
 
+# Bind the choice to this kernel release for boots without a detectable KMI.
+YZ_KMI_TMP="$(mktemp "$MODPATH/.kmi.XXXXXX")" ||
+	abort "! Cannot save selected KMI"
+if ! printf '%s\n%s\n' "$KMI" "$KERNEL_RELEASE" >"$YZ_KMI_TMP" ||
+	! chmod 0644 "$YZ_KMI_TMP" ||
+	! mv -f "$YZ_KMI_TMP" "$MODPATH/kmi"; then
+	rm -f "$YZ_KMI_TMP"
+	abort "! Cannot save selected KMI"
+fi
+yz_prune_kmis "$MODPATH" "$KMI" || abort "! Cannot remove unused kernel modules"
+
 ui_print "- Selected kernel module: $KMI"
+ui_print "- Removed other KMI kernel modules"
 ui_print "- YukiZygisk installed"
