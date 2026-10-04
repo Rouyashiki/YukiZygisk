@@ -122,6 +122,11 @@ function stateBadge(value) {
   const tones = { loaded: "success", injected: "success", failed: "danger", crashed: "danger", suspended: "warning" };
   return `<span class="badge ${tones[value] || "muted"}">${escapeHtml(t(`state.${value}`, value || t("common.unknown")))}</span>`;
 }
+function processLifetime(items) {
+  if (items.some((item) => item.process_state === "running")) return "running";
+  if (items.length && items.every((item) => item.process_state === "exited")) return "exited";
+  return "unknown";
+}
 function combinedNativeState(items, fallback = "unknown") {
   for (const candidate of ["crashed", "failed", "suspended", "injected", "unsupported32"])
     if (items.some((item) => item.state === candidate)) return candidate;
@@ -217,7 +222,7 @@ function renderModules() {
   } else if (state.nativeView === "module") {
     rows = nativeGroups().map((group, index) => moduleRow({ title: group.id, subtitle: t("status.nativeProcessCount", "", { count: new Set(group.records.map((record) => `${record.pid}\u0000${record.process}`)).size }), symbol: "layers", value: combinedNativeState([...group.scopes, ...group.records]), type: "native", index, note: evidenceNote(group.id) }));
   } else {
-    rows = nativeProcesses().map((group, index) => moduleRow({ title: processName(group.process), subtitle: [...new Set(group.records.map(({ module }) => module))].join(" \u00b7 "), symbol: "terminal", value: combinedNativeState(group.records), type: "process", index, trailing: `<code>PID ${escapeHtml(group.pid)}</code>` }));
+    rows = nativeProcesses().map((group, index) => moduleRow({ title: processName(group.process), subtitle: [...new Set(group.records.map(({ module }) => module))].join(" \u00b7 "), symbol: "terminal", value: combinedNativeState(group.records), type: "process", index, trailing: `${stateBadge(processLifetime(group.records))}<code>PID ${escapeHtml(group.pid)}</code>` }));
   }
   return `<div class="segmented module-tabs" aria-label="${escapeHtml(t("nav.modules"))}">
     ${segmentButton("data-module-kind", "zygisk", "Zygisk", !native)}${segmentButton("data-module-kind", "native", "Native", native)}
@@ -496,7 +501,7 @@ function crashEvidence(moduleId) {
   return `<h3>${escapeHtml(t("status.crashEvidence"))}</h3><p>${escapeHtml(t("status.crashEvidenceDesc"))}</p>${evidence.map((item) => `<div class="evidence-record"><dl class="info-list">${infoItem(t("status.process"), item.process)}${infoItem("PID", item.pid)}${infoItem(t("common.abi"), item.abi)}${infoItem(t("status.lastUpdate"), item.timestamp)}${infoItem("Tombstone", item.tombstone, true)}</dl><pre>${escapeHtml(item.frame)}</pre></div>`).join("")}`;
 }
 function nativeRecordDetails(record) {
-  return `<dl class="info-list">${infoItem(t("nav.modules"), record.module || "\u2014")}${infoItem(t("status.process"), record.process || record.target)}${infoItem("PID", record.pid ?? "\u2014")}${infoItem(t("common.abi"), record.abi || "\u2014")}${infoItem(t("status.target"), `${record.target_type}=${record.target}`, true)}${infoItem(t("status.companion"), t(record.companion ? "status.enabled" : "status.disabled"))}</dl>${stateBadge(record.state)}`;
+  return `<dl class="info-list">${infoItem(t("nav.modules"), record.module || "\u2014")}${infoItem(t("status.process"), record.process || record.target)}${infoItem("PID", record.pid ?? "\u2014")}${infoItem(t("common.abi"), record.abi || "\u2014")}${infoItem(t("status.target"), `${record.target_type}=${record.target}`, true)}${infoItem(t("status.companion"), t(record.companion ? "status.enabled" : "status.disabled"))}</dl>${stateBadge(record.state)} ${stateBadge(record.process_state || "unknown")}`;
 }
 function openDetail(type, index, { updateHistory = true } = {}) {
   const dialog = document.getElementById("detail-dialog");
