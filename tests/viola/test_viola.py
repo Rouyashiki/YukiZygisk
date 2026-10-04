@@ -177,7 +177,11 @@ class ViolaTests(unittest.TestCase):
             subprocess.run([cxx, *flags, *definitions, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
                 "-fno-exceptions", "-fno-rtti", "-c", str(source), "-o", str(obj)], check=True)
             loader_objects.append(str(obj))
-        loader_links = [*loader_objects, "-lstdc++"]
+        recovery_object = cls.base / "viola-recovery.o"
+        subprocess.run([cxx, *flags, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I" + str(ROOT), "-I" + str(ROOT / "userspace/common"),
+            "-c", str(loader_dir / "recovery.cpp"), "-o", str(recovery_object)], check=True)
+        loader_links = [*loader_objects, str(recovery_object), "-lstdc++"]
         cls.loader_fixture = cls.base / "viola-module-loader"
         subprocess.run([cxx, *flags, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
             "-I" + str(ROOT), str(ROOT / "tests/viola/module_loader.cpp"),
