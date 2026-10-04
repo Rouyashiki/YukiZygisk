@@ -253,7 +253,7 @@ function linkRow(href, title, subtitle, symbol = "external-link") {
 function renderAbout() {
   return `<div class="about-identity"><img src="./icon.svg" alt=""><div><h2>YukiZygisk</h2><p>${escapeHtml(state.meta.version)} \u00b7 ${escapeHtml(state.status.abi)}</p></div></div>
     <p class="about-description">${escapeHtml(t("about.description"))}</p>
-    <section class="section">${sectionHeader(t("about.project"))}<div class="row-list">${linkRow("https://github.com/Anatdx/YukiZygisk", "Anatdx / YukiZygisk", t("about.author") + ": " + state.meta.author)}</div></section>
+    <section class="section">${sectionHeader(t("about.project"))}<div class="row-list">${linkRow("https://github.com/Rouyashiki/YukiZygisk", "Rouyashiki / YukiZygisk", t("about.author") + ": " + state.meta.author)}</div></section>
     <section class="section">${sectionHeader(t("about.credits"))}<div class="row-list">
       ${linkRow("https://github.com/tiann/KernelSU", "KernelSU", "GPL-3.0")}
       ${linkRow("https://github.com/KOWX712/ksu-webui-demo", "KOWX712 / ksu-webui-demo", "MIT")}
