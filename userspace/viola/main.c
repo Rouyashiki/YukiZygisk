@@ -569,7 +569,7 @@ static int close_other_fds(int control, int ready, int image) {
 static int execute_daemon(struct package *package, int control, int ready,
                           unsigned abi) {
   struct viola_entry entry;
-  char executable[PATH_MAX], control_env[64], ready_env[64];
+  char executable[PATH_MAX], control_env[64], ready_env[64], image_env[64];
   char module_env[PATH_MAX + 32];
   int result =
       viola_manifest_find(&package->catalog, VIOLA_ROLE_DAEMON, abi, 0, &entry);
@@ -600,6 +600,7 @@ static int execute_daemon(struct package *package, int control, int ready,
   snprintf(control_env, sizeof(control_env), "YUKIZYGISK_CONTROL_FD=%d",
            control);
   snprintf(ready_env, sizeof(ready_env), "YUKIZYGISK_READY_FD=%d", ready);
+  snprintf(image_env, sizeof(image_env), "YUKIZYGISK_IMAGE_FD=%d", fd);
   char *environment[] = {"PATH=/system/bin:/system/xbin",
                          control_env,
                          ready_env,
@@ -607,6 +608,7 @@ static int execute_daemon(struct package *package, int control, int ready,
                          "YUKIZYGISK_CONFIG=" VIOLA_BASE "/yzconfig.json",
                          "YUKIZYGISK_LOG_DIR=" VIOLA_BASE "/log",
                          "YUKIZYGISK_MODULES_DIR=/data/adb/modules",
+                         abi == VIOLA_ABI_ARM32 ? image_env : NULL,
                          NULL};
   char *arguments[] = {executable, NULL};
   if (fcntl(control, F_SETFD, 0) || (ready >= 0 && fcntl(ready, F_SETFD, 0))) {
@@ -614,6 +616,11 @@ static int execute_daemon(struct package *package, int control, int ready,
     return -errno;
   }
   result = close_other_fds(control, ready, fd);
+  /* binfmt_misc must be able to deliver this image to Tango after exec.
+   * The daemon closes our inherited FD after claiming its authorized role;
+   * the kernel retains the frozen image for the entire control session. */
+  if (!result && abi == VIOLA_ABI_ARM32 && fcntl(fd, F_SETFD, 0))
+    result = -errno;
   if (!result) {
     syscall(SYS_execveat, fd, "", arguments, environment, AT_EMPTY_PATH);
     result = -errno;

@@ -199,6 +199,36 @@ class ViolaTests(unittest.TestCase):
             str(ROOT / "tests/viola/load_kernel.c"), str(shared / "viola.c"),
             str(shared / "vendor/monocypher.c"), str(shared / "vendor/monocypher-ed25519.c"),
             *loader_links, "-o", str(cls.kernel_fixture)], check=True)
+        cls.exec_fixture = cls.base / "viola-exec-daemon"
+        subprocess.run([cc, *flags, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I" + str(ROOT), "-I" + str(shared), "-I" + str(cls.context_dir),
+            str(ROOT / "tests/viola/exec_daemon.c"), str(shared / "viola.c"),
+            str(shared / "vendor/monocypher.c"), str(shared / "vendor/monocypher-ed25519.c"),
+            *loader_links, "-o", str(cls.exec_fixture)], check=True)
+
+    def test_daemon_exec_preserves_arm32_image_and_requires_authorization(self):
+        import errno
+        for abi in (1, 2):
+            for stage in (0, 1, 2):
+                with self.subTest(abi=abi, stage=stage):
+                    result = subprocess.run([str(self.exec_fixture), str(self.module), str(abi), str(stage)],
+                        capture_output=True, text=True, timeout=3)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = (-errno.ECANCELED, 1, 1, 1) if stage == 0 else (
+                        -errno.EACCES, 1, int(stage == 2), 0)
+                    self.assertEqual(tuple(map(int, result.stdout.split())), expected)
+        with tempfile.TemporaryDirectory(dir=self.base) as temporary:
+            module = Path(temporary) / "module"
+            shutil.copytree(self.module, module)
+            image = module / "bin/zygiskd32"
+            image.write_bytes(image.read_bytes() + b"tampered")
+            result = subprocess.run([str(self.exec_fixture), str(module), "2", "0"],
+                capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            error, pins, arms, executions = map(int, result.stdout.split())
+            self.assertNotEqual(error, 0)
+            self.assertEqual((pins, arms, executions), (1, 0, 0))
+
 
     def test_embedded_lkmloader(self):
         result = subprocess.run([str(self.loader_fixture)], capture_output=True, text=True)

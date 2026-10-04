@@ -12,6 +12,7 @@
 #include <linux/dcache.h>
 #include <linux/elf.h>
 #include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/fs.h>
 #include <linux/jiffies.h>
 #include <linux/list.h>
@@ -67,6 +68,7 @@ struct yz_auth_session {
 	u32 exec_id;
 	bool ready;
 	bool compat_required;
+	bool translated_exec; /* Kernel-observed binfmt handoff of the pinned image. */
 	u8 recovery; /* 0 idle, 1 requested, 2 owned by the main daemon. */
 	int recovery_error;
 };
@@ -118,6 +120,7 @@ static const char *const yz_auth_system_names[] = {
 	"/apex/com.android.runtime/lib64/bionic/libdl.so",
 };
 static struct path yz_auth_system_paths[ARRAY_SIZE(yz_auth_system_names)];
+static struct path yz_auth_tango_path;
 /* These roots are captured from the boot image before any daemon claim.  They
  * cover the release-dependent set of Bionic libraries without trusting an
  * arbitrary read-only mount or a same-named replacement elsewhere. */
@@ -301,6 +304,61 @@ static bool yz_auth_readonly_path(const struct path *path)
 	inode = d_inode(path->dentry);
 	return inode && (sb_rdonly(inode->i_sb) ||
 				(path->mnt && (path->mnt->mnt_flags & MNT_READONLY)));
+}
+
+static bool yz_auth_tango_image(const struct file *file)
+{
+	const struct path *path = &yz_auth_tango_path;
+
+	return file && path->dentry &&
+	       S_ISREG(file_inode(file)->i_mode) &&
+	       sb_rdonly(file_inode(file)->i_sb) &&
+	       path->mnt == file->f_path.mnt &&
+	       d_inode(path->dentry) == file_inode(file);
+}
+
+/* Called at sched_process_exec, before the new program can run. The execfd
+ * is selected and installed by binfmt_misc, not supplied by the interpreter.
+ * Inspect it under file_lock: no allocation, hashing or reference destruction
+ * is permitted in this tracepoint. s->image stays frozen for the session. */
+static bool yz_auth_record_exec(struct yz_auth_session *s,
+				struct linux_binprm *bprm)
+{
+	struct file *image = READ_ONCE(s->image);
+	u32 role = READ_ONCE(s->role);
+	bool translated = false;
+
+	if ((role != YZ_VIOLA_ARMED64 && role != YZ_VIOLA_ARMED32 &&
+	     role != YZ_VIOLA_DELEGATED32) || !image || !bprm->file)
+		return false;
+	if (!yz_auth_same_image(image, bprm->file)) {
+		struct files_struct *files = current->files;
+		struct fdtable *fdt;
+
+		if (role != YZ_VIOLA_ARMED32 || !yz_auth_tango_image(bprm->file) ||
+		    !bprm->have_execfd || bprm->execfd < 0 || !files)
+			return false;
+		spin_lock(&files->file_lock);
+		fdt = files_fdtable(files);
+		if ((unsigned int)bprm->execfd < fdt->max_fds)
+			translated = yz_auth_same_image(image,
+				rcu_dereference_raw(fdt->fd[bprm->execfd]));
+		spin_unlock(&files->file_lock);
+		if (!translated)
+			return false;
+	}
+	if (atomic_cmpxchg(&s->exec_seen, 0, 1))
+		return false;
+	WRITE_ONCE(s->translated_exec, translated);
+	return true;
+}
+
+static bool yz_auth_claim_image(const struct yz_auth_session *s,
+				const struct file *exe)
+{
+	if (READ_ONCE(s->translated_exec))
+		return s->role == YZ_VIOLA_ARMED32 && yz_auth_tango_image(exe);
+	return yz_auth_same_image(s->image, exe);
 }
 
 static bool yz_auth_system_image(const struct file *file)
@@ -752,8 +810,7 @@ static int yz_auth_claim(struct yz_auth_session *s)
 	exe = yz_get_current_exe_file();
 	if (!exe)
 		return -EACCES;
-	if (file_inode(exe) == file_inode(s->image) &&
-	    exe->f_path.mnt == s->image->f_path.mnt) {
+	if (yz_auth_claim_image(s, exe)) {
 		if (s->role == YZ_VIOLA_DELEGATED32 &&
 		    yz_auth_check_mappings(exe, true))
 			goto out;
@@ -1243,10 +1300,8 @@ static void yz_auth_on_exec(void *data, struct task_struct *task, pid_t old_pid,
 			    struct linux_binprm *bprm)
 {
 	struct yz_auth_session *s;
-	struct file *image;
 	unsigned long flags;
 	unsigned int i, slot = ARRAY_SIZE(yz_auth_exec_records);
-	u32 role;
 	bool changed = false;
 
 	(void)data;
@@ -1280,13 +1335,7 @@ static void yz_auth_on_exec(void *data, struct task_struct *task, pid_t old_pid,
 	list_for_each_entry_rcu(s, &yz_auth_sessions, list) {
 		if (s->owner != task_tgid(task) || atomic_read(&s->revoked))
 			continue;
-		role = READ_ONCE(s->role);
-		image = READ_ONCE(s->image);
-		if ((role != YZ_VIOLA_ARMED64 && role != YZ_VIOLA_ARMED32 &&
-		     role != YZ_VIOLA_DELEGATED32) || !image || !bprm->file ||
-		    file_inode(image) != file_inode(bprm->file) ||
-		    image->f_path.mnt != bprm->file->f_path.mnt ||
-		    atomic_cmpxchg(&s->exec_seen, 0, 1)) {
+		if (!yz_auth_record_exec(s, bprm)) {
 			yz_auth_revoke(s);
 			changed = true;
 		}
@@ -1349,6 +1398,17 @@ int yz_auth_init(void)
 			memset(path, 0, sizeof(*path));
 		}
 	}
+	/* Optional host translator; never admit a writable module replacement.
+	 * Keep it separate from the executable mappings allowed inside Viola. */
+	ret = yz_kern_path("/system_ext/bin/tango_translator", LOOKUP_FOLLOW,
+			   &yz_auth_tango_path);
+	if (ret) {
+		memset(&yz_auth_tango_path, 0, sizeof(yz_auth_tango_path));
+	} else if (!S_ISREG(d_inode(yz_auth_tango_path.dentry)->i_mode) ||
+		   !sb_rdonly(d_inode(yz_auth_tango_path.dentry)->i_sb)) {
+		yz_path_put(&yz_auth_tango_path);
+		memset(&yz_auth_tango_path, 0, sizeof(yz_auth_tango_path));
+	}
 	ret = yz_auth_check_current(VIOLA_ROLE_VIOLA);
 	if (ret) {
 		yz_auth_error(YZ_VIOLA_STAGE_LOADER, VIOLA_ROLE_VIOLA, ret);
@@ -1408,6 +1468,9 @@ void yz_auth_exit(void)
 	/* cleanup can schedule the expiry worker before it completes. */
 	cancel_delayed_work_sync(&yz_auth_timeout_work);
 	yz_auth_cleanup_execs(true);
+	if (yz_auth_tango_path.dentry)
+		yz_path_put(&yz_auth_tango_path);
+	memset(&yz_auth_tango_path, 0, sizeof(yz_auth_tango_path));
 	for (i = 0; i < ARRAY_SIZE(yz_auth_system_paths); ++i) {
 		if (yz_auth_system_paths[i].dentry)
 			yz_path_put(&yz_auth_system_paths[i]);

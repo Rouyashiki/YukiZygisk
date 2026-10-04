@@ -308,6 +308,25 @@ void notify_ready(int fd, bool ok) {
   close(fd);
 }
 
+bool close_launcher_image(int ready_fd) {
+  const char *env = getenv("YUKIZYGISK_IMAGE_FD");
+  if (!env)
+    return true;
+  errno = 0;
+  char *end = nullptr;
+  const long fd = strtol(env, &end, 10);
+  const bool valid = !errno && end != env && *end == '\0' &&
+                     fd > STDERR_FILENO && fd <= INT32_MAX &&
+                     fd != yzhost::g_control_fd && fd != ready_fd;
+  unsetenv("YUKIZYGISK_IMAGE_FD");
+  if (!valid)
+    return false;
+  struct stat image{};
+  if (fstat(static_cast<int>(fd), &image) || !S_ISREG(image.st_mode))
+    return false;
+  return close(static_cast<int>(fd)) == 0;
+}
+
 #if defined(__LP64__)
 pid_t g_compat_pid = -1;
 bool send_fd_nonblocking(int sock, int fd);
@@ -2379,6 +2398,11 @@ int run_daemon() {
 
   // Claim the execution-bound role before exposing any daemon service.
   if (yzhost::claim_control_fd() < 0) {
+    notify_ready(ready_fd, false);
+    return 1;
+  }
+  if (!close_launcher_image(ready_fd)) {
+    DLOGE("invalid inherited Viola image descriptor");
     notify_ready(ready_fd, false);
     return 1;
   }
