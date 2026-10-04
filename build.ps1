@@ -34,7 +34,7 @@ Environment:
   Node.js 24 and npm are required for WebUI packaging.
   ANDROID_SDK_ROOT / ANDROID_HOME
   ANDROID_NDK_HOME / ANDROID_NDK
-  DDK_RELEASE / YZ_DDK_RELEASE (default: 20260313 for docker fallback)
+  DDK_RELEASE / YZ_DDK_RELEASE (default: 20260828 for docker fallback)
   YZ_DDK_IMAGE (docker image override for kernel build fallback)
   VIOLA_PYTHON (Python with tools/requirements-viola.txt installed)
   VIOLA_HOST_CC (native host C compiler; default: clang)
@@ -324,6 +324,7 @@ function Build-KernelLkm {
 		switch ($target) {
 			'android15-6.6' { $ddkArguments += @('W=1') }
 			'android16-6.12' { $ddkArguments += @('W=1') }
+			'android17-6.18' { $ddkArguments += @('W=1') }
 			default { }
 		}
 		Invoke-Native -FilePath $ddkCommand -ArgumentList $ddkArguments -WorkingDirectory $script:RepoRoot
@@ -332,10 +333,10 @@ function Build-KernelLkm {
 		$dockerCommand = Ensure-Command 'docker'
 		if (-not $dockerCommand) { throw 'ddk not found and docker is unavailable. Install ddk or docker to build kernel modules.' }
 
-		$release = if ($env:DDK_RELEASE) { $env:DDK_RELEASE } elseif ($env:YZ_DDK_RELEASE) { $env:YZ_DDK_RELEASE } else { '20260313' }
+		$release = if ($env:DDK_RELEASE) { $env:DDK_RELEASE } elseif ($env:YZ_DDK_RELEASE) { $env:YZ_DDK_RELEASE } else { '20260828' }
 		$ddkImage = if ($env:YZ_DDK_IMAGE) { $env:YZ_DDK_IMAGE } else { "ghcr.io/ylarod/ddk:${target}-$release" }
 		$makeExtras = @('make', '-C', 'kernel', "-j$($script:BuildJobs)", 'KDIR=$KDIR', 'CC=clang', "VIOLA_KMI_ID=$script:KmiId")
-		if ($target -in @('android15-6.6', 'android16-6.12')) {
+		if ($target -in @('android15-6.6', 'android16-6.12', 'android17-6.18')) {
 			$makeExtras += 'W=1'
 		}
 		$makeCommand = "cd /src && $($makeExtras -join ' ')"
@@ -367,7 +368,7 @@ function Prepare-Viola {
 	$ndkLine = Get-Content (Join-Path $script:NdkRoot 'source.properties') | Where-Object { $_ -match '^Pkg.Revision\s*=' } | Select-Object -First 1
 	$ndkRevision = ($ndkLine -replace '^Pkg.Revision\s*=\s*', '').Trim()
 	$stripMode = if ($script:StripAndroid) { 1 } else { 0 }
-	$ddkRelease = if ($env:DDK_RELEASE) { $env:DDK_RELEASE } elseif ($env:YZ_DDK_RELEASE) { $env:YZ_DDK_RELEASE } else { '20260313' }
+	$ddkRelease = if ($env:DDK_RELEASE) { $env:DDK_RELEASE } elseif ($env:YZ_DDK_RELEASE) { $env:YZ_DDK_RELEASE } else { '20260828' }
 	$buildConfig = "api=31;ndk=$ndkRevision;strip=$stripMode;ddk=$ddkRelease"
 	$prepareArguments = @('prepare', '--out', $script:ViolaContext, '--profile', $script:ViolaProfile, '--version-code', "$script:VersionCode", '--build-config', $buildConfig)
 	if ($script:ViolaKey) { $prepareArguments += @('--key', $script:ViolaKey) }
@@ -584,7 +585,7 @@ try {
 		throw "Invalid KMI: $($script:Kmi)"
 	}
 
-	$kmiNames = @('android12-5.10','android13-5.10','android13-5.15','android14-5.15','android14-6.1','android15-6.6','android16-6.12')
+	$kmiNames = @('android12-5.10','android13-5.10','android13-5.15','android14-5.15','android14-6.1','android15-6.6','android16-6.12','android17-6.18')
 	$script:KmiId = [Array]::IndexOf($kmiNames, $script:Kmi) + 1
 	if ($script:KmiId -le 0) { throw "Unsupported KMI: $script:Kmi" }
 

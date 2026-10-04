@@ -8,7 +8,7 @@ YukiZygisk is a standalone, kernel-based Zygisk implementation for rooted Androi
 
 ## Requirements
 
-- An ARM64 device with a supported GKI kernel. Packages cover supported variants of 5.10, 5.15, 6.1, 6.6 and 6.12; the installer checks for a matching kernel automatically.
+- An ARM64 device with a supported GKI kernel. Packages cover supported variants of 5.10, 5.15, 6.1, 6.6, 6.12 and 6.18; the installer checks for a matching kernel automatically.
 - KernelSU, YukiSU or APatch. Magisk and devices running multiple root implementations are currently unsupported.
 - A manager with module WebUI support to use the settings interface.
 

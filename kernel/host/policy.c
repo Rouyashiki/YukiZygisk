@@ -161,12 +161,15 @@ bool yz_policy_base_ready(void)
 	       yz_selinux_status_update_policyload;
 }
 
-static struct task_security_struct *yz_policy_cred_security(
-	const struct cred *cred)
+static u32 yz_policy_cred_sid(const struct cred *cred)
 {
+	/* Follow the credential security type in the target SELinux headers. */
+	typeof(selinux_cred(cred)) csec;
+
 	if (!cred || !cred->security || !yz_selinux_blob_sizes)
-		return NULL;
-	return cred->security + yz_selinux_blob_sizes->lbs_cred;
+		return 0;
+	csec = cred->security + yz_selinux_blob_sizes->lbs_cred;
+	return csec->sid;
 }
 
 static struct inode_security_struct *
@@ -187,14 +190,6 @@ yz_policy_sidtab_search(struct sidtab *sidtab, u32 sid)
 
 	entry = yz_sidtab_search_entry(sidtab, sid);
 	return entry ? &entry->context : NULL;
-}
-
-static u32 yz_policy_cred_sid(const struct cred *cred)
-{
-	struct task_security_struct *tsec =
-		yz_policy_cred_security(cred);
-
-	return tsec ? tsec->sid : 0;
 }
 
 static const char *yz_policy_type_name_by_value(struct policydb *db, u32 type)
@@ -476,12 +471,12 @@ static int yz_policy_allow_named(
 
 int yz_host_policy_prepare_runtime_current(void)
 {
-	struct task_security_struct *tsec;
 	struct selinux_policy *policy;
 	struct context *target_context;
 	struct yz_policy_edit edit;
 	char target_name[64];
 	u32 target_type;
+	u32 sid;
 	size_t i;
 	int ret;
 
@@ -489,8 +484,8 @@ int yz_host_policy_prepare_runtime_current(void)
 	if (ret)
 		return ret;
 
-	tsec = yz_policy_cred_security(current_cred());
-	if (!tsec || !tsec->sid) {
+	sid = yz_policy_cred_sid(current_cred());
+	if (!sid) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
@@ -502,7 +497,7 @@ int yz_host_policy_prepare_runtime_current(void)
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	target_context = yz_policy_sidtab_search(policy->sidtab, tsec->sid);
+	target_context = yz_policy_sidtab_search(policy->sidtab, sid);
 	if (!target_context) {
 		ret = -ENOENT;
 		goto out_unlock;
@@ -799,7 +794,6 @@ yz_policy_base_get_file_load_keys(
 {
 	const char *const *tmpfs_perms = NULL;
 	struct inode_security_struct *isec;
-	struct task_security_struct *tsec;
 	struct selinux_policy *policy;
 	struct policydb *db;
 	struct context *scontext;
@@ -835,8 +829,7 @@ yz_policy_base_get_file_load_keys(
 	if (!isec)
 		return -EINVAL;
 
-	tsec = yz_policy_cred_security(cred);
-	ssid = tsec ? tsec->sid : 0;
+	ssid = yz_policy_cred_sid(cred);
 	tsid = isec->sid;
 	if (!ssid || !tsid)
 		return -EINVAL;
@@ -1013,18 +1006,18 @@ void yz_host_policy_exit(void)
 bool yz_host_policy_cred_has_type(const struct cred *cred,
 				  const char *type_name)
 {
-	struct task_security_struct *tsec;
 	struct selinux_policy *policy;
 	struct context *ctx;
 	struct policydb *db;
 	const char *name;
+	u32 sid;
 	bool match = false;
 
 	if (!type_name || !yz_policy_base_ready())
 		return false;
 
-	tsec = yz_policy_cred_security(cred);
-	if (!tsec || !tsec->sid)
+	sid = yz_policy_cred_sid(cred);
+	if (!sid)
 		return false;
 
 	rcu_read_lock();
@@ -1032,7 +1025,7 @@ bool yz_host_policy_cred_has_type(const struct cred *cred,
 	if (!policy)
 		goto out_unlock;
 
-	ctx = yz_policy_sidtab_search(policy->sidtab, tsec->sid);
+	ctx = yz_policy_sidtab_search(policy->sidtab, sid);
 	if (!ctx)
 		goto out_unlock;
 

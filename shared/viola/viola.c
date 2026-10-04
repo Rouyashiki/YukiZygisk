@@ -208,7 +208,7 @@ const char *viola_kmi_name(uint32_t kmi)
 {
 	static const char *const names[] = {"none",	      "android12-5.10", "android13-5.10",
 					    "android13-5.15", "android14-5.15", "android14-6.1",
-					    "android15-6.6",  "android16-6.12"};
+					    "android15-6.6",  "android16-6.12", "android17-6.18"};
 	return kmi < sizeof(names) / sizeof(names[0]) ? names[kmi] : NULL;
 }
 
@@ -217,7 +217,7 @@ int viola_kmi_id(const char *name)
 	unsigned i;
 	if (!name)
 		return -1;
-	for (i = 0; i <= 7; ++i)
+	for (i = 0; viola_kmi_name(i); ++i)
 		if (!strcmp(name, viola_kmi_name(i)))
 			return (int)i;
 	return -1;
@@ -236,7 +236,7 @@ static int valid_entry(const struct viola_entry *e)
 	    (e->abi != VIOLA_ABI_ARM64 && e->abi != VIOLA_ABI_ARM32))
 		return 0;
 	if (e->role == VIOLA_ROLE_KO)
-		return e->abi == VIOLA_ABI_ARM64 && e->kmi >= 1 && e->kmi <= 7;
+		return e->abi == VIOLA_ABI_ARM64 && e->kmi >= 1 && viola_kmi_name(e->kmi);
 	if (e->kmi)
 		return 0;
 	return (e->role != VIOLA_ROLE_VIOLA && e->role != VIOLA_ROLE_CTL) ||

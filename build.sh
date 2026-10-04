@@ -47,6 +47,7 @@ KMI_TARGETS=(
 	android14-6.1
 	android15-6.6
 	android16-6.12
+	android17-6.18
 )
 
 usage() {
@@ -326,7 +327,7 @@ build_one_kernel() {
 	done
 	((kmi_id > 0)) || die "unsupported KMI: $target"
 	case "$target" in
-	android15-6.6 | android16-6.12)
+	android15-6.6 | android16-6.12 | android17-6.18)
 		ddk build --target "$target" -- W=1 VIOLA_KMI_ID="$kmi_id"
 		;;
 	*)
@@ -510,7 +511,7 @@ prepare_viola() {
 	ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_NDK/source.properties" | tr -d '\r')"
 	local strip_mode=1
 	[[ "$STRIP_ANDROID" == true ]] || strip_mode=0
-	local config="api=${ANDROID_PLATFORM#android-};ndk=$ndk_revision;strip=$strip_mode;ddk=${DDK_RELEASE:-${YZ_DDK_RELEASE:-20260313}}"
+	local config="api=${ANDROID_PLATFORM#android-};ndk=$ndk_revision;strip=$strip_mode;ddk=${DDK_RELEASE:-${YZ_DDK_RELEASE:-20260828}}"
 	local args=(prepare --out "$VIOLA_CONTEXT" --profile "$VIOLA_PROFILE"
 		--version-code "$VERSION_CODE" --build-config "$config")
 	[[ -z "${VIOLA_KEY:-}" ]] || args+=(--key "$VIOLA_KEY")

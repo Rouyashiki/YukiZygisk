@@ -18,7 +18,7 @@ on:
       ddk_release:
         description: DDK container release
         required: false
-        default: "20260313"
+        default: "20260828"
         type: string
       viola_context_artifact:
         description: Public Viola context artifact from the caller's prepare job
@@ -35,7 +35,7 @@ on:
       ddk_release:
         description: DDK container release
         required: false
-        default: "20260313"
+        default: "20260828"
         type: string
 
 permissions:
@@ -144,12 +144,13 @@ jobs:
             android14-6.1) kmi_id=5 ;;
             android15-6.6) kmi_id=6 ;;
             android16-6.12) kmi_id=7 ;;
+            android17-6.18) kmi_id=8 ;;
             *) echo "Unsupported KMI: $KMI"; exit 1 ;;
           esac
 
           make_args=(-C kernel -j"$(nproc --all)" KDIR="$KDIR" CC=clang VIOLA_KMI_ID="$kmi_id")
           case "$KMI" in
-            android15-6.6|android16-6.12) make_args+=(W=1) ;;
+            android15-6.6|android16-6.12|android17-6.18) make_args+=(W=1) ;;
           esac
           make "${make_args[@]}"
 
