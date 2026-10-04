@@ -31,6 +31,7 @@ Options:
   -h, --help                  Show this help
 
 Environment:
+  Node.js 24 and npm are required for WebUI packaging.
   ANDROID_SDK_ROOT / ANDROID_HOME
   ANDROID_NDK_HOME / ANDROID_NDK
   DDK_RELEASE / YZ_DDK_RELEASE (default: 20260313 for docker fallback)
@@ -421,11 +422,22 @@ function Build-Userspace {
 	return $true
 }
 
+function Build-WebUI {
+	$nodeCommand = Ensure-Command 'node'
+	$npmCommand = Ensure-Command 'npm'
+	if (-not $nodeCommand -or -not $npmCommand) {
+		throw 'Node.js 24 and npm are required for WebUI packaging. Add them to PATH.'
+	}
+	$webuiTools = Join-Path $script:RepoRoot 'tools/webui'
+	Invoke-Native -FilePath $npmCommand -ArgumentList @('ci', '--include=dev', '--no-audit', '--no-fund') -WorkingDirectory $webuiTools
+	Invoke-Native -FilePath $npmCommand -ArgumentList @('run', 'bundle') -WorkingDirectory $webuiTools
+}
+
 function Stage-Module {
 	Write-Host '>>> [3/4] Stage module content ...' -ForegroundColor Cyan
 	$zipDir = Join-Path $script:RepoRoot 'build\package'
 	$moduleTemplate = Join-Path $script:RepoRoot 'module'
-	$webuiSource = Join-Path $script:RepoRoot 'webui'
+	$webuiSource = Join-Path $script:RepoRoot 'build/webui'
 	$kernelOut = Join-Path $script:OutDir "lkm\${script:Kmi}_yukizygisk.ko"
 
 	if (Test-Path -LiteralPath $zipDir) { Remove-Item -LiteralPath $zipDir -Recurse -Force }
@@ -606,6 +618,7 @@ try {
 
 	Get-ComputeVersion
 	if ($script:ViolaProfile -eq 'dev') { $script:VersionName += '-dev' }
+	Build-WebUI
 	Prepare-Viola
 	Build-Userspace
 	Invoke-ViolaTool -Arguments @('loader', '--context', $script:ViolaContext, '--image', (Join-Path $script:OutDir 'viola'))

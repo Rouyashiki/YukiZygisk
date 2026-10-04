@@ -14,7 +14,7 @@ BUILD_DIR="$PROJECT_ROOT/build"
 OUT_DIR="$BUILD_DIR/out"
 LKM_OUT_DIR="$OUT_DIR/lkm"
 MODULE_TEMPLATE_DIR="$PROJECT_ROOT/module"
-WEBUI_DIR="$PROJECT_ROOT/webui"
+WEBUI_DIR="$BUILD_DIR/webui"
 PACKAGE_DIR="$BUILD_DIR/package"
 
 COMMAND="${1:-package}"
@@ -54,7 +54,9 @@ usage() {
 YukiZygisk local build and module packager.
 
 Usage:
-  ./build.sh [prepare|viola|package|kernel|daemon|ctl|payloads|clean] [options]
+  ./build.sh [prepare|viola|package|kernel|daemon|ctl|payloads|webui|clean] [options]
+
+WebUI packaging requires Node.js 24 and npm (also available as ./build.sh webui).
 
 Options:
   -k, --kmi KMI              Build/package one DDK target (default: .ddk-version)
@@ -571,6 +573,17 @@ stage_payloads() {
 	done
 }
 
+build_webui() {
+	need_cmd node
+	need_cmd npm
+	info "Bundle module WebUI"
+	(
+		cd "$PROJECT_ROOT/tools/webui"
+		npm ci --include=dev --no-audit --no-fund
+		npm run bundle
+	)
+}
+
 package_module() {
 	check_package_deps
 	compute_version
@@ -675,6 +688,7 @@ payloads)
 	build_payloads
 	;;
 package)
+	build_webui
 	prepare_viola
 	build_viola
 	build_kernel
@@ -688,6 +702,9 @@ package)
 			ddk clean --target "$KMI" >/dev/null 2>&1 || true
 		fi
 	fi
+	;;
+webui)
+	build_webui
 	;;
 clean)
 	clean
