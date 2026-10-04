@@ -310,10 +310,11 @@ static bool yz_auth_tango_image(const struct file *file)
 {
 	const struct path *path = &yz_auth_tango_path;
 
+	/* binfmt_misc F pins its interpreter before mount namespaces are cloned.
+	 * The immutable system inode remains the same across them. */
 	return file && path->dentry &&
 	       S_ISREG(file_inode(file)->i_mode) &&
 	       sb_rdonly(file_inode(file)->i_sb) &&
-	       path->mnt == file->f_path.mnt &&
 	       d_inode(path->dentry) == file_inode(file);
 }
 

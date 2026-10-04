@@ -81,7 +81,15 @@ int main(void) {
   RESET(); fds[3] = &foreign; REJECT();
   RESET(); task.files = NULL; REJECT();
   RESET(); yz_auth_tango_path.dentry = NULL; REJECT();
-  RESET(); translator.f_path.mnt = &other_mount; REJECT();
+  /* binfmt_misc F retains the boot mount; the launcher's namespace has a clone. */
+  RESET(); translator.f_path.mnt = &other_mount;
+  assert(yz_auth_record_exec(&session, &bprm));
+  assert(session.translated_exec && yz_auth_claim_image(&session, &translator));
+  translator.f_path.mnt = &mount;
+  assert(yz_auth_claim_image(&session, &translator)); ++cases;
+  /* Namespace tolerance is exclusive to the immutable host translator. */
+  RESET(); reopened.f_path.mnt = &other_mount; REJECT();
+  reopened.f_path.mnt = &mount;
   RESET(); bprm.file = &foreign; REJECT();
   RESET(); sb.readonly = false; REJECT();
   RESET(); session.image = NULL; REJECT();
