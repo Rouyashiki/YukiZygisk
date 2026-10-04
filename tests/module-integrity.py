@@ -178,6 +178,7 @@ class ModuleIntegrityTests(unittest.TestCase):
             "MODPATH": str(modpath),
             "ZIPFILE": str(zip_path),
             "BOOTMODE": "true",
+            "KSU": "true",
             "LANG": "C",
             "LC_ALL": "C",
             "LD_LIBRARY_PATH": str(root / "untrusted-libraries"),

@@ -12,6 +12,19 @@ SKIPUNZIP=1
 
 ui_print "- Installing YukiZygisk"
 
+if [ -d /data/adb/magisk ]; then
+	abort "! Magisk and mixed-root installations are unsupported"
+fi
+if { [ "${KSU:-}" = true ] || [ -d /data/adb/ksu ]; } &&
+	{ [ "${APATCH:-}" = true ] || [ -d /data/adb/ap ]; }; then
+	abort "! KernelSU and APatch installation state coexist; remove one before installing"
+fi
+case "${KSU:-false}:${APATCH:-false}" in
+true:false) YZ_BIN_DIR=/data/adb/ksu/bin ;;
+false:true) YZ_BIN_DIR=/data/adb/ap/bin ;;
+*) abort "! Install from KernelSU/YukiSU or APatch only" ;;
+esac
+
 # Bootstrap the shell verifier before executing any packaged binary.
 YZ_VERIFY_DIR="$(mktemp -d "$TMPDIR/yz-verify.XXXXXX")" ||
 	abort "! Cannot create package verification directory"
@@ -116,6 +129,14 @@ if ! printf '%s\n%s\n' "$KMI" "$KERNEL_RELEASE" >"$YZ_KMI_TMP" ||
 	abort "! Cannot save selected KMI"
 fi
 yz_prune_kmis "$MODPATH" "$KMI" || abort "! Cannot remove unused kernel modules"
+
+# MODPATH may be a staging directory that moves on the next boot.
+mkdir -p "$YZ_BIN_DIR" || abort "! Cannot create binary directory: $YZ_BIN_DIR"
+if [ -d "$YZ_BIN_DIR/yzctl" ] && [ ! -L "$YZ_BIN_DIR/yzctl" ]; then
+	abort "! Cannot replace yzctl directory: $YZ_BIN_DIR/yzctl"
+fi
+ln -sfn /data/adb/modules/yukizygisk/bin/yzctl "$YZ_BIN_DIR/yzctl" ||
+	abort "! Cannot install yzctl symlink: $YZ_BIN_DIR/yzctl"
 
 ui_print "- Selected kernel module: $KMI"
 ui_print "- Removed other KMI kernel modules"
