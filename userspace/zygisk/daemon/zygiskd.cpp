@@ -8,6 +8,8 @@
  */
 
 #include "zygiskd.hpp"
+#include "catalog.hpp"
+#include "exit_history.hpp"
 #if defined(YUKIZYGISK_RUNTIME_LOG)
 #include "log.hpp"
 #endif
@@ -19,6 +21,7 @@
 #include "native_modules.hpp"
 #include "root_policy.hpp"
 #include "uapi/yukizygisk.h"
+#include "userspace/zygisk/daemon_state.hpp"
 #include "userspace/zygisk/load_policy.hpp"
 #include "userspace/zygisk/settings.hpp"
 #include "viola_build.h"
@@ -42,6 +45,7 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include <android/dlext.h>
 #include <dlfcn.h>
 #include <elf.h>
 #include <link.h>
@@ -252,8 +256,16 @@ bool uid_should_umount(uint32_t uid) {
 bool lsetfilecon(const std::string &path, const char *context) {
   if (context == nullptr || *context == '\0')
     return false;
-  return lsetxattr(path.c_str(), "security.selinux", context,
-                   strlen(context) + 1, 0) == 0;
+  const size_t size = strlen(context);
+  std::string current(size + 1, '\0');
+  const ssize_t length = lgetxattr(path.c_str(), "security.selinux",
+                                   current.data(), current.size());
+  if (length >= 0 &&
+      (static_cast<size_t>(length) == size ||
+       (static_cast<size_t>(length) == size + 1 && current[size] == '\0')) &&
+      memcmp(current.data(), context, size) == 0)
+    return true;
+  return lsetxattr(path.c_str(), "security.selinux", context, size + 1, 0) == 0;
 }
 
 } // namespace yzhost
@@ -269,6 +281,12 @@ using NativeModule = yukizygisk::native::NativeModule;
 
 std::vector<NativeModule> g_native_modules;
 std::vector<NativeModule> g_native_targets;
+yukizygisk::catalog::Catalog g_catalog;
+int g_lifetime_lock = -1;
+uint64_t g_start_ticks = 0;
+uint64_t g_poll_returns = 0;
+uint64_t g_poll_timeouts = 0;
+bool have_live_runtime_consumers();
 
 yukizygisk::crash::Monitor
     g_crash_monitor("/data/tombstones", [](const char *message) {
@@ -296,16 +314,20 @@ int consume_ready_fd() {
   return static_cast<int>(fd);
 }
 
-void notify_ready(int fd, bool ok) {
+void notify_ready_code(int fd, char byte) {
   if (fd < 0)
     return;
-  const char byte = ok ? '1' : '0';
   ssize_t w;
   do {
     w = write(fd, &byte, 1);
   } while (w < 0 && errno == EINTR);
   (void)w;
   close(fd);
+}
+
+void notify_ready(int fd, bool ok) {
+  notify_ready_code(fd, ok ? yukizygisk::health::kReady
+                           : yukizygisk::health::kFailed);
 }
 
 bool close_launcher_image(int ready_fd) {
@@ -376,6 +398,24 @@ void stop_compat_daemon(pid_t pid) {
   (void)kill(pid, SIGKILL);
   while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
   }
+}
+
+bool reap_compat_for_recovery() {
+  if (g_compat_pid <= 0)
+    return true;
+  pid_t result;
+  do {
+    result = waitpid(g_compat_pid, nullptr, WNOHANG);
+  } while (result < 0 && errno == EINTR);
+  if (result == 0) {
+    errno = EBUSY;
+    return false;
+  }
+  if (result == g_compat_pid || (result < 0 && errno == ECHILD)) {
+    g_compat_pid = -1;
+    return true;
+  }
+  return false;
 }
 
 pid_t spawn_compat_daemon() {
@@ -493,6 +533,8 @@ pid_t spawn_compat_daemon() {
     pid = -1;
   }
   DLOGI("zygiskd32 spawn pid=%d ready=%u", pid, ok ? 1U : 0U);
+  if (!ok)
+    errno = result == yukizygisk::health::kRebootRequired ? EUCLEAN : EIO;
   return pid;
 }
 #endif // #if defined(__LP64__)
@@ -582,7 +624,8 @@ std::vector<NativeModule> scan_native_modules() {
       NativeModule m{};
       if (yukizygisk::native::parse_native_module_line(module_id, base, line,
                                                        &m)) {
-        if (!yzhost::lsetfilecon(m.lib_path, yzhost::kSystemLibContext))
+        if (!g_catalog.frozen() &&
+            !yzhost::lsetfilecon(m.lib_path, yzhost::kSystemLibContext))
           DLOGE("native module: failed to label lib=%s", m.lib_path.c_str());
         DLOGI("native module: id=%s target=%s%s lib=%s companion=%u",
               m.module_id.c_str(),
@@ -632,7 +675,7 @@ bool needs_compat_daemon() {
 #endif // #if defined(__LP64__)
 
 #if defined(__LP64__)
-void publish_native_targets() {
+bool publish_native_targets() {
   yz_native_targets_cmd cmd{};
   for (const auto &m : g_native_targets) {
     if (cmd.count >= YZ_NATIVE_TARGET_MAX)
@@ -658,25 +701,69 @@ void publish_native_targets() {
     DLOGI("native targets: %u module(s), kernel ret=%d errno=%d (%s)",
           cmd.count, ret, errno, strerror(errno));
   }
+  return ret == 0;
 }
 #endif // #if defined(__LP64__)
 
-void rescan_modules() {
-  g_modules = scan_modules();
+bool rescan_modules(bool initial = false) {
+  const bool frozen = g_catalog.frozen();
+  const auto modules = scan_modules();
   std::vector<NativeModule> scanned = scan_native_modules();
-  g_native_targets.clear();
-  g_native_modules.clear();
+  std::vector<yukizygisk::catalog::Entry> entries;
+  for (const auto &module : modules) {
+    yukizygisk::catalog::Entry entry;
+    entry.kind = 1;
+    entry.id = module.name;
+    entry.library = module.lib_path;
+    entries.push_back(std::move(entry));
+  }
   constexpr int kElfClass = sizeof(void *) == 8 ? ELFCLASS64 : ELFCLASS32;
   for (const auto &module : scanned) {
-    int module_class = native_module_elf_class(module.lib_path);
+    const int module_class = native_module_elf_class(module.lib_path);
     if (module_class != ELFCLASS32 && module_class != ELFCLASS64)
       continue;
+    yukizygisk::catalog::Entry entry;
+    entry.kind = module_class == kElfClass ? 2 : 3;
+    entry.id = module.module_id;
+    entry.target_type = module.target_type;
+    entry.target = module.target;
+    entry.library = module.lib_path;
+    entry.manifest =
+        yzhost::modules_dir() + "/" + module.module_id + "/zn_modules.txt";
+    entry.has_companion = module.has_companion;
+    entries.push_back(std::move(entry));
+  }
+  const bool catalog_ok =
+      initial
+          ? g_catalog.initialize(yukizygisk::health::kRecoveryDirectory,
+                                 sizeof(void *) == 8 ? 2 : 1,
+                                 yukizygisk::crash::boot_id(), g_lifetime_lock,
+                                 have_live_runtime_consumers(), &entries)
+          : g_catalog.replace(&entries);
+  if (!catalog_ok) {
+    DLOGE("module catalog unavailable: errno=%d reboot_required=%d", errno,
+          g_catalog.reboot_required());
+    return false;
+  }
+  if (!initial && frozen)
+    return true;
+  g_modules.clear();
+  g_native_targets.clear();
+  g_native_modules.clear();
+  for (const auto &entry : entries) {
+    if (entry.kind == 1) {
+      g_modules.push_back({entry.id, entry.library});
+      continue;
+    }
+    NativeModule module{entry.id, static_cast<uint8_t>(entry.target_type),
+                        entry.target, entry.library, entry.has_companion};
     g_native_targets.push_back(module);
-    if (module_class == kElfClass)
+    if (entry.kind == 2)
       g_native_modules.push_back(module);
   }
 #if defined(__LP64__)
-  publish_native_targets();
+  if (!publish_native_targets())
+    return false;
 #endif // #if defined(__LP64__)
   std::vector<yukizygisk::crash::Module> crash_modules;
   crash_modules.reserve(g_modules.size() + g_native_modules.size());
@@ -687,6 +774,7 @@ void rescan_modules() {
   g_crash_monitor.set_modules(std::move(crash_modules));
   DLOGI("found %zu zygisk module(s), %zu native module(s) for %s",
         g_modules.size(), g_native_modules.size(), kAbi);
+  return true;
 }
 
 bool read_exact(int fd, void *buf, size_t n) {
@@ -833,9 +921,11 @@ bool send_module_image(int client, int fd) {
 
 int copy_file_to_memfd(const std::string &path) {
   int src = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (src < 0) {
+  if (!g_catalog.validate_library_fd(path, src)) {
     DLOGE("module memfd: open failed path=%s err=%s", path.c_str(),
           strerror(errno));
+    if (src >= 0)
+      close(src);
     return -1;
   }
 
@@ -903,6 +993,11 @@ int copy_file_to_memfd(const std::string &path) {
     }
   }
 
+  if (!g_catalog.validate_library_fd(path, src)) {
+    close(src);
+    close(mfd);
+    return -1;
+  }
   close(src);
   if (lseek(mfd, 0, SEEK_SET) < 0) {
     DLOGE("module memfd: rewind failed err=%s", strerror(errno));
@@ -979,24 +1074,50 @@ void *companion_thread(void *p) {
   return nullptr;
 }
 
-[[noreturn]] void companion_main(const std::string &lib_path, int ctrl) {
+bool close_companion_descriptors(int ctrl, int library) {
   // Third-party entry points never retain the daemon's control capability.
   if (yzhost::g_control_fd >= 0) {
-    close(yzhost::g_control_fd);
+    if (close(yzhost::g_control_fd) != 0)
+      return false;
     yzhost::g_control_fd = -1;
     yzhost::g_control_claimed = false;
   }
-  // Drop daemon fds.
-  if (DIR *fdd = opendir("/proc/self/fd")) {
-    int dfd = dirfd(fdd);
-    while (dirent *e = readdir(fdd)) {
-      int fd = atoi(e->d_name);
-      if (fd > 2 && fd != ctrl && fd != dfd)
-        close(fd);
+  DIR *directory = opendir("/proc/self/fd");
+  if (directory == nullptr)
+    return false;
+  const int directory_fd = dirfd(directory);
+  bool ok = true;
+  for (;;) {
+    errno = 0;
+    const dirent *entry = readdir(directory);
+    if (entry == nullptr) {
+      ok = errno == 0;
+      break;
     }
-    closedir(fdd);
+    const int fd = atoi(entry->d_name);
+    if (fd > 2 && fd != ctrl && fd != library && fd != directory_fd &&
+        close(fd) != 0) {
+      ok = false;
+      break;
+    }
   }
-  void *h = dlopen(lib_path.c_str(), RTLD_NOW);
+  return closedir(directory) == 0 && ok;
+}
+
+void *load_companion_library(const std::string &path, int fd) {
+  android_dlextinfo extension{};
+  extension.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+  extension.library_fd = fd;
+  void *handle = android_dlopen_ext(path.c_str(), RTLD_NOW, &extension);
+  close(fd);
+  return handle;
+}
+
+[[noreturn]] void companion_main(const std::string &lib_path, int ctrl,
+                                 int library) {
+  if (!close_companion_descriptors(ctrl, library))
+    _exit(1);
+  void *h = load_companion_library(lib_path, library);
   auto fn = h ? reinterpret_cast<companion_entry_fn>(
                     dlsym(h, "zygisk_companion_entry"))
               : nullptr;
@@ -1090,20 +1211,29 @@ bool refresh_companion(uint32_t index) {
 }
 
 bool start_companion(uint32_t index) {
+  if (!g_catalog.publish())
+    return false;
+  const int library = copy_file_to_memfd(g_modules[index].lib_path);
+  if (library < 0)
+    return false;
   Companion &companion = g_companions[index];
   int sockets[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+    close(library);
     return false;
+  }
   const pid_t pid = fork();
   if (pid < 0) {
     close(sockets[0]);
     close(sockets[1]);
+    close(library);
     return false;
   }
   if (pid == 0) {
     close(sockets[0]);
-    companion_main(g_modules[index].lib_path, sockets[1]);
+    companion_main(g_modules[index].lib_path, sockets[1], library);
   }
+  close(library);
   close(sockets[1]);
   companion.pid = pid;
   companion.ctrl = sockets[0];
@@ -1172,23 +1302,12 @@ void *native_companion_thread(void *p) {
   return nullptr;
 }
 
-[[noreturn]] void native_companion_main(const std::string &lib_path, int ctrl) {
-  if (yzhost::g_control_fd >= 0) {
-    close(yzhost::g_control_fd);
-    yzhost::g_control_fd = -1;
-    yzhost::g_control_claimed = false;
-  }
-  if (DIR *fdd = opendir("/proc/self/fd")) {
-    int dfd = dirfd(fdd);
-    while (dirent *e = readdir(fdd)) {
-      int fd = atoi(e->d_name);
-      if (fd > 2 && fd != ctrl && fd != dfd)
-        close(fd);
-    }
-    closedir(fdd);
-  }
+[[noreturn]] void native_companion_main(const std::string &lib_path, int ctrl,
+                                        int library) {
+  if (!close_companion_descriptors(ctrl, library))
+    _exit(1);
 
-  void *h = dlopen(lib_path.c_str(), RTLD_NOW);
+  void *h = load_companion_library(lib_path, library);
   auto *mod = h ? reinterpret_cast<ZygiskNextCompanionModule *>(
                       dlsym(h, "zn_companion_module"))
                 : nullptr;
@@ -1303,20 +1422,30 @@ bool refresh_native_companion(uint32_t index) {
 }
 
 bool start_native_companion(uint32_t index) {
+  if (!g_catalog.publish())
+    return false;
+  const int library = copy_file_to_memfd(g_native_modules[index].lib_path);
+  if (library < 0)
+    return false;
   Companion &companion = g_native_companions[index];
   int sockets[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+    close(library);
     return false;
+  }
   const pid_t pid = fork();
   if (pid < 0) {
     close(sockets[0]);
     close(sockets[1]);
+    close(library);
     return false;
   }
   if (pid == 0) {
     close(sockets[0]);
-    native_companion_main(g_native_modules[index].lib_path, sockets[1]);
+    native_companion_main(g_native_modules[index].lib_path, sockets[1],
+                          library);
   }
+  close(library);
   close(sockets[1]);
   companion.pid = pid;
   companion.ctrl = sockets[0];
@@ -1465,10 +1594,14 @@ constexpr uint8_t kRuntimeAbi = YZ_RUNTIME_ABI_64;
 constexpr uint8_t kRuntimeAbi = YZ_RUNTIME_ABI_32;
 #endif
 
-struct RuntimeSnapshot {
-  std::vector<yz_runtime_record> records;
-  uint32_t capabilities = 0;
-};
+int open_exit_history(yz_exit_history_fd_cmd *command) {
+  return yzhost::ctl(YZ_IOCTL_GET_EXIT_HISTORY_FD, command);
+}
+
+yukizygisk::history::Reader g_exit_history(kRuntimeAbi, g_crash_monitor,
+                                           open_exit_history);
+
+using RuntimeSnapshot = yukizygisk::history::RuntimeSnapshot;
 
 RuntimeSnapshot query_runtime_snapshot() {
   RuntimeSnapshot snapshot;
@@ -1487,6 +1620,25 @@ RuntimeSnapshot query_runtime_snapshot() {
     snapshot.records.resize(cmd.count);
   snapshot.capabilities = cmd.capabilities;
   return snapshot;
+}
+
+bool have_live_runtime_consumers() {
+  const auto snapshot = query_runtime_snapshot();
+  if (snapshot.capabilities == 0)
+    return true;
+  return std::any_of(
+      snapshot.records.begin(), snapshot.records.end(), [](const auto &record) {
+        return record.abi == kRuntimeAbi && record.module_id[0] == '\0' &&
+               (record.flags & YZ_RUNTIME_F_EARLY_NATIVE) == 0 &&
+               (record.state == YZ_RUNTIME_STATE_REDIRECTED ||
+                record.state == YZ_RUNTIME_STATE_INJECTED);
+      });
+}
+
+yukizygisk::crash::NativeExitContext
+native_exit_context(const yz_target_exit_event &event,
+                    const RuntimeSnapshot &snapshot) {
+  return yukizygisk::history::native_context(event, snapshot);
 }
 
 bool report_runtime(pid_t pid, uint8_t kind, uint32_t generation,
@@ -1594,9 +1746,27 @@ struct HyosControlSessionContext {
   pid_t parent_pid;
   uint32_t parent_generation;
   pid_t child_pid = -1;
+  uint64_t parent_epoch = 0;
 };
 
 std::vector<HyosControlSessionContext> g_hyos_sessions;
+
+void cancel_unbound_hyos_sessions(const yz_target_exit_event &event,
+                                  uint64_t epoch = 0) {
+  for (size_t index = g_hyos_sessions.size(); index > 0; --index) {
+    const auto &context = g_hyos_sessions[index - 1];
+    if (context.child_pid > 0 ||
+        static_cast<uint32_t>(context.parent_pid) != event.event.pid ||
+        context.parent_generation != event.generation ||
+        context.parent_epoch != epoch)
+      continue;
+    close(context.session);
+    g_hyos_sessions.erase(g_hyos_sessions.begin() +
+                          static_cast<ptrdiff_t>(index - 1));
+    DLOGI("HyperOS unbound session cancelled: parent=%u generation=%u",
+          event.event.pid, event.generation);
+  }
+}
 
 pid_t process_parent_pid(pid_t pid) {
   char path[64];
@@ -1712,7 +1882,8 @@ void open_hyos_control_session(int client, pid_t parent_pid,
     send_fd(client, -1);
     return;
   }
-  g_hyos_sessions.push_back({sockets[0], parent_pid, parent_generation, -1});
+  g_hyos_sessions.push_back(
+      {sockets[0], parent_pid, parent_generation, -1, g_exit_history.epoch()});
   g_hyos_catalog_frozen = true;
   const bool sent = send_fd_nonblocking(client, sockets[1]);
   close(sockets[1]);
@@ -1723,16 +1894,15 @@ void open_hyos_control_session(int client, pid_t parent_pid,
 }
 
 bool rescan_modules_for_reload() {
-  if (g_hyos_catalog_frozen)
-    return false;
+  if (g_catalog.frozen())
+    return rescan_modules();
   for (auto &companion : g_companions)
     reset_companion(companion, true);
   for (auto &companion : g_native_companions)
     reset_native_companion(companion, true);
   g_companions.clear();
   g_native_companions.clear();
-  rescan_modules();
-  return true;
+  return rescan_modules();
 }
 
 void reap_terminating_companions() {
@@ -1818,6 +1988,101 @@ bool hyos_control_peer_allowed(int client, pid_t *parent_pid,
   return true;
 }
 
+yukizygisk::health::Snapshot daemon_health_snapshot() {
+  yukizygisk::health::Snapshot snapshot;
+  snapshot.abi = kRuntimeAbi;
+  snapshot.pid = static_cast<uint32_t>(getpid());
+  snapshot.start_ticks = g_start_ticks;
+  timespec now{};
+  if (clock_gettime(CLOCK_BOOTTIME, &now) == 0)
+    snapshot.sampled_boottime_ns =
+        static_cast<uint64_t>(now.tv_sec) * 1000000000 +
+        static_cast<uint64_t>(now.tv_nsec);
+  snapshot.flags = yukizygisk::health::Ready;
+  g_exit_history.health_snapshot(snapshot);
+  g_crash_monitor.health_snapshot(snapshot);
+  if (g_catalog.frozen())
+    snapshot.flags |= yukizygisk::health::CatalogFrozen;
+  if (g_catalog.reboot_required())
+    snapshot.flags |= yukizygisk::health::RebootRequired;
+  snapshot.catalog_error = g_catalog.error();
+  if (g_catalog.digest().size() == sizeof(snapshot.catalog_sha256))
+    memcpy(snapshot.catalog_sha256, g_catalog.digest().data(),
+           sizeof(snapshot.catalog_sha256));
+  for (const auto &session : g_hyos_sessions) {
+    if (session.child_pid > 0)
+      ++snapshot.bound_sessions;
+    else
+      ++snapshot.unbound_sessions;
+  }
+  for (const auto *companions : {&g_companions, &g_native_companions})
+    for (const auto &companion : *companions)
+      if (companion.pid > 0) {
+        ++snapshot.companions;
+        if (companion.starting)
+          ++snapshot.starting_companions;
+      }
+  snapshot.terminating_companions =
+      static_cast<uint32_t>(g_terminating_companions.size());
+  snapshot.poll_returns = g_poll_returns;
+  snapshot.poll_timeouts = g_poll_timeouts;
+  return snapshot;
+}
+
+void send_health(int client) {
+  struct ucred credentials{};
+  socklen_t size = sizeof(credentials);
+  if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &credentials, &size) != 0 ||
+      size != sizeof(credentials) || credentials.uid != 0)
+    return;
+  const auto snapshot = daemon_health_snapshot();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+  const auto *data = reinterpret_cast<const unsigned char *>(&snapshot);
+  size_t sent = 0;
+  while (sent < sizeof(snapshot)) {
+    const ssize_t count = send(client, data + sent, sizeof(snapshot) - sent,
+                               MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (count > 0) {
+      sent += static_cast<size_t>(count);
+      continue;
+    }
+    if (count == 0 ||
+        (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK))
+      return;
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0)
+      return;
+    pollfd descriptor{client, POLLOUT, 0};
+    const int ready = poll(&descriptor, 1, static_cast<int>(remaining.count()));
+    if (ready < 0 && errno == EINTR)
+      continue;
+    if (ready <= 0 || (descriptor.revents & POLLOUT) == 0)
+      return;
+  }
+}
+
+bool request_uses_catalog(zygiskd::Request request) {
+  switch (request) {
+  case zygiskd::Request::GetModuleCount:
+  case zygiskd::Request::GetModuleFd:
+  case zygiskd::Request::GetModuleInfo:
+  case zygiskd::Request::GetModuleLoadState:
+  case zygiskd::Request::ConnectCompanion:
+  case zygiskd::Request::GetModuleDir:
+  case zygiskd::Request::GetNativeModuleCount:
+  case zygiskd::Request::GetNativeModuleInfo:
+  case zygiskd::Request::GetNativeModuleFd:
+  case zygiskd::Request::ConnectNativeCompanion:
+  case zygiskd::Request::OpenHyosControlSession:
+    return true;
+  default:
+    return false;
+  }
+}
+
 void handle_client(int client) {
 #if defined(YUKIZYGISK_RUNTIME_LOG)
   const ClientReader reader(client);
@@ -1832,8 +2097,16 @@ void handle_client(int client) {
   uint8_t op = 0;
   if (!read_client(&op, sizeof(op)))
     return;
+  const auto request = static_cast<zygiskd::Request>(op);
+  if (request_uses_catalog(request) && !g_catalog.publish()) {
+    DLOGE("module catalog publication failed: %s", strerror(errno));
+    return;
+  }
 
-  switch (static_cast<zygiskd::Request>(op)) {
+  switch (request) {
+  case zygiskd::Request::GetHealth:
+    send_health(client);
+    break;
   case zygiskd::Request::GetModuleCount: {
     uint32_t n = static_cast<uint32_t>(g_modules.size());
     write_exact(client, &n, sizeof(n));
@@ -2198,6 +2471,36 @@ int nl_listen() {
   return fd;
 }
 
+void handle_target_exit(const yz_target_exit_event &event,
+                        const RuntimeSnapshot *snapshot = nullptr) {
+  DLOGI("target exited pid=%u generation=%u kind=%u status=%u", event.event.pid,
+        event.generation, event.kind, event.event.appid);
+  if (event.kind != YZ_RUNTIME_KIND_NATIVE || event.abi != kRuntimeAbi ||
+      event.event.pid == 0 || event.event.pid > INT32_MAX ||
+      event.generation == 0 || event.start_boottime == 0 ||
+      event.observed_boottime < event.start_boottime)
+    return;
+  cancel_unbound_hyos_sessions(event);
+  g_crash_monitor.on_native_exit(
+      event,
+      native_exit_context(event,
+                          snapshot ? *snapshot : query_runtime_snapshot()),
+      0, 0, snapshot != nullptr);
+}
+
+std::vector<yz_target_exit_event> g_legacy_native_exits;
+
+void flush_legacy_native_exits() {
+  if (g_legacy_native_exits.empty())
+    return;
+  const auto snapshot = query_runtime_snapshot();
+  g_crash_monitor.begin_native_batch();
+  for (const auto &event : g_legacy_native_exits)
+    handle_target_exit(event, &snapshot);
+  g_legacy_native_exits.clear();
+  g_crash_monitor.flush_native();
+}
+
 bool nl_receive_one(int fd) {
   alignas(nlmsghdr) char buf[4096];
   sockaddr_nl sender{};
@@ -2205,8 +2508,13 @@ bool nl_receive_one(int fd) {
   const ssize_t got =
       recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT,
                reinterpret_cast<sockaddr *>(&sender), &sender_length);
-  if (got <= 0)
+  if (got <= 0) {
+    if (got < 0 && errno == ENOBUFS) {
+      DLOGI("netlink overflow; exit history remains readable");
+      return true;
+    }
     return got < 0 && errno == EINTR;
+  }
   if (sender_length != sizeof(sender) || sender.nl_family != AF_NETLINK ||
       sender.nl_pid != 0)
     return true;
@@ -2233,6 +2541,16 @@ bool nl_receive_one(int fd) {
         (void)yzpolicy::refresh(true);
       } else if (ev->type == YZ_EV_SAFEMODE) {
         DLOGI("safemode event pid=%u crashes=%u", ev->pid, ev->appid);
+      } else if (ev->type == YZ_EV_TARGET_EXIT) {
+        if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(yz_target_exit_event))) {
+          yz_target_exit_event event{};
+          memcpy(&event, ev, sizeof(event));
+          if (!g_exit_history.enabled()) {
+            if (g_legacy_native_exits.size() == YZ_EXIT_HISTORY_MAX)
+              flush_legacy_native_exits();
+            g_legacy_native_exits.push_back(event);
+          }
+        }
       } else if (ev->type == YZ_EV_ZYGOTE_EXIT) {
         if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(yz_zygote_exit_event))) {
           yz_zygote_exit_event event{};
@@ -2248,14 +2566,21 @@ bool nl_receive_one(int fd) {
           status.version = YZ_VIOLA_VERSION;
           if (yzhost::ctl(YZ_IOCTL_VIOLA_STATUS, &status) != 0)
             return false;
-          stop_compat_daemon(g_compat_pid);
-          g_compat_pid = spawn_compat_daemon();
+          int recovery_error = 0;
+          if (!reap_compat_for_recovery()) {
+            recovery_error = errno != 0 ? -errno : -EIO;
+          } else {
+            errno = 0;
+            g_compat_pid = spawn_compat_daemon();
+            if (g_compat_pid <= 0)
+              recovery_error = errno != 0 ? -errno : -EIO;
+          }
           yz_viola_recover_cmd done{};
           done.size = sizeof(done);
           done.version = YZ_VIOLA_VERSION;
           done.epoch = status.epoch;
           done.generation = status.generation;
-          done.result = g_compat_pid > 0 ? 0 : -EIO;
+          done.result = recovery_error;
           if (yzhost::ctl(YZ_IOCTL_VIOLA_FINISH_RECOVERY, &done) != 0)
             DLOGE("compat recovery completion rejected: %s", strerror(errno));
           DLOGI("explicit compat recovery: pid=%d result=%d", g_compat_pid,
@@ -2279,6 +2604,7 @@ bool nl_receive_one(int fd) {
 void nl_drain(int fd) {
   while (nl_receive_one(fd)) {
   }
+  flush_legacy_native_exits();
 }
 
 uint64_t resolve_linker_sym(const char *path, const char *want) {
@@ -2407,10 +2733,18 @@ int run_daemon() {
     return 1;
   }
 
+  g_start_ticks = yukizygisk::health::process_start_ticks(getpid());
+  g_lifetime_lock = yukizygisk::health::lock_daemon(kRuntimeAbi);
+  if (g_start_ticks == 0 || g_lifetime_lock < 0) {
+    DLOGE("daemon lifetime lock unavailable: %s", strerror(errno));
+    notify_ready(ready_fd, false);
+    return 1;
+  }
+
   int srv = bind_listen();
   if (srv < 0) {
-    DLOGI("@%s already owned by another zygiskd; refusing duplicate start",
-          zygiskd::kSocketName);
+    const int bind_errno = errno;
+    DLOGE("daemon socket unavailable: %s", strerror(bind_errno));
     notify_ready(ready_fd, false);
     return 1;
   }
@@ -2444,10 +2778,15 @@ int run_daemon() {
     return 1;
   }
 
-#if defined(YUKIZYGISK_RUNTIME_LOG)
-  rescan_modules();
-#else
-  rescan_modules();
+  if (!rescan_modules(true)) {
+    close(nlfd);
+    close(srv);
+    notify_ready_code(ready_fd, g_catalog.reboot_required()
+                                    ? yukizygisk::health::kRebootRequired
+                                    : yukizygisk::health::kFailed);
+    return 1;
+  }
+#if !defined(YUKIZYGISK_RUNTIME_LOG)
   read_yzconfig();
 #endif
   if (!send_dlopen_offset()) {
@@ -2462,10 +2801,13 @@ int run_daemon() {
   if (needs_compat_daemon()) {
     g_compat_pid = spawn_compat_daemon();
     if (g_compat_pid < 0) {
-      DLOGE("zygiskd32 failed to start");
+      const int compat_error = errno;
+      DLOGE("zygiskd32 failed to start: %s", strerror(compat_error));
       close(nlfd);
       close(srv);
-      notify_ready(ready_fd, false);
+      notify_ready_code(ready_fd, compat_error == EUCLEAN
+                                      ? yukizygisk::health::kRebootRequired
+                                      : yukizygisk::health::kFailed);
       return 1;
     }
   } else {
@@ -2491,6 +2833,8 @@ int run_daemon() {
 
   g_crash_monitor.start("/data/adb/yukizygisk/diagnostics/current",
                         kRuntimeAbi);
+  g_exit_history.start(true);
+  g_exit_history.drain(query_runtime_snapshot, cancel_unbound_hyos_sessions);
   DLOGI("zygiskd up: unix @%s, netlink proto=%d, modules=%s, config=%s, "
         "policy=%s",
         zygiskd::kSocketName, YZ_NETLINK_PROTO, yzhost::modules_dir().c_str(),
@@ -2513,6 +2857,7 @@ int run_daemon() {
 #endif
     reap_terminating_companions();
     g_crash_monitor.tick();
+    g_exit_history.retry();
     std::vector<pollfd> poll_fds;
     std::vector<uint32_t> module_companion_indices;
     std::vector<uint32_t> native_companion_indices;
@@ -2524,10 +2869,16 @@ int run_daemon() {
     poll_fds.push_back({nlfd, POLLIN, 0});
     const size_t tombstone_watch_index = poll_fds.size();
     poll_fds.push_back({g_crash_monitor.fd(), POLLIN, 0});
+    const size_t history_index = poll_fds.size();
+    poll_fds.push_back({g_exit_history.fd(), POLLIN, 0});
     const size_t hyos_session_offset = poll_fds.size();
     for (const auto &session : g_hyos_sessions)
       poll_fds.push_back({session.session, POLLIN, 0});
     int poll_timeout = g_crash_monitor.timeout_ms();
+    const int history_timeout = g_exit_history.timeout_ms();
+    if (history_timeout >= 0)
+      poll_timeout = poll_timeout < 0 ? history_timeout
+                                      : std::min(poll_timeout, history_timeout);
     const auto now = std::chrono::steady_clock::now();
     const size_t module_companion_offset = poll_fds.size();
     for (uint32_t index = 0; index < g_companions.size(); ++index) {
@@ -2583,7 +2934,9 @@ int run_daemon() {
                        : std::min(poll_timeout, description_timeout);
 #endif
 
-    if (poll(poll_fds.data(), poll_fds.size(), poll_timeout) < 0) {
+    const int poll_result =
+        poll(poll_fds.data(), poll_fds.size(), poll_timeout);
+    if (poll_result < 0) {
       if (errno == EINTR)
         continue;
       DLOGE("poll failed: %s; exiting", strerror(errno));
@@ -2592,8 +2945,12 @@ int run_daemon() {
 #endif // #if defined(__LP64__)
       return 1;
     }
-    if ((poll_fds[0].revents | poll_fds[1].revents) &
-        (POLLERR | POLLHUP | POLLNVAL)) {
+    if (g_poll_returns != UINT64_MAX)
+      ++g_poll_returns;
+    if (poll_result == 0 && g_poll_timeouts != UINT64_MAX)
+      ++g_poll_timeouts;
+    if ((poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+        (poll_fds[1].revents & (POLLHUP | POLLNVAL))) {
       DLOGE("daemon channel failed; exiting");
 #if defined(__LP64__)
       stop_compat_daemon(g_compat_pid);
@@ -2627,6 +2984,11 @@ int run_daemon() {
 
     // Apply crash decisions before serving new module image requests.
     nl_drain(nlfd);
+    if (poll_fds[history_index].revents & POLLNVAL)
+      g_exit_history.fail(EBADF);
+    else if (poll_fds[history_index].revents & (POLLIN | POLLERR | POLLHUP))
+      g_exit_history.drain(query_runtime_snapshot,
+                           cancel_unbound_hyos_sessions);
 #if defined(__LP64__)
     if (poll_fds[1].revents & POLLIN)
       next_description_check =
