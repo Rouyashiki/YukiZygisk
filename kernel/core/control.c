@@ -28,14 +28,15 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
-#include "feature/api.h"
-#include "core/bootstrap.h"
 #include "core/auth.h"
+#include "core/bootstrap.h"
 #include "core/control.h"
+#include "core/patch_transaction.h"
+#include "feature/api.h"
 #include "host/host.h"
 #include "host/runtime.h"
-#include "uapi/yukizygisk.h"
 #include "uapi/viola.h"
+#include "uapi/yukizygisk.h"
 
 static atomic_t yz_control_available = ATOMIC_INIT(0);
 static DECLARE_RWSEM(yz_control_sem);
@@ -539,6 +540,54 @@ static int yz_ioctl_patch_text(void __user *arg)
 	return 0;
 }
 
+static int yz_patch_v2_read(void *context, unsigned long address, void *buffer,
+                            unsigned int length) {
+  return access_process_vm(context, address, buffer, length, FOLL_FORCE);
+}
+
+static int yz_patch_v2_write(void *context, unsigned long address, void *buffer,
+                             unsigned int length) {
+  return access_process_vm(context, address, buffer, length,
+                           FOLL_FORCE | FOLL_WRITE);
+}
+
+static int yz_ioctl_patch_text_v2(void __user *arg) {
+  struct yz_patch_text_v2_cmd cmd;
+  struct task_struct *task;
+  u8 before[YZ_PATCH_TEXT_MAX];
+  u8 after[YZ_PATCH_TEXT_MAX];
+  struct yz_patch_io io;
+  int ret;
+
+  if (copy_from_user(&cmd, arg, sizeof(cmd)))
+    return -EFAULT;
+  if (!cmd.len || cmd.len > YZ_PATCH_TEXT_MAX || !cmd.addr ||
+      cmd.addr >= TASK_SIZE || cmd.addr + cmd.len < cmd.addr ||
+      cmd.addr + cmd.len > TASK_SIZE ||
+      (cmd.addr & (PAGE_SIZE - 1)) + cmd.len > PAGE_SIZE)
+    return -EINVAL;
+
+  cmd.result = YZ_PATCH_V2_REJECTED;
+  rcu_read_lock();
+  task = get_pid_task(find_vpid(cmd.pid), PIDTYPE_PID);
+  rcu_read_unlock();
+  if (!task)
+    return -ESRCH;
+  ret = yz_auth_target_task(task);
+  if (ret)
+    goto out;
+
+  io.context = task;
+  io.read = yz_patch_v2_read;
+  io.write = yz_patch_v2_write;
+  cmd.result =
+      yz_patch_transaction(&io, (unsigned long)cmd.addr, cmd.len, cmd.expected,
+                           cmd.replacement, before, after);
+out:
+  put_task_struct(task);
+  return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+}
+
 static long yukizygisk_ioctl_dispatch(struct file *file,
 				      unsigned int request, unsigned long arg)
 {
@@ -564,6 +613,8 @@ static long yukizygisk_ioctl_dispatch(struct file *file,
 		return yz_ioctl_unmap_self(uarg);
 	case YZ_IOCTL_PATCH_TEXT:
 		return yz_ioctl_patch_text(uarg);
+	case YZ_IOCTL_PATCH_TEXT_V2:
+		return yz_ioctl_patch_text_v2(uarg);
 	case YZ_IOCTL_SET_NATIVE_TARGETS:
 		return yz_ioctl_set_native_targets(uarg);
 	case YZ_IOCTL_RESTORE_NATIVE_LOAD_POLICY:

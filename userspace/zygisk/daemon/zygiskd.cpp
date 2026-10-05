@@ -198,13 +198,13 @@ int claim_control_fd() {
             fcntl(g_control_fd, F_SETFD, flags | FD_CLOEXEC) == 0 &&
             ioctl(g_control_fd, YZ_IOCTL_VIOLA_CLAIM) == 0 &&
             ioctl(g_control_fd, YZ_IOCTL_VIOLA_STATUS, &status) == 0;
-  if (ok && (status.size != sizeof(status) ||
-             status.version != YZ_VIOLA_VERSION ||
-             status.profile != VIOLA_PROFILE || status.role != kRole ||
-             status.owner_pid != static_cast<uint32_t>(getpid()) ||
-             !status.catalog_ready ||
-             memcmp(status.release_id, kReleaseId, sizeof(kReleaseId)) != 0 ||
-             memcmp(status.trust_id, kTrustId, sizeof(kTrustId)) != 0)) {
+  if (ok &&
+      (status.size != sizeof(status) || status.version != YZ_VIOLA_VERSION ||
+       status.profile != VIOLA_PROFILE || status.role != kRole ||
+       status.owner_pid != static_cast<uint32_t>(getpid()) ||
+       !status.catalog_ready ||
+       memcmp(status.release_id, kReleaseId, sizeof(kReleaseId)) != 0 ||
+       memcmp(status.trust_id, kTrustId, sizeof(kTrustId)) != 0)) {
     errno = EKEYREJECTED;
     ok = false;
   }
@@ -447,16 +447,21 @@ pid_t spawn_compat_daemon() {
   char control_text[16]{};
   char ready_text[16]{};
   format_descriptor(ready[1], ready_text);
-  char *args[] = {viola_path.data(), const_cast<char *>("launch-compat"),
-                  const_cast<char *>("--module-dir"), module_dir.data(),
-                  const_cast<char *>("--control-fd"), control_text,
-                  const_cast<char *>("--ready-fd"), ready_text, nullptr};
+  char *args[] = {viola_path.data(),
+                  const_cast<char *>("launch-compat"),
+                  const_cast<char *>("--module-dir"),
+                  module_dir.data(),
+                  const_cast<char *>("--control-fd"),
+                  control_text,
+                  const_cast<char *>("--ready-fd"),
+                  ready_text,
+                  nullptr};
   std::string module_env = "YUKIZYGISK_MODULE_DIR=" + module_dir;
   std::string modules_env = "YUKIZYGISK_MODULES_DIR=" + yzhost::modules_dir();
   std::string config_env = "YUKIZYGISK_CONFIG=" + yzhost::config_path();
   char *env[] = {const_cast<char *>("PATH=/system/bin:/system/xbin"),
-                module_env.data(), modules_env.data(), config_env.data(),
-                nullptr};
+                 module_env.data(), modules_env.data(), config_env.data(),
+                 nullptr};
   const pid_t parent_pid = getpid();
   pid_t pid = fork();
   if (pid == 0) {
@@ -492,10 +497,9 @@ pid_t spawn_compat_daemon() {
   command.child_pid = static_cast<uint32_t>(pid);
   command.viola_fd = viola_fd;
   command.control_fd = -1;
-  bool delegated =
-      yzhost::ctl(YZ_IOCTL_VIOLA_DELEGATE, &command) == 0 &&
-      command.control_fd >= 0 &&
-      send_fd_nonblocking(delegation[0], command.control_fd);
+  bool delegated = yzhost::ctl(YZ_IOCTL_VIOLA_DELEGATE, &command) == 0 &&
+                   command.control_fd >= 0 &&
+                   send_fd_nonblocking(delegation[0], command.control_fd);
   if (command.control_fd >= 0)
     close(command.control_fd);
   close(viola_fd);
@@ -511,9 +515,10 @@ pid_t spawn_compat_daemon() {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
   for (;;) {
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               deadline - std::chrono::steady_clock::now())
-                               .count();
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now())
+            .count();
     if (remaining <= 0)
       break;
     poll_result = poll(&pfd, 1, static_cast<int>(remaining));
@@ -1710,7 +1715,33 @@ bool patch_text_for_pid(pid_t pid, uint64_t address, uint32_t length,
   command.len = length;
   command.addr = address;
   memcpy(command.bytes, bytes, length);
-  return yzhost::ctl(YZ_IOCTL_PATCH_TEXT, &command) == 0;
+  const bool applied = yzhost::ctl(YZ_IOCTL_PATCH_TEXT, &command) == 0;
+  return applied;
+}
+
+uint8_t patch_text_v2_for_pid(pid_t pid, uint64_t address, uint32_t length,
+                              const uint8_t *expected,
+                              const uint8_t *replacement) {
+  if (pid <= 0 || expected == nullptr || replacement == nullptr ||
+      length == 0 || length > YZ_PATCH_TEXT_MAX)
+    return YZ_PATCH_V2_REJECTED;
+  yz_patch_text_v2_cmd command{};
+  command.pid = static_cast<uint32_t>(pid);
+  command.len = length;
+  command.addr = address;
+  memcpy(command.expected, expected, length);
+  memcpy(command.replacement, replacement, length);
+  if (yzhost::ctl(YZ_IOCTL_PATCH_TEXT_V2, &command) != 0) {
+    const int error = errno;
+    DLOGE("checked text patch ioctl failed pid=%d addr=0x%llx len=%u errno=%d",
+          pid, static_cast<unsigned long long>(address), length, error);
+    return error == ENOTTY || error == EINVAL ? YZ_PATCH_V2_REJECTED
+                                              : YZ_PATCH_V2_INDETERMINATE;
+  }
+  if (command.result == YZ_PATCH_V2_INDETERMINATE)
+    DLOGE("checked text patch indeterminate pid=%d addr=0x%llx len=%u", pid,
+          static_cast<unsigned long long>(address), length);
+  return static_cast<uint8_t>(command.result);
 }
 
 ssize_t receive_hyos_session_packet(int session, uint8_t *buffer,
@@ -1807,8 +1838,9 @@ bool bind_hyos_session_child(HyosControlSessionContext &context,
 
 bool handle_hyos_control_session(HyosControlSessionContext &context) {
   const int session = context.session;
-  constexpr size_t kFrameCapacity =
-      sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + YZ_PATCH_TEXT_MAX;
+  constexpr size_t kFrameCapacity = sizeof(uint8_t) + sizeof(uint64_t) +
+                                    sizeof(uint32_t) +
+                                    (size_t{2} * YZ_PATCH_TEXT_MAX);
   uint8_t frame[kFrameCapacity];
   struct ucred credentials{};
   const ssize_t size =
@@ -1843,6 +1875,25 @@ bool handle_hyos_control_session(HyosControlSessionContext &context) {
             ? 1
             : 0;
     return send_hyos_response(session, ok);
+  }
+  if (request == zygiskd::Request::PatchTextV2) {
+    constexpr size_t kHeaderSize =
+        sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t);
+    if (size < static_cast<ssize_t>(kHeaderSize))
+      return false;
+    uint64_t address = 0;
+    uint32_t length = 0;
+    memcpy(&address, frame + sizeof(uint8_t), sizeof(address));
+    memcpy(&length, frame + sizeof(uint8_t) + sizeof(address), sizeof(length));
+    const bool valid_size =
+        length > 0 && length <= YZ_PATCH_TEXT_MAX &&
+        size == static_cast<ssize_t>(kHeaderSize + (size_t{2} * length));
+    const uint8_t result =
+        valid_size ? patch_text_v2_for_pid(credentials.pid, address, length,
+                                           frame + kHeaderSize,
+                                           frame + kHeaderSize + length)
+                   : YZ_PATCH_V2_REJECTED;
+    return send_hyos_response(session, result);
   }
   if (request == zygiskd::Request::ReportHyosCallback) {
     if (size != static_cast<ssize_t>(sizeof(uint8_t) + sizeof(uint32_t)))
@@ -2241,6 +2292,25 @@ void handle_client(int client) {
             ? 1
             : 0;
     write_exact(client, &ok, sizeof(ok));
+    break;
+  }
+  case zygiskd::Request::PatchTextV2: {
+    uint64_t addr = 0;
+    uint32_t len = 0;
+    if (!read_client(&addr, sizeof(addr)) || !read_client(&len, sizeof(len)) ||
+        len == 0 || len > YZ_PATCH_TEXT_MAX)
+      break;
+    uint8_t expected[YZ_PATCH_TEXT_MAX];
+    uint8_t replacement[YZ_PATCH_TEXT_MAX];
+    if (!read_client(expected, len) || !read_client(replacement, len))
+      break;
+    struct ucred cr{};
+    socklen_t crlen = sizeof(cr);
+    const uint8_t result =
+        getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cr, &crlen) == 0
+            ? patch_text_v2_for_pid(cr.pid, addr, len, expected, replacement)
+            : YZ_PATCH_V2_REJECTED;
+    write_exact(client, &result, sizeof(result));
     break;
   }
   case zygiskd::Request::Log: {
@@ -2770,7 +2840,8 @@ int run_daemon() {
 #endif
   yz_root_status_cmd root_status{};
   if (!yzhost::get_root_status(&root_status) ||
-      !yzpolicy::setup(yzhost::g_control_fd, root_status, sizeof(void *) == 8)) {
+      !yzpolicy::setup(yzhost::g_control_fd, root_status,
+                       sizeof(void *) == 8)) {
     DLOGE("root policy unavailable; exiting");
     close(nlfd);
     close(srv);

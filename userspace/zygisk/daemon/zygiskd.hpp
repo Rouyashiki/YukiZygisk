@@ -39,6 +39,7 @@ enum class Request : uint8_t {
   ReportZygoteModule = 26,
   GetModuleLoadState = 27, // -> uint8_t: 0 available, 1 suspended, 2 invalid.
   GetHealth = 28,          // -> authenticated root-only daemon health snapshot.
+  PatchTextV2 = 29,
 };
 
 enum class LogLevel : uint8_t {

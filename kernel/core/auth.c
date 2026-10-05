@@ -672,6 +672,7 @@ int yz_auth_begin(struct yz_auth_session *s, unsigned int request,
 	case YZ_IOCTL_UNMAP_PID:
 	case YZ_IOCTL_UNMAP_SELF:
 	case YZ_IOCTL_PATCH_TEXT:
+	case YZ_IOCTL_PATCH_TEXT_V2:
 	case YZ_IOCTL_RESTORE_NATIVE_LOAD_POLICY:
 	case YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY:
 	case YZ_IOCTL_REPORT_RUNTIME:
