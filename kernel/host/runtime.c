@@ -10,6 +10,7 @@
  */
 
 #include <linux/err.h>
+#include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/kallsyms.h>
 #include <linux/kprobes.h>
@@ -27,6 +28,13 @@
 #include "host/root_impl.h"
 #include "host/runtime.h"
 
+/* Android common KMI 5.10 still exports __close_fd(files, fd) */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+#define YZ_USE_LEGACY_CLOSE_FD 1
+#else
+#define YZ_USE_LEGACY_CLOSE_FD 0
+#endif
+
 unsigned long (*yz_kallsyms_lookup_name)(const char *name);
 struct file *(*yz_filp_open)(const char *filename, int flags, umode_t mode);
 int (*yz_filp_close)(struct file *file, fl_owner_t id);
@@ -42,7 +50,11 @@ static ssize_t (*yz_kernel_write_fn)(struct file *file, const void *buf,
 static int (*yz_kern_path_fn)(const char *name, unsigned int flags,
 			      struct path *path);
 static typeof(&path_put) yz_path_put_fn;
+#ifdef YZ_USE_LEGACY_CLOSE_FD
+static int (*yz_close_fd_fn)(struct files_struct *files, unsigned int fd);
+#else
 static int (*yz_close_fd_fn)(unsigned int fd);
+#endif
 static int (*yz_task_work_add_fn)(struct task_struct *task,
 				  struct callback_head *twork,
 				  enum task_work_notify_mode mode);
@@ -388,7 +400,11 @@ void yz_path_put(const struct path *path)
 
 YZ_INDIRECT_CALL int yz_close_fd(unsigned int fd)
 {
+#if YZ_USE_LEGACY_CLOSE_FD
+	return yz_close_fd_fn ? yz_close_fd_fn(current->files, fd): -ENOENT;
+#else
 	return yz_close_fd_fn ? yz_close_fd_fn(fd) : -ENOENT;
+#endif
 }
 
 noinline struct file *yz_get_current_exe_file(void)
@@ -442,7 +458,11 @@ static int yz_resolve_runtime_symbols(void)
 		(void *)yz_lookup_callable_quiet("kernel_write");
 	yz_kern_path_fn = (void *)yz_lookup_callable_quiet("kern_path");
 	yz_path_put_fn = (void *)yz_lookup_callable_quiet("path_put");
+#if YZ_USE_LEGACY_CLOSE_FD
+	yz_close_fd_fn = (void *)yz_lookup_callable_quiet("__close_fd");
+#else
 	yz_close_fd_fn = (void *)yz_lookup_callable_quiet("close_fd");
+#endif
 #if YZ_USE_KCFI
 	yz_task_work_cancel_match_fn =
 	    (typeof(yz_task_work_cancel_match_fn))yz_lookup_callable(
