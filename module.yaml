@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/KernelSU-Modules/tools/main/schemas/module.schema.json
+schemaVersion: 1
+id: yukizygisk
+name: YukiZygisk
+summary: Standalone kernel-level Zygisk
+description: README.md
+license: Apache-2.0 OR GPL-2.0
+homepage: https://github.com/Rouyashiki/YukiZygisk
+support: https://github.com/Rouyashiki/YukiZygisk/issues
+tags: [zygisk, system]
+
+authors:
+  - name: Anatdx
+    url: https://github.com/Rouyashiki
+
+compatibility:
+  androidMinApi: 31
+  architectures: [arm64-v8a]
+
+release:
+  assetPattern: YukiZygisk-*-all-kmi-arm64-v8a.zip

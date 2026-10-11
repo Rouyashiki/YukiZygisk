@@ -308,7 +308,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: package
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -351,9 +351,9 @@ jobs:
           tag_name: ci-${{ github.run_id }}
           target_commitish: ${{ github.sha }}
           name: YukiZygisk ${{ steps.package.outputs.version }} (CI ${{ github.run_number }})
-          prerelease: ${{ github.ref != 'refs/heads/main' }}
-          make_latest: ${{ github.ref == 'refs/heads/main' && 'legacy' || 'false' }}
-          overwrite_files: true
+          prerelease: false
+          make_latest: legacy
+          overwrite_files: false
           fail_on_unmatched_files: true
           files: |
             dist/YukiZygisk-*-all-kmi-arm64-v8a.zip
@@ -370,7 +370,7 @@ jobs:
   publish-update:
     name: Publish Cloudflare update feed
     needs: release
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
       group: yukizygisk-updates-main
