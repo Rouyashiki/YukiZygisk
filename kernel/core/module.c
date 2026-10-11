@@ -20,6 +20,7 @@
 #include "core/auth.h"
 #include "core/control.h"
 #include "core/lifecycle.h"
+#include "core/module_sysfs.h"
 #include "host/host.h"
 #include "uapi/yukizygisk.h"
 #include <viola.h>
@@ -219,6 +220,8 @@ static int __init yukizygisk_init(void)
 		yz_stage_bootstrap_active = true;
 		pr_info("yukizygisk: init step bootstrap done\n");
 	}
+
+	yz_module_sysfs_hide();
 
 	pr_info("yukizygisk: standalone LKM initialized\n");
 	return 0;

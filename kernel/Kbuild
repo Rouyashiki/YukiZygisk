@@ -11,6 +11,7 @@ obj-m += yukizygisk.o
 
 yukizygisk-objs := \
 	core/module.o \
+	core/module_sysfs.o \
 	core/bootstrap.o \
 	core/control.o \
 	core/auth.o \
@@ -57,6 +58,19 @@ ccflags-y += -Wno-declaration-after-statement
 ccflags-y += -Wno-missing-braces
 ccflags-y += -Wno-unused-function
 ccflags-y += -Wno-unused-variable
+
+# Module sysfs metadata is private to the target kernel. Probe its allocation
+# layout so backports use the matching cleanup, independently of the version.
+yz-module-sysfs-src := $(srctree)/kernel/module/sysfs.c
+ifeq ($(wildcard $(yz-module-sysfs-src)),)
+yz-module-sysfs-src := $(srctree)/kernel/module.c
+endif
+ifneq ($(shell sed -n '/^struct module_notes_attrs {/,/^};/p' $(yz-module-sysfs-src) | grep -c 'struct attribute_group grp'),0)
+CFLAGS_core/module_sysfs.o += -DYZ_MODULE_NOTES_USE_GROUP
+endif
+ifneq ($(shell grep -c 'kfree(sect_attrs->grp.bin_attrs)' $(yz-module-sysfs-src)),0)
+CFLAGS_core/module_sysfs.o += -DYZ_MODULE_SECT_SEPARATE_BIN_ATTRS
+endif
 
 ifneq ($(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h; echo $$?),0)
 ccflags-y += -DKSU_HAS_NEW_DCACHE_FLUSH
