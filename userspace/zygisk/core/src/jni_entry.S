@@ -6,6 +6,10 @@
  * context. Each stub records the same context into g_yz_ret_ctx and then
  * tail-branches to the C++ wrapper, which lets yz_self_unmap_tail restore a
  * continuation outside the core before unmapping it.
+ *
+ * The saved layout matches yz_self_unmap_tail:
+ *   AArch64  x19-x28, x29, x30, sp, d8-d15
+ *   ARM32    r4-r11, lr, sp, d8-d15
  */
 
 .section .note.GNU-stack,"",%progbits
@@ -42,6 +46,38 @@
     .size \name, .-\name
 .endm
 
+#elif defined(__arm__)
+
+.syntax unified
+.arm
+.text
+.balign 4
+
+.macro YZ_JNI_ENTRY name, index
+    .global \name
+    .hidden \name
+    .type \name, %function
+\name:
+    ldr  r12, 7f
+4:  add  r12, pc, r12
+    stmia r12!, {r4-r11}
+    str  lr, [r12], #4
+    str  sp, [r12], #4
+    vstmia r12, {d8-d15}
+    ldr  r12, 8f
+5:  add  r12, pc, r12
+    ldr  r12, [r12, #(\index * 4)]
+    bx   r12
+    .balign 4
+7:  .word g_yz_ret_ctx - (4b + 8)
+8:  .word g_yz_jni_targets - (5b + 8)
+    .size \name, .-\name
+.endm
+
+#endif
+
+#if defined(__aarch64__) || defined(__arm__)
+
 YZ_JNI_ENTRY yz_jni_entry_0, 0
 YZ_JNI_ENTRY yz_jni_entry_1, 1
 YZ_JNI_ENTRY yz_jni_entry_2, 2
@@ -50,5 +86,7 @@ YZ_JNI_ENTRY yz_jni_entry_4, 4
 YZ_JNI_ENTRY yz_jni_entry_5, 5
 YZ_JNI_ENTRY yz_jni_entry_6, 6
 YZ_JNI_ENTRY yz_jni_entry_7, 7
+
+.ltorg
 
 #endif

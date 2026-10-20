@@ -48,7 +48,7 @@ template <class F> struct Hook {
   F *original = nullptr;
 };
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__arm__)
 extern "C" {
 void yz_jni_entry_0();
 void yz_jni_entry_1();
@@ -340,7 +340,7 @@ enum ZygoteMethodIndex : size_t {
 bool g_app_specialize_hooks_complete = false;
 bool g_zygote_uses_fallback = false;
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__arm__)
 static_assert(kZygoteMethodCount == 8, "jni_entry.S provides eight stubs");
 /* Installed through RegisterNatives so the caller context is captured. */
 void *const kYzJniEntryTable[kZygoteMethodCount] = {
@@ -867,7 +867,7 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
     // Registering bypasses the inline capture trampoline, so route the zygote
     // table through an entry stub that records the caller context first.
     void *entry = m.fnPtr;
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__arm__)
     if (prefer_register && methods == g_zygote_methods.data() &&
         i < static_cast<int>(kZygoteMethodCount)) {
       g_yz_jni_targets[i] = m.fnPtr;
@@ -1053,6 +1053,9 @@ bool yz_capture_ready() {
 #if defined(__aarch64__)
   // g_yz_ret_ctx: x19-x28, x29, x30, sp, then d8-d15.
   return g_yz_ret_ctx[11] != 0 && g_yz_ret_ctx[12] != 0;
+#elif defined(__arm__)
+  // g_yz_ret_ctx: r4-r11, lr, sp, then d8-d15.
+  return g_yz_ret_ctx[8] != 0 && g_yz_ret_ctx[9] != 0;
 #else
   return false;
 #endif
@@ -1062,12 +1065,14 @@ bool yz_capture_ready() {
 bool yz_capture_outside(uintptr_t base, size_t span) {
 #if defined(__aarch64__)
   const uintptr_t resume = static_cast<uintptr_t>(g_yz_ret_ctx[11]);
-  return resume < base || resume - base >= span;
+#elif defined(__arm__)
+  const uintptr_t resume = static_cast<uintptr_t>(g_yz_ret_ctx[8]);
 #else
   (void)base;
   (void)span;
   return false;
 #endif
+  return resume < base || resume - base >= span;
 }
 
 /* Drop libandroid_runtime header pages faulted by symbol scans. */
