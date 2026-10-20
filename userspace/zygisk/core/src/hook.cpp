@@ -12,18 +12,20 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <android/fdsan.h>
 #include <array>
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <malloc.h>
 #include <sched.h>
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
-#include <sys/prctl.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 #include <vector>
@@ -37,7 +39,9 @@ namespace {
 
 constexpr char kZygoteInit[] = "com.android.internal.os.ZygoteInit";
 constexpr char kZygote[] = "com/android/internal/os/Zygote";
+constexpr char kZygoteInitClass[] = "com/android/internal/os/ZygoteInit";
 constexpr char kAndroidRuntime[] = "/libandroid_runtime.so";
+constexpr char kArtPostForkChild[] = "_ZN3art3jit3Jit19PostForkChildActionEbb";
 
 bool ends_with(std::string_view value, std::string_view suffix) {
   return value.size() >= suffix.size() &&
@@ -68,7 +72,10 @@ __attribute__((visibility("hidden"))) void *g_yz_jni_targets[10] = {};
 #endif
 
 Hook<char *(const char *)> g_strdup;
+Hook<void(void *, bool, bool)> g_art_post_fork_child;
 bool g_jni_hooked = false;
+bool g_art_fork_hook_retired = true;
+pid_t g_zygote_pid = 0;
 
 void hook_zygote_jni();
 
@@ -84,6 +91,7 @@ struct RuntimeMapCache {
 };
 
 RuntimeMapCache g_runtime_maps;
+RuntimeMapCache g_art_maps;
 
 int find_runtime_header(dl_phdr_info *info, size_t, void *data) {
   if (info == nullptr || info->dlpi_name == nullptr ||
@@ -144,6 +152,108 @@ bool find_libandroid_runtime(dev_t &dev, ino_t &inode) {
   return true;
 }
 
+bool retire_art_fork_hook() {
+  const bool pending_committed = lsplt::CommitHookCached();
+  if (g_art_post_fork_child.original == nullptr)
+    return pending_committed;
+  if (!g_art_maps.ready ||
+      !lsplt::RegisterHook(
+          g_art_maps.dev, g_art_maps.inode, kArtPostForkChild,
+          reinterpret_cast<void *>(g_art_post_fork_child.original), nullptr))
+    return false;
+  return lsplt::CommitHookCached() && pending_committed;
+}
+
+bool reset_art_method_fd(void *jit, size_t jit_size, int fd) {
+  const uint64_t tag = android_fdsan_get_owner_tag(fd);
+  if (tag >> 56 != ANDROID_FDSAN_OWNER_TYPE_UNIQUE_FD)
+    return false;
+  constexpr uint64_t kAddressMask = (uint64_t{1} << 56) - 1;
+  const auto base = reinterpret_cast<uintptr_t>(jit);
+  const uint64_t address = tag & kAddressMask;
+  const uint64_t untagged_base = base & kAddressMask;
+  if (jit_size < sizeof(int) || address < untagged_base ||
+      address - untagged_base > jit_size - sizeof(int) ||
+      address % alignof(int) != 0)
+    return false;
+
+  // fdsan identifies the owning unique_fd, avoiding a versioned Jit offset.
+  auto *slot = static_cast<unsigned char *>(jit) + (address - untagged_base);
+  int owned_fd;
+  memcpy(&owned_fd, slot, sizeof(owned_fd));
+  if (owned_fd != fd)
+    return false;
+  const int invalid_fd = -1;
+  memcpy(slot, &invalid_fd, sizeof(invalid_fd));
+  android_fdsan_close_with_tag(fd, tag);
+  return true;
+}
+
+void hide_art_method_fds(void *jit) {
+  if (jit == nullptr || android_fdsan_close_with_tag == nullptr)
+    return;
+  DIR *dir = opendir("/proc/self/fd");
+  if (dir == nullptr)
+    return;
+  const size_t jit_size = malloc_usable_size(jit);
+  const int dir_fd = dirfd(dir);
+  while (dirent *entry = readdir(dir)) {
+    if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
+      continue;
+    char *end = nullptr;
+    const long value = strtol(entry->d_name, &end, 10);
+    if (end == nullptr || *end != '\0' || value < 0 || value > INT_MAX ||
+        value == dir_fd)
+      continue;
+    const int fd = static_cast<int>(value);
+    char target[128];
+    const ssize_t length =
+        readlinkat(dir_fd, entry->d_name, target, sizeof(target));
+    if (length <= 0 || static_cast<size_t>(length) == sizeof(target))
+      continue;
+    const std::string_view path(target, static_cast<size_t>(length));
+    if (path != "/memfd:/boot-image-methods.art" &&
+        path != "/memfd:/boot-image-methods.art (deleted)")
+      continue;
+    if (reset_art_method_fd(jit, jit_size, fd))
+      ZLOGI("closed inherited ART methods fd before child JIT setup");
+    else
+      ZLOGE("ART methods fd owner is unverified; leaving it intact");
+  }
+  closedir(dir);
+}
+
+void new_art_post_fork_child(void *jit, bool is_system_server, bool is_zygote) {
+  if (g_zygote_pid != 0 && getpid() != g_zygote_pid) {
+    const int saved_errno = errno;
+    // Clear ART's owner before it can queue MapBootImageMethodsTask. The
+    // child keeps its existing image pages; the parent's shared fd is intact.
+    hide_art_method_fds(jit);
+    errno = saved_errno;
+  }
+  g_art_post_fork_child.original(jit, is_system_server, is_zygote);
+}
+
+void hook_art_post_fork_child() {
+  for (const auto &map : lsplt::MapInfo::Scan()) {
+    if (map.offset != 0 || !(map.perms & PROT_READ) || map.dev == 0 ||
+        map.inode == 0 ||
+        (!ends_with(map.path, "/libart.so") &&
+         !ends_with(map.path, "/libartd.so")))
+      continue;
+    g_art_maps = {map.dev, map.inode, true};
+    g_art_fork_hook_retired = false;
+    if (!lsplt::RegisterHook(
+            map.dev, map.inode, kArtPostForkChild,
+            reinterpret_cast<void *>(new_art_post_fork_child),
+            reinterpret_cast<void **>(&g_art_post_fork_child.original)) ||
+        !lsplt::CommitHook() || g_art_post_fork_child.original == nullptr)
+      ZLOGE("ART post-fork hook unavailable; methods fd hiding is disabled");
+    return;
+  }
+  ZLOGE("ART library unavailable; methods fd hiding is disabled");
+}
+
 struct ZygiskContext {
   JNIEnv *env = nullptr;
   pid_t pid = -1; // <0 not forked; ==0 child; >0 zygote (parent)
@@ -158,17 +268,6 @@ int (*g_orig_fork)() = nullptr;
 bool is_isolated(int uid) {
   int app_id = uid % 100000;
   return app_id >= 90000 && app_id <= 99999;
-}
-
-/* A zygote process must keep the core so its children still run our stubs. */
-bool yz_process_is_zygote() {
-  char name[16] = {};
-  if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0)
-    return false;
-  const size_t len = strnlen(name, sizeof(name));
-  constexpr char kSuffix[] = "_zygote";
-  constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
-  return len >= kSuffixLen && strcmp(name + len - kSuffixLen, kSuffix) == 0;
 }
 
 int forked_decision(bool is_child, int uid) {
@@ -372,13 +471,12 @@ enum ZygoteMethodIndex : size_t {
   kSpecializeCgroup,
   kForkSystemServer,
   kInitNativeState,
-  kUnmountStorageOnInit,
+  kNativeZygoteInit,
   kZygoteMethodCount,
 };
 
 bool g_app_specialize_hooks_complete = false;
 bool g_zygote_uses_fallback = false;
-pid_t g_zygote_pid = 0;
 bool g_zygote_primary = false;
 
 #if defined(__aarch64__) || defined(__arm__)
@@ -844,16 +942,14 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
        ZLOGI("zygote native state: %s",
              g_zygote_primary ? "primary" : "secondary");
      })},
-    /* A specialized child reaches this right after storage unmount, before app
-     * code. The signature is stable, so it doubles as a fallback unmap point
-     * for processes whose specialize overload we failed to hook. */
-    {"nativeUnmountStorageOnInit", "()V",
+    // ZygoteInit calls this before applicationInit; childZygoteInit skips it.
+    {"nativeZygoteInit", "()V",
      reinterpret_cast<void *>(+[](JNIEnv *env, jclass clazz) -> void {
        reinterpret_cast<void (*)(JNIEnv *, jclass)>(
-           g_zygote_methods[kUnmountStorageOnInit].fnPtr)(env, clazz);
-       if (g_zygote_pid != 0 && getpid() != g_zygote_pid &&
-           !yz_process_is_zygote())
-         finish_app_child(env, true, false);
+           g_zygote_methods[kNativeZygoteInit].fnPtr)(env, clazz);
+       if (g_zygote_pid != 0 && getpid() != g_zygote_pid)
+         finish_app_child(env, true, is_isolated(getuid()),
+                          forked_decision(true, getuid()));
      })},
 }};
 
@@ -898,7 +994,8 @@ bool reflected_is_native(JNIEnv *env, jobject method) {
 }
 
 void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
-                      int count, yuki::ihook::UnhookMode mode, int owner) {
+                      int count, yuki::ihook::UnhookMode mode, int owner,
+                      size_t first_entry = 0) {
   jclass clazz = env->FindClass(clz);
   if (clazz == nullptr) {
     env->ExceptionClear();
@@ -954,10 +1051,12 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
     // table through an entry stub that records the caller context first.
     void *entry = m.fnPtr;
 #if defined(__aarch64__) || defined(__arm__)
-    if (prefer_register && methods == g_zygote_methods.data() &&
-        i < static_cast<int>(kZygoteMethodCount)) {
-      g_yz_jni_targets[i] = m.fnPtr;
-      entry = kYzJniEntryTable[i];
+    if (prefer_register && first_entry < kZygoteMethodCount &&
+        methods == g_zygote_methods.data() + first_entry &&
+        static_cast<size_t>(i) < kZygoteMethodCount - first_entry) {
+      const size_t index = first_entry + static_cast<size_t>(i);
+      g_yz_jni_targets[index] = m.fnPtr;
+      entry = kYzJniEntryTable[index];
     }
 #endif
 
@@ -1110,8 +1209,11 @@ void hook_zygote_jni() {
   }
   ZLOGI("fork hook armed (orig=%p)", reinterpret_cast<void *>(g_orig_fork));
   hook_jni_methods(env, kZygote, g_zygote_methods.data(),
-                   static_cast<int>(g_zygote_methods.size()),
+                   static_cast<int>(kNativeZygoteInit),
                    yuki::ihook::UnhookMode::DiscardCowPages, -1);
+  hook_jni_methods(
+      env, kZygoteInitClass, g_zygote_methods.data() + kNativeZygoteInit, 1,
+      yuki::ihook::UnhookMode::DiscardCowPages, -1, kNativeZygoteInit);
   const bool fork_hooked = g_zygote_methods[kForkLegacy].fnPtr != nullptr ||
                            g_zygote_methods[kForkSysprop].fnPtr != nullptr ||
                            g_zygote_methods[kForkFifo].fnPtr != nullptr ||
@@ -1124,6 +1226,7 @@ void hook_zygote_jni() {
       g_zygote_methods[kForkSystemServer].fnPtr != nullptr;
   g_app_specialize_hooks_complete = fork_hooked && specialize_hooked;
   g_zygote_pid = getpid();
+  hook_art_post_fork_child();
   yz_unmap_injection_stub();
   if (g_app_specialize_hooks_complete && system_server_hooked) {
     ZLOGI("zygote JNI takeover done");
@@ -1228,8 +1331,11 @@ bool zygisk_restore_module_hooks(JNIEnv *env, int owner) {
 
 /* Restore hooks before self-unmap. */
 bool zygisk_self_unhook(JNIEnv *env) {
+  if (!g_art_fork_hook_retired)
+    g_art_fork_hook_retired = retire_art_fork_hook();
   const bool lifecycle_restored = restore_jni_hooks(env, -1);
-  bool unhooked = lifecycle_restored && g_jni_hooks.empty();
+  bool unhooked =
+      lifecycle_restored && g_art_fork_hook_retired && g_jni_hooks.empty();
   dev_t dev = 0;
   ino_t inode = 0;
   if (find_libandroid_runtime(dev, inode)) {
