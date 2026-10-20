@@ -32,6 +32,7 @@
 #include <new>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -678,6 +679,25 @@ bool create_address_space(int fd, const uint8_t *source, size_t file_size,
   return true;
 }
 
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+/* ART labels its anonymous JIT code with an [anon:...] name; giving loaded
+ * images the same label keeps them out of the anonymous-executable class for
+ * /proc/self/maps readers. Naming is best-effort: kernels without
+ * CONFIG_ANON_VMA_NAME reject it and nothing else depends on it. */
+static void name_anonymous_code(void *address, size_t size) {
+  constexpr char kName[] = "dalvik-jit-code-cache";
+  (void)prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+              reinterpret_cast<unsigned long>(address),
+              static_cast<unsigned long>(size),
+              reinterpret_cast<unsigned long>(kName));
+}
+
 bool restore_anonymous_protections(ImageState *image) {
   if (image->memory.file_backed)
     return true;
@@ -696,9 +716,11 @@ bool restore_anonymous_protections(ImageState *image) {
     int protection = protection_for(ph.p_flags);
     if (mprotect(address, rounded, protection) != 0)
       return false;
-    if ((protection & PROT_EXEC) != 0)
+    if ((protection & PROT_EXEC) != 0) {
+      name_anonymous_code(address, rounded);
       __builtin___clear_cache(reinterpret_cast<char *>(address),
                               reinterpret_cast<char *>(address + rounded));
+    }
   }
   return true;
 }
