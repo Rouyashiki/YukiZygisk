@@ -832,15 +832,13 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
     record.mode = mode;
     record.original = orig;
     record.replacement = m.fnPtr;
-    // Tango translates the guest ARM32 native entry and may not execute an
-    // inline-patched ArtMethod body. Register the zygote replacement in ART's
-    // native table so the child specialization wrapper remains reachable.
-    const bool prefer_register =
-#ifdef __arm__
-        owner == -1;
-#else
-        false;
-#endif
+    // Zygote lifecycle hooks register through ART's native table instead of
+    // patching libandroid_runtime text: an inline patch COWs the text page in
+    // zygote, and every forked child then inherits it as shared-dirty
+    // executable memory. Tango additionally translates the guest ARM32 native
+    // entry and may not execute an inline-patched ArtMethod body, so the
+    // specialization wrapper must stay reachable through the native table.
+    const bool prefer_register = owner == -1;
     void *tramp = prefer_register
                       ? nullptr
                       : yuki::ihook::install(orig, m.fnPtr, &record.hook, false,
