@@ -10,6 +10,8 @@
 
 #include <jni.h>
 
+#include <cstdint>
+
 #include "zygisk.hpp"
 
 /* Early lifecycle hook. */
@@ -21,6 +23,8 @@ int zygisk_inject_decision(int uid);
 void zygisk_revert_mounts();
 bool zygisk_self_unhook(JNIEnv *env);
 bool zygisk_restore_module_hooks(JNIEnv *env, int owner);
+bool yz_capture_ready();
+bool yz_capture_outside(uintptr_t base, size_t span);
 void yz_drop_runtime_header_pages();
 bool zygisk_specialize_fully_inline_hooked();
 void zygisk_self_destruct(JNIEnv *env, bool isolated, bool revert_mounts);

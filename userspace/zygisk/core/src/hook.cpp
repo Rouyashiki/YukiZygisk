@@ -48,6 +48,22 @@ template <class F> struct Hook {
   F *original = nullptr;
 };
 
+#if defined(__aarch64__)
+extern "C" {
+void yz_jni_entry_0();
+void yz_jni_entry_1();
+void yz_jni_entry_2();
+void yz_jni_entry_3();
+void yz_jni_entry_4();
+void yz_jni_entry_5();
+void yz_jni_entry_6();
+void yz_jni_entry_7();
+
+/* Target slots read by the entry stubs in jni_entry.S. */
+__attribute__((visibility("hidden"))) void *g_yz_jni_targets[8] = {};
+}
+#endif
+
 Hook<char *(const char *)> g_strdup;
 bool g_jni_hooked = false;
 
@@ -323,6 +339,21 @@ enum ZygoteMethodIndex : size_t {
 
 bool g_app_specialize_hooks_complete = false;
 bool g_zygote_uses_fallback = false;
+
+#if defined(__aarch64__)
+static_assert(kZygoteMethodCount == 8, "jni_entry.S provides eight stubs");
+/* Installed through RegisterNatives so the caller context is captured. */
+void *const kYzJniEntryTable[kZygoteMethodCount] = {
+    reinterpret_cast<void *>(yz_jni_entry_0),
+    reinterpret_cast<void *>(yz_jni_entry_1),
+    reinterpret_cast<void *>(yz_jni_entry_2),
+    reinterpret_cast<void *>(yz_jni_entry_3),
+    reinterpret_cast<void *>(yz_jni_entry_4),
+    reinterpret_cast<void *>(yz_jni_entry_5),
+    reinterpret_cast<void *>(yz_jni_entry_6),
+    reinterpret_cast<void *>(yz_jni_entry_7),
+};
+#endif
 
 std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
     {"nativeForkAndSpecialize",
@@ -826,12 +857,6 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
       continue;
     }
 
-    JniHookRecord record;
-    record.owner = owner;
-    record.method = art;
-    record.mode = mode;
-    record.original = orig;
-    record.replacement = m.fnPtr;
     // Zygote lifecycle hooks register through ART's native table instead of
     // patching libandroid_runtime text: an inline patch COWs the text page in
     // zygote, and every forked child then inherits it as shared-dirty
@@ -839,6 +864,23 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
     // entry and may not execute an inline-patched ArtMethod body, so the
     // specialization wrapper must stay reachable through the native table.
     const bool prefer_register = owner == -1;
+    // Registering bypasses the inline capture trampoline, so route the zygote
+    // table through an entry stub that records the caller context first.
+    void *entry = m.fnPtr;
+#if defined(__aarch64__)
+    if (prefer_register && methods == g_zygote_methods.data() &&
+        i < static_cast<int>(kZygoteMethodCount)) {
+      g_yz_jni_targets[i] = m.fnPtr;
+      entry = kYzJniEntryTable[i];
+    }
+#endif
+
+    JniHookRecord record;
+    record.owner = owner;
+    record.method = art;
+    record.mode = mode;
+    record.original = orig;
+    record.replacement = entry;
     void *tramp = prefer_register
                       ? nullptr
                       : yuki::ihook::install(orig, m.fnPtr, &record.hook, false,
@@ -859,16 +901,17 @@ void hook_jni_methods(JNIEnv *env, const char *clz, JNINativeMethod *methods,
     record.name = m.name;
     record.signature = m.signature;
     g_jni_hooks.push_back(std::move(record));
+    m.fnPtr = entry;
     const jint registered = env->RegisterNatives(clazz, &m, 1);
     if (registered != JNI_OK || env->ExceptionCheck()) {
       env->ExceptionClear();
-      ZLOGE("RegisterNatives fallback failed for %s", m.name);
+      ZLOGE("RegisterNatives failed for %s", m.name);
       m.fnPtr = nullptr;
     } else {
       if (owner == -1)
         g_zygote_uses_fallback = true;
       m.fnPtr = orig;
-      ZLOGI("RegisterNatives fallback installed for %s", m.name);
+      ZLOGI("registered %s through ART", m.name);
     }
   }
   env->DeleteLocalRef(clazz);
@@ -1004,6 +1047,28 @@ void hook_zygote_jni() {
 }
 
 } // namespace
+
+/* Whether an entry stub has recorded a usable caller continuation. */
+bool yz_capture_ready() {
+#if defined(__aarch64__)
+  // g_yz_ret_ctx: x19-x28, x29, x30, sp, then d8-d15.
+  return g_yz_ret_ctx[11] != 0 && g_yz_ret_ctx[12] != 0;
+#else
+  return false;
+#endif
+}
+
+/* The captured return address must land outside the core image. */
+bool yz_capture_outside(uintptr_t base, size_t span) {
+#if defined(__aarch64__)
+  const uintptr_t resume = static_cast<uintptr_t>(g_yz_ret_ctx[11]);
+  return resume < base || resume - base >= span;
+#else
+  (void)base;
+  (void)span;
+  return false;
+#endif
+}
 
 /* Drop libandroid_runtime header pages faulted by symbol scans. */
 void yz_drop_runtime_header_pages() {

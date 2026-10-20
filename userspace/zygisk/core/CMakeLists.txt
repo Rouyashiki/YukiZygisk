@@ -23,10 +23,13 @@ endif()
 
 set(YUKILINKER_ARCH_SOURCES)
 set(YUKIZYGISK_RUNTIME_LOG_SOURCES)
+set(YUKIZYGISK_ENTRY_SOURCES)
 if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
     set(YUKIZYGISK_ABI_SUFFIX 64)
     list(APPEND YUKILINKER_ARCH_SOURCES src/yukilinker_tlsdesc.S)
     list(APPEND YUKIZYGISK_RUNTIME_LOG_SOURCES src/runtime_log.cpp)
+    # Captures the caller context for RegisterNatives-installed zygote hooks.
+    list(APPEND YUKIZYGISK_ENTRY_SOURCES src/jni_entry.S)
 else()
     set(YUKIZYGISK_ABI_SUFFIX 32)
 endif()
@@ -62,6 +65,7 @@ add_library(zygisk SHARED
     # right after handoff (zygisk_finalize_loader) instead of lingering.
     src/yukilinker.cpp
     ${YUKILINKER_ARCH_SOURCES}
+    ${YUKIZYGISK_ENTRY_SOURCES}
     # synchronous self-unmap: capture-stub template + tail-call munmap.
     src/self_unmap.S
     # solist unlink and maps hiding helpers.
