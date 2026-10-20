@@ -86,6 +86,8 @@ YZ_JNI_ENTRY yz_jni_entry_4, 4
 YZ_JNI_ENTRY yz_jni_entry_5, 5
 YZ_JNI_ENTRY yz_jni_entry_6, 6
 YZ_JNI_ENTRY yz_jni_entry_7, 7
+YZ_JNI_ENTRY yz_jni_entry_8, 8
+YZ_JNI_ENTRY yz_jni_entry_9, 9
 
 .ltorg
 

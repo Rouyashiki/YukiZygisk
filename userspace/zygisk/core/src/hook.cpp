@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 #include <vector>
@@ -58,9 +59,11 @@ void yz_jni_entry_4();
 void yz_jni_entry_5();
 void yz_jni_entry_6();
 void yz_jni_entry_7();
+void yz_jni_entry_8();
+void yz_jni_entry_9();
 
 /* Target slots read by the entry stubs in jni_entry.S. */
-__attribute__((visibility("hidden"))) void *g_yz_jni_targets[8] = {};
+__attribute__((visibility("hidden"))) void *g_yz_jni_targets[10] = {};
 }
 #endif
 
@@ -155,6 +158,17 @@ int (*g_orig_fork)() = nullptr;
 bool is_isolated(int uid) {
   int app_id = uid % 100000;
   return app_id >= 90000 && app_id <= 99999;
+}
+
+/* A zygote process must keep the core so its children still run our stubs. */
+bool yz_process_is_zygote() {
+  char name[16] = {};
+  if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0)
+    return false;
+  const size_t len = strnlen(name, sizeof(name));
+  constexpr char kSuffix[] = "_zygote";
+  constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+  return len >= kSuffixLen && strcmp(name + len - kSuffixLen, kSuffix) == 0;
 }
 
 int forked_decision(bool is_child, int uid) {
@@ -357,14 +371,18 @@ enum ZygoteMethodIndex : size_t {
   kSpecializeSysprop,
   kSpecializeCgroup,
   kForkSystemServer,
+  kInitNativeState,
+  kUnmountStorageOnInit,
   kZygoteMethodCount,
 };
 
 bool g_app_specialize_hooks_complete = false;
 bool g_zygote_uses_fallback = false;
+pid_t g_zygote_pid = 0;
+bool g_zygote_primary = false;
 
 #if defined(__aarch64__) || defined(__arm__)
-static_assert(kZygoteMethodCount == 8, "jni_entry.S provides eight stubs");
+static_assert(kZygoteMethodCount == 10, "jni_entry.S provides ten stubs");
 /* Installed through RegisterNatives so the caller context is captured. */
 void *const kYzJniEntryTable[kZygoteMethodCount] = {
     reinterpret_cast<void *>(yz_jni_entry_0),
@@ -375,6 +393,8 @@ void *const kYzJniEntryTable[kZygoteMethodCount] = {
     reinterpret_cast<void *>(yz_jni_entry_5),
     reinterpret_cast<void *>(yz_jni_entry_6),
     reinterpret_cast<void *>(yz_jni_entry_7),
+    reinterpret_cast<void *>(yz_jni_entry_8),
+    reinterpret_cast<void *>(yz_jni_entry_9),
 };
 #endif
 
@@ -814,6 +834,27 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
        g_ctx = nullptr;
        return pid;
      })},
+    /* Native state init runs once per zygote after the VM is up. */
+    {"nativeInitNativeState", "(Z)V",
+     reinterpret_cast<void *>(+[](JNIEnv *env, jclass clazz,
+                                  jboolean is_primary) -> void {
+       reinterpret_cast<void (*)(JNIEnv *, jclass, jboolean)>(
+           g_zygote_methods[kInitNativeState].fnPtr)(env, clazz, is_primary);
+       g_zygote_primary = is_primary == JNI_TRUE;
+       ZLOGI("zygote native state: %s",
+             g_zygote_primary ? "primary" : "secondary");
+     })},
+    /* A specialized child reaches this right after storage unmount, before app
+     * code. The signature is stable, so it doubles as a fallback unmap point
+     * for processes whose specialize overload we failed to hook. */
+    {"nativeUnmountStorageOnInit", "()V",
+     reinterpret_cast<void *>(+[](JNIEnv *env, jclass clazz) -> void {
+       reinterpret_cast<void (*)(JNIEnv *, jclass)>(
+           g_zygote_methods[kUnmountStorageOnInit].fnPtr)(env, clazz);
+       if (g_zygote_pid != 0 && getpid() != g_zygote_pid &&
+           !yz_process_is_zygote())
+         finish_app_child(env, true, false);
+     })},
 }};
 
 struct JniHookRecord {
@@ -1082,6 +1123,7 @@ void hook_zygote_jni() {
   const bool system_server_hooked =
       g_zygote_methods[kForkSystemServer].fnPtr != nullptr;
   g_app_specialize_hooks_complete = fork_hooked && specialize_hooked;
+  g_zygote_pid = getpid();
   yz_unmap_injection_stub();
   if (g_app_specialize_hooks_complete && system_server_hooked) {
     ZLOGI("zygote JNI takeover done");
