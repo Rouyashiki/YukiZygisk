@@ -165,20 +165,43 @@ int forked_decision(bool is_child, int uid) {
   return zygisk_inject_decision(uid);
 }
 
-void finish_app_child(JNIEnv *env, bool is_child_zygote, bool isolated,
+/* App zygotes are named after the owning package (com.example_zygote) and run
+ * as that package's uid; they only fork isolated processes, which never load
+ * modules, so the core is disposable once preload is done. Bare names such as
+ * webview_zygote or vendor stub_zygote fork ordinary processes that still need
+ * module injection, so they keep it. */
+bool yz_app_zygote_can_unmap(JNIEnv *env, jstring nice_name, jint uid) {
+  if (nice_name == nullptr)
+    return false;
+  const char *name = env->GetStringUTFChars(nice_name, nullptr);
+  if (name == nullptr) {
+    env->ExceptionClear();
+    return false;
+  }
+  const size_t len = strlen(name);
+  constexpr char kSuffix[] = "_zygote";
+  constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+  const bool named_app_zygote = len > kSuffixLen + 1 &&
+                                strcmp(name + len - kSuffixLen, kSuffix) == 0 &&
+                                memchr(name, '.', len - kSuffixLen) != nullptr;
+  const int app_id = static_cast<int>(uid % 100000);
+  const bool app_uid = app_id >= 10000 && app_id <= 19999;
+  if (named_app_zygote)
+    ZLOGI("app zygote %s (uid=%d, app_id=%d): %s", name, static_cast<int>(uid),
+          app_id, app_uid ? "dropping the core" : "keeping the core");
+  env->ReleaseStringUTFChars(nice_name, name);
+  return named_app_zygote && app_uid;
+}
+
+void finish_app_child(JNIEnv *env, bool can_unmap, bool isolated,
                       int decision) {
-  // Every fully specialized app child drops the inherited core. Child zygotes
-  // retain it because they must inject their own future descendants.
-  //
-  // Restore mode reverts mounts after module post-specialize callbacks. Force
-  // mode lets self-destruct request the same cleanup. The normal inject path
-  // must preserve module mounts while still dropping the inherited core.
+  // Mount cleanup remains required when the core must stay resident.
   bool revert_mounts = decision == 2;
   if (decision == 1) {
     zygisk_revert_mounts();
     revert_mounts = false;
   }
-  if (is_child_zygote || !zygisk_app_core_unload_safe()) {
+  if (!can_unmap || !zygisk_app_core_unload_safe()) {
     if (revert_mounts)
       zygisk_revert_mounts();
     return;
@@ -383,7 +406,8 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            ctx.fds_to_ignore = &fds_to_ignore;
            g_ctx = &ctx;
            ctx_fork_pre(&ctx); // real fork; child snapshots fds
-           bool run_modules = ctx.pid == 0 && !is_isolated(uid);
+           bool run_modules =
+               ctx.pid == 0 && !is_isolated(uid) && !is_child_zygote;
            int decision = forked_decision(ctx.pid == 0, uid);
            if (decision == 2) // denylist + force mode: do not inject
              run_modules = false;
@@ -408,7 +432,10 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            if (run_modules)
              zygisk_run_app_post(env, &args);
            if (ctx.pid == 0)
-             finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+             finish_app_child(env,
+                              !is_child_zygote ||
+                                  yz_app_zygote_can_unmap(env, nice_name, uid),
+                              is_isolated(uid), decision);
            if (is_child_zygote && ctx.pid == 0)
              close_inherited_module_fds();
            g_ctx = nullptr;
@@ -445,7 +472,8 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            const bool fifo_ui =
                is_top_app == JNI_TRUE && use_fifo_ui == JNI_TRUE;
            ctx_fork_pre(&ctx, fifo_ui);
-           bool run_modules = ctx.pid == 0 && !is_isolated(uid);
+           bool run_modules =
+               ctx.pid == 0 && !is_isolated(uid) && !is_child_zygote;
            int decision = forked_decision(ctx.pid == 0, uid);
            if (decision == 2)
              run_modules = false;
@@ -474,7 +502,10 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            if (run_modules)
              zygisk_run_app_post(env, &args);
            if (ctx.pid == 0)
-             finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+             finish_app_child(env,
+                              !is_child_zygote ||
+                                  yz_app_zygote_can_unmap(env, nice_name, uid),
+                              is_isolated(uid), decision);
            if (is_child_zygote && ctx.pid == 0)
              close_inherited_module_fds();
            g_ctx = nullptr;
@@ -509,7 +540,8 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            ctx.fds_to_ignore = &fds_to_ignore;
            g_ctx = &ctx;
            ctx_fork_pre(&ctx); // real fork; child snapshots fds
-           bool run_modules = ctx.pid == 0 && !is_isolated(uid);
+           bool run_modules =
+               ctx.pid == 0 && !is_isolated(uid) && !is_child_zygote;
            int decision = forked_decision(ctx.pid == 0, uid);
            if (decision == 2) // denylist + force mode: do not inject
              run_modules = false;
@@ -534,7 +566,10 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            if (run_modules)
              zygisk_run_app_post(env, &args);
            if (ctx.pid == 0)
-             finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+             finish_app_child(env,
+                              !is_child_zygote ||
+                                  yz_app_zygote_can_unmap(env, nice_name, uid),
+                              is_isolated(uid), decision);
            if (is_child_zygote && ctx.pid == 0)
              close_inherited_module_fds();
            g_ctx = nullptr;
@@ -572,7 +607,8 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            const bool fifo_ui =
                is_top_app == JNI_TRUE && use_fifo_ui == JNI_TRUE;
            ctx_fork_pre(&ctx, fifo_ui);
-           bool run_modules = ctx.pid == 0 && !is_isolated(uid);
+           bool run_modules =
+               ctx.pid == 0 && !is_isolated(uid) && !is_child_zygote;
            int decision = forked_decision(ctx.pid == 0, uid);
            if (decision == 2)
              run_modules = false;
@@ -601,7 +637,10 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            if (run_modules)
              zygisk_run_app_post(env, &args);
            if (ctx.pid == 0)
-             finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+             finish_app_child(env,
+                              !is_child_zygote ||
+                                  yz_app_zygote_can_unmap(env, nice_name, uid),
+                              is_isolated(uid), decision);
            if (is_child_zygote && ctx.pid == 0)
              close_inherited_module_fds();
            g_ctx = nullptr;
@@ -628,7 +667,9 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            args.whitelisted_data_info_list = &allowlisted_data_info;
            args.mount_data_dirs = &mount_data_dirs;
            args.mount_storage_dirs = &mount_storage_dirs;
-           bool run_modules = !is_isolated(uid);
+           bool run_modules = !is_isolated(uid) && !is_child_zygote;
+           const bool can_unmap =
+               !is_child_zygote || yz_app_zygote_can_unmap(env, nice_name, uid);
            int decision = forked_decision(true, uid);
            if (decision == 2) // denylist + force mode: do not inject
              run_modules = false;
@@ -647,7 +688,7 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
                allowlisted_data_info, mount_data_dirs, mount_storage_dirs);
            if (run_modules)
              zygisk_run_app_post(env, &args);
-           finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+           finish_app_child(env, can_unmap, is_isolated(uid), decision);
          })},
     {"nativeSpecializeAppProcess",
      "(II[II[[IILjava/lang/String;Ljava/lang/String;ZLjava/lang/String;"
@@ -671,7 +712,9 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            args.mount_data_dirs = &mount_data_dirs;
            args.mount_storage_dirs = &mount_storage_dirs;
            args.mount_sysprop_overrides = &mount_sysprop_overrides;
-           bool run_modules = !is_isolated(uid);
+           bool run_modules = !is_isolated(uid) && !is_child_zygote;
+           const bool can_unmap =
+               !is_child_zygote || yz_app_zygote_can_unmap(env, nice_name, uid);
            int decision = forked_decision(true, uid);
            if (decision == 2) // denylist + force mode: do not inject
              run_modules = false;
@@ -691,7 +734,7 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
                mount_sysprop_overrides);
            if (run_modules)
              zygisk_run_app_post(env, &args);
-           finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+           finish_app_child(env, can_unmap, is_isolated(uid), decision);
          })},
     {"nativeSpecializeAppProcess",
      "(III[II[[IILjava/lang/String;Ljava/lang/String;ZLjava/lang/String;"
@@ -716,7 +759,9 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
            args.mount_data_dirs = &mount_data_dirs;
            args.mount_storage_dirs = &mount_storage_dirs;
            args.mount_sysprop_overrides = &mount_sysprop_overrides;
-           bool run_modules = !is_isolated(uid);
+           bool run_modules = !is_isolated(uid) && !is_child_zygote;
+           const bool can_unmap =
+               !is_child_zygote || yz_app_zygote_can_unmap(env, nice_name, uid);
            int decision = forked_decision(true, uid);
            if (decision == 2)
              run_modules = false;
@@ -736,7 +781,7 @@ std::array<JNINativeMethod, kZygoteMethodCount> g_zygote_methods = {{
                mount_sysprop_overrides);
            if (run_modules)
              zygisk_run_app_post(env, &args);
-           finish_app_child(env, is_child_zygote, is_isolated(uid), decision);
+           finish_app_child(env, can_unmap, is_isolated(uid), decision);
          })},
     /* system_server fork. */
     {"nativeForkSystemServer", "(II[II[[IJJ)I",
