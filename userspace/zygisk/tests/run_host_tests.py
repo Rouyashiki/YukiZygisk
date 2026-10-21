@@ -122,7 +122,8 @@ with tempfile.TemporaryDirectory(prefix='yz-host-tests-') as temporary:
     endpoint = root / 'userspace/zygisk/endpoint.cpp'
     binary = build / 'endpoint_test'
     run(compiler, *flags, '-pthread',
-        str(root / 'userspace/zygisk/tests/endpoint_test.cpp'), str(endpoint), '-o', str(binary))
+        str(root / 'userspace/zygisk/tests/endpoint_test.cpp'), str(endpoint),
+        '-Wl,--wrap=connect', '-o', str(binary))
     run(str(binary))
     load_config = root / 'userspace/zygisk/tests/load_config_test.cpp'
     if load_config.is_file():

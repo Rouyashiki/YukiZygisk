@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace yukizygisk::endpoint {
@@ -20,10 +21,18 @@ bool fail(int error) {
   return false;
 }
 
-bool valid(const yz_endpoint_state &state, uint32_t abi) {
+bool valid_layout(const yz_endpoint_state &state, uint32_t abi) {
   if (state.version != YZ_ENDPOINT_VERSION || state.size != sizeof(state))
     return fail(EPROTONOSUPPORT);
-  if (state.abi != abi || state.reserved || state.available > 1)
+  if (state.abi != abi || state.reserved)
+    return fail(EPROTO);
+  return true;
+}
+
+bool valid(const yz_endpoint_state &state, uint32_t abi) {
+  if (!valid_layout(state, abi))
+    return false;
+  if (state.available > 1)
     return fail(EPROTO);
   if (!state.available)
     return true;
@@ -34,6 +43,31 @@ bool valid(const yz_endpoint_state &state, uint32_t abi) {
     if ((c < '0' || c > '9') && (c < 'a' || c > 'f'))
       return fail(EPROTO);
   return true;
+}
+
+bool wait_connect(int fd, const sockaddr *target, socklen_t length,
+                  Deadline deadline) {
+  if (fcntl(fd, F_SETFL, 0) != 0)
+    return false;
+  for (;;) {
+    const auto remaining =
+        std::chrono::ceil<std::chrono::microseconds>(deadline - Clock::now());
+    if (remaining.count() <= 0)
+      return fail(ETIMEDOUT);
+    const timeval timeout{
+        static_cast<time_t>(remaining.count() / 1000000),
+        static_cast<suseconds_t>(remaining.count() % 1000000)};
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)
+      return false;
+    if (::connect(fd, target, length) == 0 || errno == EINPROGRESS)
+      break;
+    if (errno != EINTR && errno != EAGAIN)
+      return false;
+  }
+  const timeval timeout{};
+  return setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) ==
+             0 &&
+         fcntl(fd, F_SETFL, O_NONBLOCK) == 0;
 }
 } // namespace
 
@@ -56,7 +90,12 @@ bool Mapping::map(int fd, uint32_t abi) {
   length_ = page_size;
   abi_ = abi;
   yz_endpoint_state state{};
-  if (read(state))
+  // These fields are immutable, even while a new endpoint is being published.
+  state.version = __atomic_load_n(&page_->version, __ATOMIC_RELAXED);
+  state.size = __atomic_load_n(&page_->size, __ATOMIC_RELAXED);
+  state.abi = __atomic_load_n(&page_->abi, __ATOMIC_RELAXED);
+  state.reserved = __atomic_load_n(&page_->reserved, __ATOMIC_RELAXED);
+  if (valid_layout(state, abi_) && (read(state) || errno == EAGAIN))
     return true;
   const int error = errno;
   reset();
@@ -155,7 +194,7 @@ socklen_t address(const yz_endpoint_state &state, sockaddr_un &out) {
   return offsetof(sockaddr_un, sun_path) + 1 + sizeof(state.name);
 }
 
-int start(const Mapping &mapping, yz_endpoint_state &state) {
+int start(const Mapping &mapping, yz_endpoint_state &state, Deadline deadline) {
   if (!mapping.read(state))
     return -1;
   if (!state.available) {
@@ -167,8 +206,14 @@ int start(const Mapping &mapping, yz_endpoint_state &state) {
     return -1;
   sockaddr_un target{};
   const auto length = address(state, target);
+  const bool can_wait = Clock::now() < deadline;
   if (::connect(fd, reinterpret_cast<sockaddr *>(&target), length) != 0 &&
       errno != EINPROGRESS) {
+    // AF_UNIX reports a full accept queue as EAGAIN, without a pending connect.
+    if (errno == EAGAIN && can_wait &&
+        wait_connect(fd, reinterpret_cast<sockaddr *>(&target), length,
+                     deadline))
+      return fd;
     const int error = errno;
     close(fd);
     errno = error;
@@ -209,7 +254,7 @@ bool rediscoverable(int error) {
 int connect(const Mapping &mapping, Deadline deadline, bool nonblocking) {
   for (unsigned attempt = 0; attempt < 2; ++attempt) {
     yz_endpoint_state state{};
-    const int fd = start(mapping, state);
+    const int fd = start(mapping, state, deadline);
     if (fd < 0) {
       if (rediscoverable(errno))
         continue;

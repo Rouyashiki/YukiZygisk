@@ -46,7 +46,8 @@ void release();
 void close_packet(int packet_fd, bool close_endpoint = true);
 
 socklen_t address(const yz_endpoint_state &state, sockaddr_un &out);
-int start(const Mapping &mapping, yz_endpoint_state &state);
+int start(const Mapping &mapping, yz_endpoint_state &state,
+          Deadline deadline = Clock::now());
 bool validate(int fd, const Mapping &mapping, const yz_endpoint_state &state);
 bool rediscoverable(int error);
 int connect(const Mapping &mapping, Deadline deadline,

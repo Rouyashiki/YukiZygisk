@@ -17,6 +17,31 @@
 
 namespace ep = yukizygisk::endpoint;
 
+static int blocked_signal = -1;
+static int resume_signal = -1;
+static unsigned connect_interruptions;
+
+extern "C" int __real_connect(int, const sockaddr *, socklen_t);
+extern "C" int __wrap_connect(int fd, const sockaddr *address,
+                              socklen_t length) {
+  if (connect_interruptions && !(fcntl(fd, F_GETFL) & O_NONBLOCK)) {
+    --connect_interruptions;
+    errno = EINTR;
+    return -1;
+  }
+  const int result = __real_connect(fd, address, length);
+  const int error = errno;
+  if (result < 0 && error == EAGAIN && blocked_signal >= 0) {
+    const int signal = blocked_signal;
+    blocked_signal = -1;
+    assert(write(signal, "B", 1) == 1);
+    char ready;
+    assert(read(resume_signal, &ready, 1) == 1);
+  }
+  errno = error;
+  return result;
+}
+
 static size_t descriptor_count() {
   DIR *directory = opendir("/proc/self/fd");
   assert(directory);
@@ -265,6 +290,110 @@ static void bootstrap_ownership() {
   assert(descriptor_count() == before);
 }
 
+static void bootstrap_publication() {
+  StatePage page;
+  const size_t before = descriptor_count();
+  __atomic_store_n(&page.page->sequence, 1, __ATOMIC_RELEASE);
+  const int endpoint_fd = dup(page.readonly);
+  const int fd = packet(endpoint_fd);
+  assert(ep::initialize(fd, false));
+  assert(ep::connect(ep::Clock::now()) < 0 && errno == EAGAIN);
+  assert(ep::initialize(fd, true));
+  ep::close_packet(fd, false);
+  assert(descriptor_count() == before);
+  __atomic_store_n(&page.page->sequence, 2, __ATOMIC_RELEASE);
+  int listener = ep::listen();
+  assert(listener >= 0);
+  page.publish(listener, 1);
+  int connection = ep::connect(ep::Clock::now());
+  assert(connection >= 0);
+  close(connection);
+  close(listener);
+  ep::release();
+  assert(ep::connect(ep::Clock::now()) < 0 && errno == ENOTCONN);
+
+  ep::Mapping mapping;
+  __atomic_store_n(&page.page->sequence, 5, __ATOMIC_RELEASE);
+  assert(!mapping.map(page.readonly, 3 - ep::kAbi) && errno == EPROTO);
+  page.page->version++;
+  assert(!mapping.map(page.readonly, ep::kAbi) && errno == EPROTONOSUPPORT);
+  page.page->version--;
+  page.page->size++;
+  assert(!mapping.map(page.readonly, ep::kAbi) && errno == EPROTONOSUPPORT);
+  page.page->size--;
+  page.page->reserved = 1;
+  assert(!mapping.map(page.readonly, ep::kAbi) && errno == EPROTO);
+  assert(descriptor_count() == before);
+}
+
+static void congested_connections() {
+  StatePage page;
+  ep::Mapping mapping;
+  assert(mapping.map(page.readonly, ep::kAbi));
+  for (bool restart : {false, true}) {
+    const int listener = ep::listen();
+    const int replacement = restart ? ep::listen() : -1;
+    assert(listener >= 0 && (!restart || replacement >= 0));
+    assert(listen(listener, 0) == 0);
+    page.publish(listener, 1);
+    yz_endpoint_state state{};
+    const int occupied = ep::start(mapping, state);
+    assert(occupied >= 0);
+    const size_t before = descriptor_count();
+    assert(ep::connect(mapping, ep::Clock::now(), true) < 0 && errno == EAGAIN);
+    connect_interruptions = 2;
+    const auto deadline = ep::Clock::now() + std::chrono::milliseconds(50);
+    assert(ep::connect(mapping, deadline) < 0 && errno == ETIMEDOUT);
+    assert(connect_interruptions == 0);
+    assert(ep::Clock::now() >= deadline);
+    assert(descriptor_count() == before);
+
+    int blocked[2], resume[2];
+    assert(pipe(blocked) == 0 && pipe(resume) == 0);
+    blocked_signal = blocked[1];
+    resume_signal = resume[0];
+    std::thread server([&] {
+      char ready;
+      assert(read(blocked[0], &ready, 1) == 1);
+      if (restart) {
+        page.publish(replacement, 2);
+        close(listener);
+      } else {
+        const int accepted = accept(listener, nullptr, nullptr);
+        assert(accepted >= 0);
+        close(accepted);
+      }
+      assert(write(resume[1], "R", 1) == 1);
+    });
+    const int connected = ep::connect(
+        mapping, ep::Clock::now() + std::chrono::seconds(2), restart);
+    assert(connected >= 0);
+    server.join();
+    assert((fcntl(connected, F_GETFL) & O_NONBLOCK) ==
+           (restart ? O_NONBLOCK : 0));
+    timeval timeout{};
+    socklen_t timeout_size = sizeof(timeout);
+    assert(getsockopt(connected, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                      &timeout_size) == 0);
+    assert(timeout.tv_sec == 0 && timeout.tv_usec == 0);
+    assert(send(connected, "X", 1, MSG_NOSIGNAL) == 1);
+    const int accepted =
+        accept(restart ? replacement : listener, nullptr, nullptr);
+    assert(accepted >= 0);
+    char received;
+    assert(read(accepted, &received, 1) == 1 && received == 'X');
+    close(accepted);
+    close(connected);
+    close(occupied);
+    close(restart ? replacement : listener);
+    resume_signal = -1;
+    for (unsigned i = 0; i < 2; ++i) {
+      close(blocked[i]);
+      close(resume[i]);
+    }
+  }
+}
+
 int main() {
   assert(getuid() == 0);
   const auto before = descriptor_count();
@@ -272,7 +401,9 @@ int main() {
   readonly_and_layout();
   restart_and_publication();
   bootstrap_ownership();
+  bootstrap_publication();
+  congested_connections();
   assert(descriptor_count() == before);
   puts("PASS: random endpoints, readonly pages, dual ABI layout, restart, "
-       "publication and bootstrap ownership");
+       "publication, bootstrap ownership and connection congestion");
 }
