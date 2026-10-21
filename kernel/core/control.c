@@ -660,6 +660,7 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 	long ret;
 
 	if (request == YZ_IOCTL_GET_HEALTH ||
+	    request == YZ_IOCTL_GET_ENDPOINT_STATE_FD ||
 	    request == YZ_IOCTL_VIOLA_DAEMON_IDENTITY) {
 		if (!down_read_trylock(&yz_control_sem))
 			return -EAGAIN;

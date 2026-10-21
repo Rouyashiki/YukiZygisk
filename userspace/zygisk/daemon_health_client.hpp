@@ -113,13 +113,8 @@ inline bool verify_viola_identity(uint32_t abi, pid_t pid, uint64_t start_ticks,
 
 inline int endpoint_state_fd(uint32_t abi, void *opaque) {
   auto *context = static_cast<ViolaIdentityContext *>(opaque);
-  yz_runtime_query_cmd capabilities{};
-  if (ioctl(context->control_fd, YZ_IOCTL_GET_RUNTIME, &capabilities) != 0)
-    return -1;
-  if (!(capabilities.capabilities & YZ_RUNTIME_CAP_ENDPOINT_STATE)) {
-    errno = EPROTONOSUPPORT;
-    return -1;
-  }
+  // This ioctl uses trylocks so a busy daemon cannot stall health queries.
+  // Query it directly instead of first issuing the blocking GET_RUNTIME.
   yz_endpoint_fd_cmd command{YZ_ENDPOINT_VERSION, abi, -1, 0};
   return ioctl(context->control_fd, YZ_IOCTL_GET_ENDPOINT_STATE_FD, &command) ==
                  0

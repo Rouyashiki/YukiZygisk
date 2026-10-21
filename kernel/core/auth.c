@@ -641,7 +641,8 @@ int yz_auth_begin(struct yz_auth_session *s, unsigned int request,
 
 	(void)arg;
 
-	if (request == YZ_IOCTL_GET_HEALTH) {
+	if (request == YZ_IOCTL_GET_HEALTH ||
+	    request == YZ_IOCTL_GET_ENDPOINT_STATE_FD) {
 		if (!mutex_trylock(&yz_auth_lock))
 			return -EAGAIN;
 	} else {
