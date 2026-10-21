@@ -1,49 +1,39 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- SPDX-License-Identifier: Apache-2.0; derived from YukiSU docs/YukiSU-mini.svg by Anan. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="220" height="220" viewBox="0 0 108 108" role="img" aria-label="YukiZygisk">
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128" role="img" aria-label="YukiZygisk">
+  <title>YukiZygisk</title>
   <defs>
-    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#4FC3F7;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#0288D1;stop-opacity:1" />
+    <linearGradient id="yukizygisk-base" gradientUnits="userSpaceOnUse" x1="72" y1="20" x2="90" y2="108">
+      <stop stop-color="#505C4C" />
+      <stop offset=".54" stop-color="#444E46" />
+      <stop offset="1" stop-color="#363941" />
+    </linearGradient>
+    <clipPath id="yukizygisk-body" clipPathUnits="userSpaceOnUse">
+      <path d="M84 20A24 24 0 0 1 108 44V84A24 24 0 0 1 84 108A5.5 5.5 0 0 1 78.5 102.5V75.842719A7 7 0 0 0 66.983871 70.494394A8.5 8.5 0 1 1 66.983871 57.505606A7 7 0 0 0 78.5 52.157281V25.5A5.5 5.5 0 0 1 84 20Z" />
+    </clipPath>
+    <linearGradient id="yukizygisk-accent" gradientUnits="userSpaceOnUse" x1="94" y1="52.5" x2="102" y2="66.5">
+      <stop offset="0" stop-color="#A18A98" stop-opacity=".82" />
+      <stop offset=".3" stop-color="#9A8292" stop-opacity=".62" />
+      <stop offset=".65" stop-color="#927887" stop-opacity=".23" />
+      <stop offset="1" stop-color="#927887" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="yukizygisk-fade" gradientUnits="userSpaceOnUse" x1="79.5" y1="60" x2="104" y2="60">
+      <stop stop-color="white" stop-opacity="0" />
+      <stop offset=".43" stop-color="white" stop-opacity=".43" />
+      <stop offset="1" stop-color="white" />
+    </linearGradient>
+    <mask id="yukizygisk-entry" maskUnits="userSpaceOnUse" x="78" y="40" width="31" height="45" maskContentUnits="userSpaceOnUse">
+      <rect x="78" y="40" width="31" height="45" fill="url(#yukizygisk-fade)" />
+    </mask>
+    <linearGradient id="yukizygisk-ridge" gradientUnits="userSpaceOnUse" x1="82" y1="62" x2="108" y2="45.2">
+      <stop stop-color="#B49EAA" stop-opacity="0" />
+      <stop offset="1" stop-color="#B49EAA" stop-opacity=".48" />
     </linearGradient>
   </defs>
-  <!-- Background rounded square -->
-  <rect x="4" y="4" width="100" height="100" rx="28" ry="28" fill="url(#bgGradient)"/>
-  <!-- Snowflake -->
-  <g transform="translate(54, 54) scale(1.2)" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" fill="none">
-    <!-- Branch 0° -->
-    <line x1="0" y1="0" x2="0" y2="-25"/>
-    <line x1="0" y1="-15" x2="-4.5" y2="-19.5"/>
-    <line x1="0" y1="-15" x2="4.5" y2="-19.5"/>
-    <!-- Branch 60° -->
-    <g transform="rotate(60)">
-      <line x1="0" y1="0" x2="0" y2="-25"/>
-      <line x1="0" y1="-15" x2="-4.5" y2="-19.5"/>
-      <line x1="0" y1="-15" x2="4.5" y2="-19.5"/>
-    </g>
-    <!-- Branch 120° -->
-    <g transform="rotate(120)">
-      <line x1="0" y1="0" x2="0" y2="-25"/>
-      <line x1="0" y1="-15" x2="-4.5" y2="-19.5"/>
-      <line x1="0" y1="-15" x2="4.5" y2="-19.5"/>
-    </g>
-    <!-- Branch 180° -->
-    <g transform="rotate(180)">
-      <line x1="0" y1="0" x2="0" y2="-25"/>
-      <line x1="0" y1="-15" x2="-4.5" y2="-19.5"/>
-      <line x1="0" y1="-15" x2="4.5" y2="-19.5"/>
-    </g>
-    <!-- Branch 240° -->
-    <g transform="rotate(240)">
-      <line x1="0" y1="0" x2="0" y2="-25"/>
-      <line x1="0" y1="-15" x2="-4.5" y2="-19.5"/>
-      <line x1="0" y1="-15" x2="4.5" y2="-19.5"/>
-    </g>
-    <!-- Branch 300° -->
-    <g transform="rotate(300)">
-      <line x1="0" y1="0" x2="0" y2="-25"/>
-      <line x1="0" y1="-15" x2="-4.5" y2="-19.5"/>
-      <line x1="0" y1="-15" x2="4.5" y2="-19.5"/>
-    </g>
+  <path fill="#363941" fill-rule="evenodd" d="M44 20H62.5A10 10 0 0 1 72.5 30V52.157281A1 1 0 0 1 70.854839 52.921327A14.5 14.5 0 1 0 70.854839 75.078673A1 1 0 0 1 72.5 75.842719V98A10 10 0 0 1 62.5 108H44A24 24 0 0 1 20 84V44A24 24 0 0 1 44 20Z M44 27.5H62.5A2.5 2.5 0 0 1 65 30V39.5C65 41.2 63.9 42 61.5 42A22 22 0 0 0 61.5 86C63.9 86 65 86.8 65 88.5V98A2.5 2.5 0 0 1 62.5 100.5H44A16.5 16.5 0 0 1 27.5 84V44A16.5 16.5 0 0 1 44 27.5Z" />
+  <path fill="url(#yukizygisk-base)" d="M84 20A24 24 0 0 1 108 44V84A24 24 0 0 1 84 108A5.5 5.5 0 0 1 78.5 102.5V75.842719A7 7 0 0 0 66.983871 70.494394A8.5 8.5 0 1 1 66.983871 57.505606A7 7 0 0 0 78.5 52.157281V25.5A5.5 5.5 0 0 1 84 20Z" />
+  <g clip-path="url(#yukizygisk-body)">
+    <path fill="url(#yukizygisk-accent)" mask="url(#yukizygisk-entry)" d="M78.5 63.2C86.7 56.2 99 48.35 108 45.2V63C96 65.6 84 72.4 78.5 80Z" />
+    <path fill="url(#yukizygisk-ridge)" d="M78.5 63.2C86.7 56.2 99 48.35 108 45.2V45.68C99 48.79 86.7 56.3 78.5 63.2Z" />
   </g>
 </svg>

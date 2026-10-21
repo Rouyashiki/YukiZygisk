@@ -5,3 +5,4 @@ versionCode=1
 author=Anatdx
 description=Standalone kernel-level Zygisk
 updateJson=https://ci.yukizygisk.anatdx.com/update.json
+webuiIcon=icon.png

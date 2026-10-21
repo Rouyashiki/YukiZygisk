@@ -1,5 +1,7 @@
 # YukiZygisk
 
+<img align="right" src="webui/icon.svg" width="220" alt="YukiZygisk logo">
+
 **English** | [简体中文](README.zh-CN.md)
 
 YukiZygisk is a standalone, kernel-based Zygisk implementation for rooted Android devices. It runs Zygisk and ZN native modules, with a built-in WebUI for checking status and changing settings.

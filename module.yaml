@@ -8,6 +8,7 @@ license: Apache-2.0 OR GPL-2.0
 homepage: https://github.com/Rouyashiki/YukiZygisk
 support: https://github.com/Rouyashiki/YukiZygisk/issues
 tags: [zygisk, system]
+icon: module/icon.png
 
 authors:
   - name: Anatdx

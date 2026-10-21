@@ -1,5 +1,7 @@
 # YukiZygisk
 
+<img align="right" src="webui/icon.svg" width="220" alt="YukiZygisk logo">
+
 [English](README.md) | **简体中文**
 
 YukiZygisk 是一个独立的、基于内核的 Zygisk 实现，让已 root 的 Android 设备运行 Zygisk 模块，也支持 ZN 原生模块。内置 WebUI，可以查看运行状态和调整设置。
