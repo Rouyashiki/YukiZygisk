@@ -427,11 +427,12 @@ int yz_runtime_query(struct yz_runtime_record *entries, u32 capacity,
 	spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
 
 	yz_safemode_fill_runtime_query(query);
-	query->capabilities = YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY |
-			      YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT |
-			      YZ_RUNTIME_CAP_INJECTION_STATE |
-			      YZ_RUNTIME_CAP_EXIT_HISTORY |
-			      YZ_RUNTIME_CAP_HEALTH;
+	query->capabilities =
+	    YZ_RUNTIME_CAP_MODULE_IMAGE_POLICY |
+	    YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT |
+	    YZ_RUNTIME_CAP_INJECTION_STATE | YZ_RUNTIME_CAP_EXIT_HISTORY |
+	    YZ_RUNTIME_CAP_HEALTH |
+	    (yz_endpoint_supported() ? YZ_RUNTIME_CAP_ENDPOINT_STATE : 0);
 	return 0;
 }
 

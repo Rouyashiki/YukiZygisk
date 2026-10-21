@@ -326,6 +326,7 @@ void yz_early_native_packet_init(struct yz_early_packet_state *state)
 	u32 i;
 
 	state->packet_fd = -1;
+	state->endpoint_fd = -1;
 	state->module_fd_count = 0;
 	for (i = 0; i < YZ_NATIVE_TARGET_MAX; i++)
 		state->module_fds[i] = -1;
@@ -340,6 +341,10 @@ void yz_early_native_packet_close(struct yz_early_packet_state *state)
 	if (state->packet_fd >= 0) {
 		yz_payload_close_fd(state->packet_fd);
 		state->packet_fd = -1;
+	}
+	if (state->endpoint_fd >= 0) {
+		yz_payload_close_fd(state->endpoint_fd);
+		state->endpoint_fd = -1;
 	}
 	for (i = 0; i < state->module_fd_count; i++) {
 		if (state->module_fds[i] >= 0)
@@ -378,53 +383,49 @@ static int yz_install_packet_fd(const void *buf, size_t size)
 	return fd;
 }
 
-int yz_early_native_stage_packet(u8 target_type, const char *target,
-				 bool compat,
-				 struct yz_early_packet_state *state)
+int yz_stage_bootstrap_packet(u8 target_type, const char *target, bool compat,
+			      struct yz_early_packet_state *state)
 {
 	struct yz_early_native_entry *matches;
-	struct yz_early_native_packet_header *hdr;
+	struct yz_bootstrap_packet_header *hdr;
 	struct yz_early_native_packet_entry *entries;
 	void *packet;
 	size_t packet_size;
 	u32 match_count = 0;
-	u16 load_flags;
+	u16 load_flags = 0;
 	u32 i;
 	int ret = 0;
 
-	if (!target || !state)
+	if (!state)
 		return -EINVAL;
 
 	matches = kcalloc(YZ_NATIVE_TARGET_MAX, sizeof(*matches), GFP_KERNEL);
 	if (!matches)
 		return -ENOMEM;
 
-	mutex_lock(&yz_early_native_lock);
-	yz_load_early_native_locked();
-	if (!yz_early_native_enabled) {
-		mutex_unlock(&yz_early_native_lock);
-		ret = -ENOENT;
-		goto out_free_matches;
-	}
-	load_flags = yz_early_load_flags;
-	for (i = 0; i < yz_early_native_count; i++) {
-		struct yz_early_native_entry *entry =
-		    &yz_early_native_entries[i];
+	if (target) {
+		mutex_lock(&yz_early_native_lock);
+		yz_load_early_native_locked();
+		load_flags = yz_early_load_flags;
+		for (i = 0;
+		     yz_early_native_enabled && i < yz_early_native_count;
+		     i++) {
+			struct yz_early_native_entry *entry =
+			    &yz_early_native_entries[i];
 
-		if (entry->target_type != target_type)
-			continue;
-		if (strcmp(entry->target, target))
-			continue;
-		if (compat && !(entry->flags & YZ_EARLY_NATIVE_ENTRY_ABI32))
-			continue;
-		if (!compat && !(entry->flags & YZ_EARLY_NATIVE_ENTRY_ABI64))
-			continue;
-		matches[match_count++] = *entry;
-	}
-	mutex_unlock(&yz_early_native_lock);
-	if (!match_count) {
-		ret = -ENOENT;
-		goto out_free_matches;
+			if (entry->target_type != target_type)
+				continue;
+			if (strcmp(entry->target, target))
+				continue;
+			if (compat &&
+			    !(entry->flags & YZ_EARLY_NATIVE_ENTRY_ABI32))
+				continue;
+			if (!compat &&
+			    !(entry->flags & YZ_EARLY_NATIVE_ENTRY_ABI64))
+				continue;
+			matches[match_count++] = *entry;
+		}
+		mutex_unlock(&yz_early_native_lock);
 	}
 
 	packet_size = sizeof(*hdr) + match_count * sizeof(*entries);
@@ -436,8 +437,8 @@ int yz_early_native_stage_packet(u8 target_type, const char *target,
 
 	hdr = packet;
 	entries = (struct yz_early_native_packet_entry *)(hdr + 1);
-	hdr->magic = YZ_EARLY_NATIVE_PACKET_MAGIC;
-	hdr->version = YZ_EARLY_NATIVE_VERSION;
+	hdr->magic = YZ_BOOTSTRAP_PACKET_MAGIC;
+	hdr->version = YZ_BOOTSTRAP_PACKET_VERSION;
 	hdr->header_size = sizeof(*hdr);
 	hdr->entry_size = sizeof(*entries);
 	hdr->load_flags = load_flags;
@@ -457,12 +458,15 @@ int yz_early_native_stage_packet(u8 target_type, const char *target,
 		entries[hdr->count].fd = fd;
 		hdr->count++;
 	}
-	if (!hdr->count) {
+	state->endpoint_fd = yz_endpoint_install_fd(compat ? YZ_RUNTIME_ABI_32
+							   : YZ_RUNTIME_ABI_64);
+	if (state->endpoint_fd < 0) {
+		ret = state->endpoint_fd;
 		kvfree(packet);
 		yz_early_native_packet_close(state);
-		ret = -ENOENT;
 		goto out_free_matches;
 	}
+	hdr->endpoint_fd = state->endpoint_fd;
 
 	packet_size = sizeof(*hdr) + hdr->count * sizeof(*entries);
 	match_count = hdr->count;
@@ -475,7 +479,7 @@ int yz_early_native_stage_packet(u8 target_type, const char *target,
 	state->packet_fd = ret;
 	pr_info("yukizygisk: early_native: early native packet target=%s "
 		"modules=%u fd=%d\n",
-		target, match_count, state->packet_fd);
+		target ?: "zygote", match_count, state->packet_fd);
 	ret = 0;
 
 out_free_matches:

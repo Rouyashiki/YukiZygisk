@@ -27,6 +27,7 @@ yukizygisk-objs := \
 	host/lsm.o \
 	host/adapter.o \
 	feature/config.o \
+	feature/endpoint.o \
 	feature/load_policy.o \
 	feature/safemode.o \
 	feature/runtime.o \
@@ -78,4 +79,10 @@ endif
 
 ifneq ($(shell grep -A3 'sched_process_exit,' $(srctree)/include/trace/events/sched.h | grep -c 'bool group_dead'),0)
 ccflags-y += -DYZ_EXIT_HAS_GROUP_DEAD
+endif
+
+yz-endpoint-symvers := $(firstword $(wildcard $(objtree)/Module.symvers $(KDIR)/Module.symvers $(KERNEL_SRC)/Module.symvers))
+yz-endpoint-vfs-ns := $(if $(yz-endpoint-symvers),$(shell awk '$$2 == "dentry_open" {print $$5; exit}' $(yz-endpoint-symvers)))
+ifneq ($(strip $(yz-endpoint-vfs-ns)),)
+ccflags-y += -DYZ_ENDPOINT_VFS_NS=$(yz-endpoint-vfs-ns)
 endif

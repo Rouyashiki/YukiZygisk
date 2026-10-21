@@ -10,6 +10,7 @@
 #include "zygiskd.hpp"
 #include "catalog.hpp"
 #include "exit_history.hpp"
+#include "userspace/zygisk/endpoint.hpp"
 #if defined(YUKIZYGISK_RUNTIME_LOG)
 #include "log.hpp"
 #endif
@@ -2496,33 +2497,7 @@ void handle_client(int client) {
   }
 }
 
-int bind_listen() {
-  int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (srv < 0) {
-    DLOGE("socket failed: %s", strerror(errno));
-    return -1;
-  }
-
-  sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  /* abstract namespace */
-  const size_t name_len = strlen(zygiskd::kSocketName);
-  memcpy(addr.sun_path + 1, zygiskd::kSocketName, name_len);
-  socklen_t len =
-      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name_len);
-
-  if (bind(srv, reinterpret_cast<sockaddr *>(&addr), len) < 0) {
-    DLOGE("bind @%s failed: %s", zygiskd::kSocketName, strerror(errno));
-    close(srv);
-    return -1;
-  }
-  if (listen(srv, 32) < 0) {
-    DLOGE("listen failed: %s", strerror(errno));
-    close(srv);
-    return -1;
-  }
-  return srv;
-}
+int bind_listen() { return yukizygisk::endpoint::listen(); }
 
 int nl_listen() {
   int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, YZ_NETLINK_PROTO);
@@ -2786,6 +2761,28 @@ void refresh_module_description() {
 }
 #endif
 
+struct EndpointRegistration {
+  uint64_t generation = 0;
+  EndpointRegistration() = default;
+  EndpointRegistration(const EndpointRegistration &) = delete;
+  EndpointRegistration &operator=(const EndpointRegistration &) = delete;
+  EndpointRegistration(EndpointRegistration &&) = delete;
+  EndpointRegistration &operator=(EndpointRegistration &&) = delete;
+  ~EndpointRegistration() {
+    if (generation) {
+      yz_endpoint_unregister_cmd command{kRuntimeAbi, 0, generation};
+      (void)yzhost::ctl(YZ_IOCTL_UNREGISTER_ENDPOINT, &command);
+    }
+  }
+  bool publish(int listener) {
+    yz_endpoint_register_cmd command{kRuntimeAbi, listener, 0};
+    if (yzhost::ctl(YZ_IOCTL_REGISTER_ENDPOINT, &command) != 0)
+      return false;
+    generation = command.generation;
+    return true;
+  }
+};
+
 int run_daemon() {
   int ready_fd = consume_ready_fd();
   yzhost::load_env();
@@ -2811,10 +2808,24 @@ int run_daemon() {
     return 1;
   }
 
+  yz_runtime_query_cmd capabilities{};
+  if (yzhost::ctl(YZ_IOCTL_GET_RUNTIME, &capabilities) != 0 ||
+      !(capabilities.capabilities & YZ_RUNTIME_CAP_ENDPOINT_STATE)) {
+    DLOGE("kernel/userspace version mismatch: endpoint handoff is required");
+    notify_ready(ready_fd, false);
+    return 1;
+  }
   int srv = bind_listen();
   if (srv < 0) {
     const int bind_errno = errno;
     DLOGE("daemon socket unavailable: %s", strerror(bind_errno));
+    notify_ready(ready_fd, false);
+    return 1;
+  }
+  EndpointRegistration endpoint;
+  if (!endpoint.publish(srv)) {
+    DLOGE("endpoint registration failed: %s", strerror(errno));
+    close(srv);
     notify_ready(ready_fd, false);
     return 1;
   }
@@ -2906,9 +2917,10 @@ int run_daemon() {
                         kRuntimeAbi);
   g_exit_history.start(true);
   g_exit_history.drain(query_runtime_snapshot, cancel_unbound_hyos_sessions);
-  DLOGI("zygiskd up: unix @%s, netlink proto=%d, modules=%s, config=%s, "
+  DLOGI("zygiskd up: endpoint registered, netlink proto=%d, modules=%s, "
+        "config=%s, "
         "policy=%s",
-        zygiskd::kSocketName, YZ_NETLINK_PROTO, yzhost::modules_dir().c_str(),
+        YZ_NETLINK_PROTO, yzhost::modules_dir().c_str(),
         yzhost::config_path().c_str(), yzpolicy::source_name());
   notify_ready(ready_fd, true);
 

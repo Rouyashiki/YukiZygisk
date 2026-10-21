@@ -54,6 +54,7 @@ add_subdirectory(
 target_compile_definitions(lsplt_static PRIVATE LOG_DISABLED)
 
 add_library(zygisk SHARED
+    ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/core.cpp
     src/hook.cpp
@@ -112,6 +113,7 @@ target_link_options(zygisk PRIVATE -Wl,--gc-sections -Wl,--strip-all
                     -Wl,--as-needed)
 
 add_library(yukizncore SHARED
+    ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/hyos_runtime.cpp
     src/yukizncore.cpp
@@ -155,6 +157,7 @@ target_link_options(yukizncore PRIVATE -Wl,--gc-sections -Wl,--strip-all
 # yuki_dlopen_memfd/dlsym/dlclose). Same source as compiled-in; no lsplt/solist
 # deps.
 add_library(yukilinker SHARED
+    ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/yukilinker.cpp
     ${YUKIZYGISK_RUNTIME_LOG_SOURCES}

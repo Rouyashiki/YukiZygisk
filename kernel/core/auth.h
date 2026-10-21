@@ -25,6 +25,7 @@ void yz_auth_exit(void);
 struct yz_auth_session *yz_auth_open(bool launcher);
 void yz_auth_release(struct yz_auth_session *session);
 /* A successful begin holds the authorization mutex until end. */
+bool yz_auth_endpoint_abi(u32 abi);
 int yz_auth_begin(struct yz_auth_session *session, unsigned int request,
 		  void __user *arg);
 void yz_auth_end(void);

@@ -23,14 +23,15 @@
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
 
-#include "host/lsm.h"
 #include "core/auth.h"
+#include "host/lsm.h"
 #include "host/runtime.h"
-#include "tango.h"
+#include "internal.h"
 #include "klog.h"
+#include "tango.h"
 
 #define YZ_TANGO_PHNUM 32
-#define YZ_TANGO_STUB_SIZE 176
+#define YZ_TANGO_STUB_SIZE 208
 #define YZ_TANGO_SLOTS 16
 #define YZ_R_ARM_JUMP_SLOT 22
 
@@ -296,30 +297,41 @@ static u32 yz_tango_padding(const struct yz_tango_image *image,
 }
 
 static void yz_tango_bootstrap(u8 *bytes, u32 got, u32 original, u32 stub,
-			       u32 dlopen, u32 dlsym, int fd)
+			       u32 dlopen, u32 dlsym, int fd,
+			       const struct yz_early_packet_state *packet)
 {
 	/* Thumb: save r0-r12/lr, dlopen(fd), close(fd), dlsym, call, restore,
 	 * then tail-call __libc_init without rewinding the translator state. */
 	/* Bionic LP32: RTLD_NOW=0; 2 is RTLD_GLOBAL and blocks unloading. */
-	static const u8 code[64] = {
-	    0x2d, 0xe9, 0xff, 0x5f, 0x0f, 0xf2, 0x38, 0x04, 0x04, 0xf1, 0x48,
-	    0x00, 0x00, 0x21, 0x04, 0xf1, 0x20, 0x02, 0x63, 0x68, 0x25, 0x69,
-	    0xa8, 0x47, 0x06, 0x46, 0xa0, 0x69, 0x06, 0x27, 0x00, 0xdf, 0x56,
-	    0xb1, 0x30, 0x46, 0x04, 0xf1, 0x58, 0x01, 0x62, 0x68, 0x65, 0x69,
-	    0xa8, 0x47, 0x18, 0xb1, 0x05, 0x46, 0x94, 0xe8, 0x0f, 0x00, 0xa8,
-	    0x47, 0xbd, 0xe8, 0xff, 0x5f, 0xdf, 0xf8, 0x04, 0xf0,
+	static const u8 code[88] = {
+	    0x2d, 0xe9, 0xff, 0x5f, 0x0f, 0xf2, 0x50, 0x04, 0x04, 0xf1, 0x50,
+	    0x00, 0x00, 0x21, 0x04, 0xf1, 0x28, 0x02, 0x63, 0x68, 0x25, 0x69,
+	    0xa8, 0x47, 0x06, 0x46, 0xa0, 0x69, 0x06, 0x27, 0x00, 0xdf, 0x7e,
+	    0xb1, 0x30, 0x46, 0x04, 0xf1, 0x60, 0x01, 0x62, 0x68, 0x65, 0x69,
+	    0xa8, 0x47, 0x40, 0xb1, 0x05, 0x46, 0x82, 0xb0, 0xe0, 0x69, 0x00,
+	    0x90, 0x94, 0xe8, 0x0f, 0x00, 0xa8, 0x47, 0x02, 0xb0, 0x05, 0xe0,
+	    0xe0, 0x69, 0x01, 0x38, 0x06, 0x27, 0x00, 0xdf, 0x20, 0x6a, 0x00,
+	    0xdf, 0xbd, 0xe8, 0xff, 0x5f, 0xdf, 0xf8, 0x08, 0xf0, 0x00, 0xbf,
 	};
-	u32 data[] = {got,    original, stub, YZ_TANGO_STUB_SIZE,
-		      dlopen, dlsym,	fd,   0};
+	u32 data[] = {got,
+		      original,
+		      stub,
+		      YZ_TANGO_STUB_SIZE,
+		      dlopen,
+		      dlsym,
+		      fd,
+		      packet->packet_fd + 1,
+		      packet->endpoint_fd,
+		      0};
 	u64 flags = 0x10; /* ANDROID_DLEXT_USE_LIBRARY_FD */
 
 	memset(bytes, 0, YZ_TANGO_STUB_SIZE);
 	memcpy(bytes, code, sizeof(code));
-	memcpy(bytes + 64, data, sizeof(data));
-	memcpy(bytes + 96, &flags, sizeof(flags));
-	memcpy(bytes + 116, &fd, sizeof(fd));
-	memcpy(bytes + 136, "libzygisk32.so", sizeof("libzygisk32.so"));
-	memcpy(bytes + 152, "zygisk_core_entry_tango",
+	memcpy(bytes + 88, data, sizeof(data));
+	memcpy(bytes + 128, &flags, sizeof(flags));
+	memcpy(bytes + 148, &fd, sizeof(fd));
+	memcpy(bytes + 168, "libzygisk32.so", sizeof("libzygisk32.so"));
+	memcpy(bytes + 184, "zygisk_core_entry_tango",
 	       sizeof("zygisk_core_entry_tango"));
 }
 
@@ -364,6 +376,7 @@ out:
 static void yz_tango_inject(struct callback_head *cb)
 {
 	struct yz_tango_work *work = container_of(cb, struct yz_tango_work, cb);
+	struct yz_early_packet_state packet;
 	struct vm_area_struct *vma;
 	unsigned long app = 0, linker = 0;
 	u64 dlopen_off, dlsym_off;
@@ -373,6 +386,8 @@ static void yz_tango_inject(struct callback_head *cb)
 	u32 count = 0;
 	const char *stage = "images";
 	bool redirected = false;
+
+	yz_early_native_packet_init(&packet);
 
 	if (!yz_auth_injection_ticket_alive(&work->ticket) ||
 	    !yz_tango_active() || current->mm != work->mm ||
@@ -424,9 +439,11 @@ static void yz_tango_inject(struct callback_head *cb)
 		    current->tgid, stub);
 		goto finish;
 	}
+	if (yz_stage_bootstrap_packet(0, NULL, true, &packet) < 0)
+		goto finish;
 	yz_tango_bootstrap(bytes, got, original, stub,
 			   work->linker.bias + dlopen_off,
-			   work->linker.bias + dlsym_off, fd);
+			   work->linker.bias + dlsym_off, fd, &packet);
 	if (!yz_auth_injection_ticket_alive(&work->ticket))
 		goto finish;
 	n = access_process_vm(current, stub, bytes, sizeof(bytes),
@@ -459,6 +476,8 @@ finish:
 	pr_info("yukizygisk: Tango guest bootstrap pid=%d got=%x stub=%x "
 		"redirected=%d\n",
 		current->tgid, got, stub, redirected);
+	if (!redirected)
+		yz_early_native_packet_close(&packet);
 	yz_tango_finish(generation, fd, redirected);
 	goto out;
 skipped:

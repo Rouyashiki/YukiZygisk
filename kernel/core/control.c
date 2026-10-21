@@ -637,6 +637,12 @@ static long yukizygisk_ioctl_dispatch(struct file *file,
 		return yz_ioctl_get_runtime(uarg);
 	case YZ_IOCTL_GET_EXIT_HISTORY_FD:
 		return yz_exit_history_get_fd(uarg);
+	case YZ_IOCTL_REGISTER_ENDPOINT:
+		return yz_endpoint_register(uarg);
+	case YZ_IOCTL_UNREGISTER_ENDPOINT:
+		return yz_endpoint_unregister(uarg);
+	case YZ_IOCTL_GET_ENDPOINT_STATE_FD:
+		return yz_endpoint_get_fd(uarg);
 	case YZ_IOCTL_GET_HEALTH:
 		return yz_exit_history_get_health(uarg);
 	case YZ_IOCTL_REPORT_RUNTIME:

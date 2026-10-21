@@ -19,6 +19,8 @@ const char *availability_name(health::Availability value) {
   switch (value) {
   case health::Availability::Available:
     return "available";
+  case health::Availability::Unpublished:
+    return "not_published";
   case health::Availability::Missing:
     return "missing";
   case health::Availability::Unresponsive:
@@ -135,7 +137,8 @@ json::Value daemon_health(Host &host) {
   health::ViolaIdentityContext identity;
   identity.control_fd = host.native_handle();
   const auto replies = health::query_all(
-      health::kQueryTimeoutMs, health::verify_viola_identity, &identity);
+      health::endpoint_state_fd, &identity, health::kQueryTimeoutMs,
+      health::verify_viola_identity, &identity);
   json::Value result = json::Value::array();
   for (size_t index = 0; index < replies.size(); ++index) {
     const auto &reply = replies[index];

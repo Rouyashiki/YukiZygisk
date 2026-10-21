@@ -38,8 +38,8 @@ constexpr yz_config from_flags(__u16 flags) {
 
 static_assert(sizeof(yz_config) == 4);
 static_assert(offsetof(yz_config, memory_type) == 3);
-static_assert(sizeof(yz_early_native_packet_header) == 16);
-static_assert(offsetof(yz_early_native_packet_header, count) == 12);
+static_assert(sizeof(yz_bootstrap_packet_header) == 24);
+static_assert(offsetof(yz_bootstrap_packet_header, count) == 12);
 static_assert(sizeof(yz_early_native_snapshot_header) == 72);
 static_assert(offsetof(yz_early_native_snapshot_header, flags) == 12);
 

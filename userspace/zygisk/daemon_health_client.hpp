@@ -10,6 +10,7 @@
 
 #include "daemon_health.hpp"
 #include "daemon_state.hpp"
+#include "endpoint.hpp"
 #include "kernel/uapi/viola.h"
 #include "kernel/uapi/viola_health.h"
 
@@ -33,6 +34,7 @@ namespace yukizygisk::health {
 enum class Availability {
   Available,
   Missing,
+  Unpublished,
   Unresponsive,
   Unsupported,
   IdentityError,
@@ -109,6 +111,22 @@ inline bool verify_viola_identity(uint32_t abi, pid_t pid, uint64_t start_ticks,
   return true;
 }
 
+inline int endpoint_state_fd(uint32_t abi, void *opaque) {
+  auto *context = static_cast<ViolaIdentityContext *>(opaque);
+  yz_runtime_query_cmd capabilities{};
+  if (ioctl(context->control_fd, YZ_IOCTL_GET_RUNTIME, &capabilities) != 0)
+    return -1;
+  if (!(capabilities.capabilities & YZ_RUNTIME_CAP_ENDPOINT_STATE)) {
+    errno = EPROTONOSUPPORT;
+    return -1;
+  }
+  yz_endpoint_fd_cmd command{YZ_ENDPOINT_VERSION, abi, -1, 0};
+  return ioctl(context->control_fd, YZ_IOCTL_GET_ENDPOINT_STATE_FD, &command) ==
+                 0
+             ? command.fd
+             : -1;
+}
+
 namespace client_detail {
 
 using Deadline = std::chrono::steady_clock::time_point;
@@ -119,6 +137,9 @@ struct Connection {
   Connection &operator=(const Connection &) = delete;
   Connection(Connection &&) = delete;
   Connection &operator=(Connection &&) = delete;
+  endpoint::Mapping endpoint;
+  yz_endpoint_state registered{};
+  unsigned discoveries = 0;
   int fd = -1;
   int pidfd = -1;
   pid_t pid = 0;
@@ -196,9 +217,47 @@ inline bool identity(Connection &connection, uint32_t abi, Deadline deadline,
          std::chrono::steady_clock::now() < deadline;
 }
 
-inline std::array<QueryResult, 2> query_mask(unsigned mask, int timeout_ms,
-                                             IdentityVerifier verify,
-                                             void *context) {
+inline Availability endpoint_availability(int error) {
+  if (error == ENOENT)
+    return Availability::Unpublished;
+  if (error == ECONNREFUSED)
+    return Availability::Missing;
+  if (error == EOPNOTSUPP || error == EPROTONOSUPPORT || error == ENOTTY)
+    return Availability::Unsupported;
+  if (error == EAGAIN || error == ETIMEDOUT)
+    return Availability::Unresponsive;
+  if (error == EACCES || error == ESTALE)
+    return Availability::IdentityError;
+  return Availability::Error;
+}
+
+inline bool discover(Connection &connection, int error = ENOENT) {
+  if (connection.fd >= 0) {
+    close(connection.fd);
+    connection.fd = -1;
+  }
+  if (connection.pidfd >= 0) {
+    close(connection.pidfd);
+    connection.pidfd = -1;
+  }
+  while (connection.discoveries < 2) {
+    ++connection.discoveries;
+    connection.fd = endpoint::start(connection.endpoint, connection.registered);
+    if (connection.fd >= 0) {
+      connection.stage = 1;
+      return true;
+    }
+    error = errno;
+    if (!endpoint::rediscoverable(error))
+      break;
+  }
+  connection.finish(endpoint_availability(error), error);
+  return false;
+}
+
+inline std::array<QueryResult, 2>
+query_mask(endpoint::Provider provider, void *provider_context, unsigned mask,
+           int timeout_ms, IdentityVerifier verify, void *context) {
   using Clock = std::chrono::steady_clock;
   const auto deadline =
       Clock::now() + std::chrono::milliseconds(std::max(0, timeout_ms));
@@ -207,31 +266,20 @@ inline std::array<QueryResult, 2> query_mask(unsigned mask, int timeout_ms,
     auto &connection = connections[index];
     if ((mask & (1U << index)) == 0)
       continue;
-    connection.fd =
-        socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (connection.fd < 0) {
-      connection.finish(Availability::Error, errno);
+    const uint32_t abi = static_cast<uint32_t>(index + 1);
+    const int state_fd = provider(abi, provider_context);
+    if (state_fd < 0) {
+      connection.finish(endpoint_availability(errno), errno);
       continue;
     }
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    const char *name = index == 0 ? "zygiskd32" : "zygiskd64";
-    const size_t name_length = strlen(name);
-    memcpy(address.sun_path + 1, name, name_length);
-    const auto address_length = static_cast<socklen_t>(
-        offsetof(sockaddr_un, sun_path) + 1 + name_length);
-    if (connect(connection.fd, reinterpret_cast<sockaddr *>(&address),
-                address_length) != 0 &&
-        errno != EINPROGRESS) {
-      const int error = errno;
-      connection.finish(error == ENOENT || error == ECONNREFUSED
-                            ? Availability::Missing
-                        : error == EAGAIN ? Availability::Unresponsive
-                                          : Availability::Error,
-                        error);
+    const bool mapped = connection.endpoint.map(state_fd, abi);
+    const int error = errno;
+    close(state_fd);
+    if (!mapped) {
+      connection.finish(endpoint_availability(error), error);
       continue;
     }
-    connection.stage = 1;
+    discover(connection);
   }
   for (;;) {
     std::array<pollfd, 2> descriptors{};
@@ -261,15 +309,15 @@ inline std::array<QueryResult, 2> query_mask(unsigned mask, int timeout_ms,
       if (connection.stage == 0 || descriptors[index].revents == 0)
         continue;
       if (connection.stage == 1) {
-        int error = 0;
-        socklen_t length = sizeof(error);
-        if (getsockopt(connection.fd, SOL_SOCKET, SO_ERROR, &error, &length) !=
-                0 ||
-            error != 0) {
-          connection.finish(Availability::Error, error != 0 ? error : errno);
+        if (!endpoint::validate(connection.fd, connection.endpoint,
+                                connection.registered)) {
+          const int error = errno;
+          if (endpoint::rediscoverable(error))
+            discover(connection, error);
+          else
+            connection.finish(endpoint_availability(error), error);
           continue;
         }
-        errno = 0;
         if (!identity(connection, static_cast<uint32_t>(index + 1), deadline,
                       verify, context)) {
           const int error = errno != 0 ? errno : EACCES;
@@ -283,6 +331,15 @@ inline std::array<QueryResult, 2> query_mask(unsigned mask, int timeout_ms,
         connection.stage = 2;
       }
       if (connection.stage == 2) {
+        if (!endpoint::validate(connection.fd, connection.endpoint,
+                                connection.registered)) {
+          const int error = errno;
+          if (endpoint::rediscoverable(error))
+            discover(connection, error);
+          else
+            connection.finish(endpoint_availability(error), error);
+          continue;
+        }
         const ssize_t sent = send(connection.fd, &kRequest, sizeof(kRequest),
                                   MSG_DONTWAIT | MSG_NOSIGNAL);
         if (sent < 0 && (errno == EAGAIN || errno == EINTR))
@@ -376,13 +433,17 @@ inline std::array<QueryResult, 2> query_mask(unsigned mask, int timeout_ms,
 
 } // namespace client_detail
 
-inline std::array<QueryResult, 2> query_all(int timeout_ms = kQueryTimeoutMs,
+inline std::array<QueryResult, 2> query_all(endpoint::Provider provider,
+                                            void *provider_context,
+                                            int timeout_ms = kQueryTimeoutMs,
                                             IdentityVerifier verify = nullptr,
                                             void *context = nullptr) {
-  return client_detail::query_mask(3, timeout_ms, verify, context);
+  return client_detail::query_mask(provider, provider_context, 3, timeout_ms,
+                                   verify, context);
 }
 
-inline QueryResult query(uint32_t abi, int timeout_ms = kQueryTimeoutMs,
+inline QueryResult query(endpoint::Provider provider, void *provider_context,
+                         uint32_t abi, int timeout_ms = kQueryTimeoutMs,
                          IdentityVerifier verify = nullptr,
                          void *context = nullptr) {
   if (abi != 1 && abi != 2) {
@@ -390,8 +451,8 @@ inline QueryResult query(uint32_t abi, int timeout_ms = kQueryTimeoutMs,
     result.error = EINVAL;
     return result;
   }
-  return client_detail::query_mask(1U << (abi - 1), timeout_ms, verify,
-                                   context)[abi - 1];
+  return client_detail::query_mask(provider, provider_context, 1U << (abi - 1),
+                                   timeout_ms, verify, context)[abi - 1];
 }
 
 } // namespace yukizygisk::health

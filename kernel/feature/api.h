@@ -62,4 +62,15 @@ bool yz_runtime_is_native(pid_t pid, u64 start_boottime);
 u8 yz_runtime_task_abi(struct task_struct *task);
 u8 yz_runtime_report_abi(u32 pid, u32 generation);
 
+int yz_endpoint_init(void);
+void yz_endpoint_exit(void);
+void yz_endpoint_invalidate(void);
+void yz_endpoint_enable(void);
+void yz_endpoint_suspend(void);
+bool yz_endpoint_supported(void);
+int yz_endpoint_install_fd(u32 abi);
+int yz_endpoint_get_fd(void __user *arg);
+int yz_endpoint_register(void __user *arg);
+int yz_endpoint_unregister(void __user *arg);
+
 #endif

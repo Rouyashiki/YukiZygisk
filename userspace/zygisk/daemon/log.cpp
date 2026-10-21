@@ -246,7 +246,7 @@ void write_kernel(LogLevel level, LogSource source, pid_t pid, uid_t uid,
   std::array<char, kKernelRecordSize> record{};
   const int length =
       snprintf(record.data(), record.size(), "<%d>yukizygisk: %s %s[%d:%u]: %s",
-               kernel_priority(level), kSocketName, source_name(source), pid,
+               kernel_priority(level), kDaemonLabel, source_name(source), pid,
                static_cast<unsigned int>(uid), message);
   if (length <= 0)
     return;
@@ -280,7 +280,7 @@ void emit(LogLevel level, LogSource source, pid_t pid, uid_t uid,
                "%04d-%02d-%02d %02d:%02d:%02d.%03ld %c/%s %s[%d:%u]: %s\n",
                local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
                local.tm_hour, local.tm_min, local.tm_sec, now.tv_nsec / 1000000,
-               level_char(level), kSocketName, source_name(source), pid,
+               level_char(level), kDaemonLabel, source_name(source), pid,
                static_cast<unsigned int>(uid), clean.data());
   if (length > 0) {
     const size_t size =

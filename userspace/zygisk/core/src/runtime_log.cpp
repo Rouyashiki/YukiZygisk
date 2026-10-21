@@ -8,6 +8,7 @@
  */
 
 #include "log.hpp"
+#include "userspace/zygisk/endpoint.hpp"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -42,22 +43,8 @@ struct ErrnoGuard {
 };
 
 int connect_zygiskd() {
-  const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-  if (fd < 0)
-    return -1;
-
-  sockaddr_un address{};
-  address.sun_family = AF_UNIX;
-  const size_t length = strlen(zygiskd::kSocketName);
-  memcpy(address.sun_path + 1, zygiskd::kSocketName, length);
-  const auto address_length =
-      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + length);
-  if (connect(fd, reinterpret_cast<sockaddr *>(&address), address_length) !=
-      0) {
-    close(fd);
-    return -1;
-  }
-  return fd;
+  return yukizygisk::endpoint::connect(yukizygisk::endpoint::Clock::now(),
+                                       true);
 }
 
 } // namespace

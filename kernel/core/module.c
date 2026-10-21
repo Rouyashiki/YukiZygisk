@@ -41,6 +41,7 @@ MODULE_PARM_DESC(init_stage_mask,
 #define YZ_INIT_STAGE_CONTROL 0x10u
 #define YZ_INIT_STAGE_BOOTSTRAP 0x20u
 
+static bool yz_stage_endpoint_active;
 static bool yz_stage_exec_active;
 static bool yz_stage_events_active;
 static bool yz_stage_lifecycle_active;
@@ -63,6 +64,7 @@ static void yukizygisk_deactivate_locked(bool skip_bootstrap)
 			yz_stage_bootstrap_active = false;
 		}
 	}
+	yz_endpoint_invalidate();
 	if (yz_stage_control_active) {
 		yukizygisk_control_exit();
 		yz_stage_control_active = false;
@@ -110,6 +112,10 @@ static void yukizygisk_deactivate_locked(bool skip_bootstrap)
 			yz_stage_policy_active = false;
 		}
 	}
+	if (yz_stage_endpoint_active) {
+		yz_endpoint_exit();
+		yz_stage_endpoint_active = false;
+	}
 	if (yz_stage_host_active && !yz_stage_policy_active) {
 		yz_host_exit();
 		yz_stage_host_active = false;
@@ -144,6 +150,10 @@ static int __init yukizygisk_init(void)
 	if (ret)
 		goto err_control;
 	yz_stage_auth_active = true;
+	ret = yz_endpoint_init();
+	if (ret)
+		goto err_control;
+	yz_stage_endpoint_active = true;
 	yz_exit_history_init();
 	yz_stage_history_active = true;
 	ret = yz_process_exit_enable();

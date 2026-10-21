@@ -47,7 +47,8 @@ void viola_daemon_health(int control, int timeout_ms,
                          struct viola_health replies[2]) {
   health::ViolaIdentityContext context{control};
   const auto values =
-      health::query_all(timeout_ms, health::verify_viola_identity, &context);
+      health::query_all(health::endpoint_state_fd, &context, timeout_ms,
+                        health::verify_viola_identity, &context);
   for (unsigned index = 0; index < values.size(); ++index) {
     const auto &value = values[index];
     auto &reply = replies[index];
@@ -56,6 +57,7 @@ void viola_daemon_health(int control, int timeout_ms,
     case health::Availability::Available:
       reply.state = VIOLA_HEALTH_AVAILABLE;
       break;
+    case health::Availability::Unpublished:
     case health::Availability::Missing:
       reply.state = VIOLA_HEALTH_MISSING;
       break;

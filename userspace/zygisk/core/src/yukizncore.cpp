@@ -12,6 +12,7 @@
 #include "load_config.hpp"
 #include "log.hpp"
 #include "solist.hpp"
+#include "userspace/zygisk/endpoint.hpp"
 #include "yukilinker.hpp"
 #include "zygiskd.hpp"
 
@@ -186,21 +187,7 @@ int recv_fd(int sock, bool *message_received = nullptr) {
   return -1;
 }
 
-int connect_zygiskd() {
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (fd < 0)
-    return -1;
-  sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  size_t len = std::strlen(zygiskd::kSocketName);
-  memcpy(addr.sun_path + 1, zygiskd::kSocketName, len);
-  auto alen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + len);
-  if (connect(fd, reinterpret_cast<sockaddr *>(&addr), alen) != 0) {
-    close(fd);
-    return -1;
-  }
-  return fd;
-}
+int connect_zygiskd() { return yukizygisk::endpoint::connect(); }
 
 using HyosClock = std::chrono::steady_clock;
 using HyosDeadline = HyosClock::time_point;
@@ -299,31 +286,7 @@ int recv_fd_until(int sock, const HyosDeadline &deadline,
 }
 
 int connect_zygiskd_for_hyos(const HyosDeadline &deadline) {
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-  if (fd < 0)
-    return -1;
-  sockaddr_un address{};
-  address.sun_family = AF_UNIX;
-  const size_t length = std::strlen(zygiskd::kSocketName);
-  memcpy(address.sun_path + 1, zygiskd::kSocketName, length);
-  const auto address_length =
-      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + length);
-  if (connect(fd, reinterpret_cast<sockaddr *>(&address), address_length) !=
-      0) {
-    if ((errno != EINPROGRESS && errno != EAGAIN) ||
-        !wait_socket_event_until(fd, POLLOUT, deadline)) {
-      close(fd);
-      return -1;
-    }
-    int error = 0;
-    socklen_t error_length = sizeof(error);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_length) != 0 ||
-        error != 0) {
-      close(fd);
-      return -1;
-    }
-  }
-  return fd;
+  return yukizygisk::endpoint::connect(deadline, true);
 }
 
 int request_fd(ZdRequest req, uint32_t arg) {
@@ -1195,11 +1158,11 @@ void load_early_modules() {
     return;
   g_early_packet_fd = -1;
 
-  yz_early_native_packet_header hdr{};
+  yz_bootstrap_packet_header hdr{};
   if (lseek(packet_fd, 0, SEEK_SET) != 0 ||
       !read_all(packet_fd, &hdr, sizeof(hdr)) ||
-      hdr.magic != YZ_EARLY_NATIVE_PACKET_MAGIC ||
-      hdr.version != YZ_EARLY_NATIVE_VERSION ||
+      hdr.magic != YZ_BOOTSTRAP_PACKET_MAGIC ||
+      hdr.version != YZ_BOOTSTRAP_PACKET_VERSION ||
       hdr.header_size != sizeof(hdr) ||
       hdr.entry_size != sizeof(yz_early_native_packet_entry) ||
       hdr.count > YZ_NATIVE_TARGET_MAX) {
@@ -1649,16 +1612,28 @@ zygisk_core_entry(const char * /*self_path*/, void *loader_self,
   g_self_size = reinterpret_cast<size_t>(core_size);
   g_early_packet_fd =
       early_packet_fd_plus1 > 0 ? early_packet_fd_plus1 - 1 : -1;
+  if (!yukizygisk::endpoint::initialize(g_early_packet_fd, true)) {
+    yukizygisk::endpoint::close_packet(g_early_packet_fd, false);
+    g_early_packet_fd = -1;
+    return;
+  }
   g_loader_unmap_safe = rebind_self_dl_iterate_slot(g_self_base);
   core_start();
 }
 
 extern "C" [[gnu::visibility("default")]] void
-zygisk_core_entry_direct(int /*core_fd*/) {
+zygisk_core_entry_direct(int /*core_fd*/, int early_packet_fd_plus1) {
   g_loader_base = 0;
   g_self_base = 0;
   g_self_size = 0;
-  g_early_packet_fd = -1;
+  g_early_packet_fd =
+      early_packet_fd_plus1 > 0 ? early_packet_fd_plus1 - 1 : -1;
+  if (!yukizygisk::endpoint::initialize(g_early_packet_fd, true)) {
+    yukizygisk::endpoint::close_packet(g_early_packet_fd, false);
+    g_early_packet_fd = -1;
+    return;
+  }
+
   g_loader_unmap_safe = true;
   core_start();
 }

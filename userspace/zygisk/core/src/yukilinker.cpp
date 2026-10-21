@@ -19,6 +19,7 @@
 
 #include "yukilinker.hpp"
 #include "load_config.hpp"
+#include "userspace/zygisk/endpoint.hpp"
 
 #include <algorithm>
 #include <android/dlext.h>
@@ -2358,25 +2359,8 @@ bool read_exactly(int fd, void *buffer, size_t bytes) {
 }
 
 void close_early_packet(int packet_fd) {
-  if (packet_fd < 0)
-    return;
-  yz_early_native_packet_header header{};
-  if (lseek(packet_fd, 0, SEEK_SET) == 0 &&
-      read_exactly(packet_fd, &header, sizeof(header)) &&
-      header.magic == YZ_EARLY_NATIVE_PACKET_MAGIC &&
-      header.version == YZ_EARLY_NATIVE_VERSION &&
-      header.header_size == sizeof(header) &&
-      header.entry_size == sizeof(yz_early_native_packet_entry) &&
-      header.count <= YZ_NATIVE_TARGET_MAX) {
-    for (uint32_t i = 0; i < header.count; ++i) {
-      yz_early_native_packet_entry entry{};
-      if (!read_exactly(packet_fd, &entry, sizeof(entry)))
-        break;
-      if (entry.fd >= 0)
-        raw_close_descriptor(entry.fd);
-    }
-  }
-  raw_close_descriptor(packet_fd);
+  yukizygisk::endpoint::close_packet(packet_fd);
+  yukizygisk::endpoint::release();
 }
 
 #if defined(__LP64__)
@@ -2430,6 +2414,11 @@ yuki_core_dlopen_memfd(int memfd, const char *vma_name, bool file_backed) {
     return;
   }
 
+  if (!yukizygisk::endpoint::initialize(packet_fd, false)) {
+    raw_close_descriptor(core_fd);
+    close_early_packet(packet_fd);
+    return;
+  }
   yz_config config = yukizygisk::config::early_config(packet_fd);
   (void)yukizygisk::config::read_runtime(&config);
   yukilinker::SoHandle *core = nullptr;
@@ -2481,9 +2470,11 @@ yuki_core_dlopen_memfd(int memfd, const char *vma_name, bool file_backed) {
   if (core != nullptr && finalize != nullptr && handoff_complete != nullptr &&
       handoff_complete() && !yukilinker::release_bootstrap_metadata(core)) {
     ZLOGE("bootstrap metadata cleanup failed; retaining loader");
+    yukizygisk::endpoint::release();
     return;
   }
   yukilinker::finalize_self_dso();
+  yukizygisk::endpoint::release();
   if (finalize != nullptr) [[clang::musttail]]
     return finalize(0, 0);
 }

@@ -57,6 +57,7 @@ struct yz_file_load_policy;
 
 struct yz_early_packet_state {
 	int packet_fd;
+	int endpoint_fd;
 	int module_fds[YZ_NATIVE_TARGET_MAX];
 	u32 module_fd_count;
 };
@@ -97,9 +98,8 @@ const char *yz_early_native_loader_path(bool compat);
 const char *yz_early_native_core_path(bool compat);
 void yz_early_native_packet_init(struct yz_early_packet_state *state);
 void yz_early_native_packet_close(struct yz_early_packet_state *state);
-int yz_early_native_stage_packet(u8 target_type, const char *target,
-				 bool compat,
-				 struct yz_early_packet_state *state);
+int yz_stage_bootstrap_packet(u8 target_type, const char *target, bool compat,
+			      struct yz_early_packet_state *state);
 void yz_payload_close_fd(int fd);
 void yz_payload_cache_name(char *buf, size_t len);
 int yz_payload_stage_image(const char *path, const char *name,

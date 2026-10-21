@@ -629,6 +629,7 @@ static bool yz_auth_query_request(unsigned int request)
 	       request == YZ_IOCTL_GET_RUNTIME ||
 	       request == YZ_IOCTL_GET_EXIT_HISTORY_FD ||
 	       request == YZ_IOCTL_GET_HEALTH ||
+	       request == YZ_IOCTL_GET_ENDPOINT_STATE_FD ||
 	       request == YZ_IOCTL_GET_ZYGOTE_VARIANTS ||
 	       request == YZ_IOCTL_UID_SHOULD_UMOUNT;
 }
@@ -667,6 +668,8 @@ int yz_auth_begin(struct yz_auth_session *s, unsigned int request,
 		if (s->role == YZ_VIOLA_DAEMON32)
 			return 0;
 		break;
+	case YZ_IOCTL_REGISTER_ENDPOINT:
+	case YZ_IOCTL_UNREGISTER_ENDPOINT:
 	case YZ_IOCTL_HANDOFF:
 	case YZ_IOCTL_UMOUNT_PID:
 	case YZ_IOCTL_UNMAP_PID:
@@ -690,6 +693,20 @@ fail:
 void yz_auth_end(void)
 {
 	mutex_unlock(&yz_auth_lock);
+}
+
+bool yz_auth_endpoint_abi(u32 abi)
+{
+	struct yz_auth_session *session;
+	u32 role = abi == YZ_RUNTIME_ABI_32   ? YZ_VIOLA_DAEMON32
+		   : abi == YZ_RUNTIME_ABI_64 ? YZ_VIOLA_DAEMON64
+					      : 0;
+
+	lockdep_assert_held(&yz_auth_lock);
+	list_for_each_entry (session, &yz_auth_sessions, list)
+		if (session->role == role && yz_auth_is_owner(session, true))
+			return true;
+	return false;
 }
 
 int yz_auth_current_ticket(struct yz_auth_ticket *ticket)

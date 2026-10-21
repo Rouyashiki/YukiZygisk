@@ -17,6 +17,7 @@ endif()
 
 set(ZYGISKD_SOURCES
   ${PROJECT_SOURCE_DIR}/userspace/common/cxx_slim.cpp
+  ../endpoint.cpp
   catalog.cpp
   crash_monitor.cpp
   exit_history.cpp

@@ -95,9 +95,9 @@ static_assert(sizeof(ModuleInfo) == 64);
 static_assert(sizeof(ZygoteModuleReport) == 76);
 
 #if defined(__LP64__)
-inline constexpr char kSocketName[] = "zygiskd64";
+inline constexpr char kDaemonLabel[] = "zygiskd64";
 #else
-inline constexpr char kSocketName[] = "zygiskd32";
+inline constexpr char kDaemonLabel[] = "zygiskd32";
 #endif // #if defined(__LP64__)
 
 } // namespace zygiskd

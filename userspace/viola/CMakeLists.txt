@@ -35,7 +35,7 @@ target_compile_options(viola_module_loader PRIVATE
   -Os -Wall -Wextra -Werror -fno-exceptions -fno-rtti
   -ffunction-sections -fdata-sections)
 
-add_executable(viola main.c recovery.cpp)
+add_executable(viola main.c recovery.cpp ../zygisk/endpoint.cpp)
 target_compile_features(viola PRIVATE cxx_std_17)
 target_include_directories(viola PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(viola PRIVATE viola_crypto viola_module_loader)

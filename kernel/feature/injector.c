@@ -381,6 +381,17 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		    0x00, 0x00, 0x00, 0x00,
 		};
 		static_assert(sizeof(compat_tmpl) == 0x68);
+		static const u8 cleanup64[] = {
+		    0x69, 0x02, 0x14, 0x91, 0x2a, 0x45, 0x40, 0xb8,
+		    0x28, 0x07, 0x80, 0xd2, 0x20, 0x45, 0x40, 0xb8,
+		    0x01, 0x00, 0x00, 0xd4, 0x4a, 0x05, 0x00, 0x71,
+		    0xa1, 0xff, 0xff, 0x54, 0xe9, 0xff, 0xff, 0x17,
+		};
+		static const u8 cleanup32[] = {
+		    0x08, 0xf2, 0x00, 0x59, 0x59, 0xf8, 0x04, 0x6b, 0x06,
+		    0x27, 0x59, 0xf8, 0x04, 0x0b, 0x00, 0xdf, 0xb6, 0xf1,
+		    0x01, 0x06, 0xf9, 0xd1, 0xff, 0xf7, 0x97, 0xbf,
+		};
 		u32 code[ARRAY_SIZE(tmpl)];
 		u8 compat_code[ARRAY_SIZE(compat_tmpl)];
 		struct yz_dlextinfo extinfo;
@@ -391,6 +402,8 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		unsigned long redirected_entry;
 		int loader_fd, core_fd, stub_core_fd;
 		int early_packet_arg, werr;
+		s32 cleanup_fds[YZ_NATIVE_TARGET_MAX + 4];
+		u32 cleanup_count = 0, cleanup_index;
 		bool copy_failed, yuki;
 		const char *lib_str, *entry_str;
 		const char *loader_path, *core_path;
@@ -463,10 +476,11 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		}
 
 		early_packet_arg = 0;
-		if (native && tw->early_native) {
-			int ret = yz_early_native_stage_packet(
-			    tw->native_target_type, tw->label, compat,
-			    &early_packet);
+		{
+			int ret = yz_stage_bootstrap_packet(
+			    tw->native_target_type,
+			    native && tw->early_native ? tw->label : NULL,
+			    compat, &early_packet);
 
 			if (ret < 0 || early_packet.packet_fd < 0 ||
 			    early_packet.packet_fd >= 0xffff) {
@@ -517,17 +531,31 @@ static void yz_inject_tw_func(struct callback_head *cb)
 			goto out;
 		}
 
+		if (yuki)
+			cleanup_fds[++cleanup_count] = core_fd;
+		cleanup_fds[++cleanup_count] = early_packet.packet_fd;
+		cleanup_fds[++cleanup_count] = early_packet.endpoint_fd;
+		for (cleanup_index = 0;
+		     cleanup_index < early_packet.module_fd_count;
+		     ++cleanup_index)
+			cleanup_fds[++cleanup_count] =
+			    early_packet.module_fds[cleanup_index];
+		cleanup_fds[0] = cleanup_count;
 		memcpy(code, tmpl, sizeof(code));
 		yz_patch_imm64(&code[2], saved); /* x20 = real entry */
 		yz_patch_imm64(&code[6], dlopen_addr); /* x21 = dlopen */
 		yz_patch_imm64(&code[10], dlsym_addr); /* x23 = dlsym */
 		/* core fd argument */
 		stub_core_fd = yuki ? core_fd : -1;
-		code[40] = 0xd2800000u | (((u32)stub_core_fd & 0xffff) << 5);
+		code[40] = 0x14000018u; /* b cleanup at stub + 0x100 */
 		code[45] = 0xd2800000u | (((u32)stub_core_fd & 0xffff) << 5);
 		code[46] =
 		    0xd2800001u | (((u32)early_packet_arg & 0xffff) << 5);
 		memcpy(compat_code, compat_tmpl, sizeof(compat_code));
+		{
+			static const u8 branch[] = {0x00, 0xf0, 0x5e, 0xb8};
+			memcpy(compat_code + 0x40, branch, sizeof(branch));
+		}
 		{
 			u32 value = (u32)saved;
 
@@ -585,6 +613,13 @@ static void yz_inject_tw_func(struct callback_head *cb)
 				&extinfo, sizeof(extinfo));
 		}
 		if (copy_failed ||
+		    copy_to_user((void __user *)(stub + 0x100),
+				 compat ? cleanup32 : cleanup64,
+				 compat ? sizeof(cleanup32)
+					: sizeof(cleanup64)) ||
+		    copy_to_user((void __user *)(stub + 0x500), cleanup_fds,
+				 (cleanup_count + 1) *
+				     sizeof(cleanup_fds[0])) ||
 		    copy_to_user((void __user *)(stub + YZ_STUB_STR_OFF),
 				 lib_str, lib_len) ||
 		    copy_to_user((void __user *)(stub + YZ_STUB_ENTRY_STR_OFF),
@@ -618,7 +653,8 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		}
 
 		flush_icache_range(
-		    stub, stub + (compat ? sizeof(compat_code) : sizeof(code)));
+		    stub, stub + 0x100 +
+			      (compat ? sizeof(cleanup32) : sizeof(cleanup64)));
 
 		redirected_entry = compat ? stub | 1UL : stub;
 		werr = yz_auth_injection_ticket_alive(&tw->ticket)

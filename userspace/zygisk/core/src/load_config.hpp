@@ -10,6 +10,7 @@
 #pragma once
 
 #include "userspace/zygisk/daemon/zygiskd.hpp"
+#include "userspace/zygisk/endpoint.hpp"
 #include "userspace/zygisk/load_policy.hpp"
 
 #include <cerrno>
@@ -22,11 +23,11 @@
 namespace yukizygisk::config {
 
 inline yz_config early_config(int packet_fd) {
-  yz_early_native_packet_header header{};
+  yz_bootstrap_packet_header header{};
   if (packet_fd >= 0 &&
       pread(packet_fd, &header, sizeof(header), 0) == sizeof(header) &&
-      header.magic == YZ_EARLY_NATIVE_PACKET_MAGIC &&
-      header.version == YZ_EARLY_NATIVE_VERSION &&
+      header.magic == YZ_BOOTSTRAP_PACKET_MAGIC &&
+      header.version == YZ_BOOTSTRAP_PACKET_VERSION &&
       header.header_size == sizeof(header) &&
       header.entry_size == sizeof(yz_early_native_packet_entry) &&
       header.count <= YZ_NATIVE_TARGET_MAX)
@@ -35,7 +36,7 @@ inline yz_config early_config(int packet_fd) {
 }
 
 inline bool read_runtime(yz_config *config) {
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  int fd = yukizygisk::endpoint::connect();
   if (fd < 0)
     return false;
   timeval timeout{2, 0};
@@ -44,15 +45,8 @@ inline bool read_runtime(yz_config *config) {
     close(fd);
     return false;
   }
-  sockaddr_un address{};
-  address.sun_family = AF_UNIX;
-  constexpr size_t name_size = sizeof(zygiskd::kSocketName) - 1;
-  memcpy(address.sun_path + 1, zygiskd::kSocketName, name_size);
-  const auto size =
-      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name_size);
   const auto request = static_cast<uint8_t>(zygiskd::Request::GetConfig);
   bool ok =
-      connect(fd, reinterpret_cast<sockaddr *>(&address), size) == 0 &&
       send(fd, &request, sizeof(request), MSG_NOSIGNAL) == sizeof(request);
   yz_config incoming{};
   size_t received = 0;

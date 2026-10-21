@@ -130,6 +130,50 @@ struct yz_patch_text_cmd {
 #define YZ_IOCTL_PATCH_TEXT_V2                                                 \
   _IOC(_IOC_READ | _IOC_WRITE, YZ_IOCTL_MAGIC, 83, 0)
 
+#define YZ_IOCTL_REGISTER_ENDPOINT                                             \
+	_IOC(_IOC_READ | _IOC_WRITE, YZ_IOCTL_MAGIC, 84, 0)
+#define YZ_IOCTL_UNREGISTER_ENDPOINT _IOC(_IOC_WRITE, YZ_IOCTL_MAGIC, 85, 0)
+#define YZ_IOCTL_GET_ENDPOINT_STATE_FD                                         \
+	_IOC(_IOC_READ | _IOC_WRITE, YZ_IOCTL_MAGIC, 86, 0)
+
+#define YZ_ENDPOINT_VERSION 1
+#define YZ_ENDPOINT_NAME_LENGTH 32
+
+/* Fixed-width layout shared by ARM32 and ARM64; sequence protects all fields.
+ */
+struct yz_endpoint_state {
+	__u32 sequence;
+	__u32 version;
+	__u32 size;
+	__u32 available;
+	__u32 abi;
+	__u32 pid;
+	__aligned_u64 start_boottime;
+	__aligned_u64 generation;
+	__u32 name_length;
+	__u32 reserved;
+	char name[YZ_ENDPOINT_NAME_LENGTH];
+};
+
+struct yz_endpoint_register_cmd {
+	__u32 abi;
+	__s32 listener_fd;
+	__aligned_u64 generation;
+};
+
+struct yz_endpoint_unregister_cmd {
+	__u32 abi;
+	__u32 reserved;
+	__aligned_u64 generation;
+};
+
+struct yz_endpoint_fd_cmd {
+	__u32 version;
+	__u32 abi;
+	__s32 fd;
+	__u32 reserved;
+};
+
 #define YZ_PATCH_V2_REJECTED 0
 #define YZ_PATCH_V2_APPLIED 1
 #define YZ_PATCH_V2_INDETERMINATE 2
@@ -204,15 +248,18 @@ struct yz_early_native_entry {
 	char lib_path[YZ_NATIVE_MODULE_PATH_MAX];
 };
 
-#define YZ_EARLY_NATIVE_PACKET_MAGIC 0x59504e5a /* YPNZ */
+#define YZ_BOOTSTRAP_PACKET_MAGIC 0x59504e5a /* YPNZ */
+#define YZ_BOOTSTRAP_PACKET_VERSION 3
 
-struct yz_early_native_packet_header {
+struct yz_bootstrap_packet_header {
 	__u32 magic;
 	__u16 version;
 	__u16 header_size;
 	__u16 entry_size;
 	__u16 load_flags;
 	__u32 count;
+	__s32 endpoint_fd;
+	__u32 reserved;
 };
 
 struct yz_early_native_packet_entry {
@@ -363,6 +410,7 @@ enum yz_runtime_abi {
 #define YZ_RUNTIME_CAP_INJECTION_STATE (1U << 2)
 #define YZ_RUNTIME_CAP_EXIT_HISTORY (1U << 3)
 #define YZ_RUNTIME_CAP_HEALTH (1U << 4)
+#define YZ_RUNTIME_CAP_ENDPOINT_STATE (1U << 5)
 
 #define YZ_HEALTH_VERSION 1
 #define YZ_HEALTH_POLICY_NONE 0

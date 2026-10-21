@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <initializer_list>
 #include <thread>
 
@@ -27,9 +28,9 @@ int make_packet(__u16 flags) {
   int fd = mkstemp(path);
   assert(fd >= 0);
   assert(unlink(path) == 0);
-  yz_early_native_packet_header header{};
-  header.magic = YZ_EARLY_NATIVE_PACKET_MAGIC;
-  header.version = YZ_EARLY_NATIVE_VERSION;
+  yz_bootstrap_packet_header header{};
+  header.magic = YZ_BOOTSTRAP_PACKET_MAGIC;
+  header.version = YZ_BOOTSTRAP_PACKET_VERSION;
   header.header_size = sizeof(header);
   header.entry_size = sizeof(yz_early_native_packet_entry);
   header.load_flags = flags;
@@ -52,7 +53,7 @@ void early_packets() {
       assert(lseek(fd, 3, SEEK_SET) == 3);
       expect_config(yukizygisk::config::early_config(fd), linker, anonymous);
       assert(lseek(fd, 0, SEEK_CUR) == 3);
-      yz_early_native_packet_header header{};
+      yz_bootstrap_packet_header header{};
       assert(pread(fd, &header, sizeof(header), 0) == sizeof(header));
       assert(header.count == 1);
       header.version++;
@@ -66,16 +67,37 @@ void early_packets() {
 }
 
 int listen_for_config() {
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  int fd = yukizygisk::endpoint::listen();
   assert(fd >= 0);
+  yz_endpoint_state state{};
+  state.version = YZ_ENDPOINT_VERSION;
+  state.size = sizeof(state);
+  state.abi = yukizygisk::endpoint::kAbi;
+  state.available = 1;
+  state.pid = static_cast<uint32_t>(getpid());
+  state.generation = 1;
+  state.start_boottime = 1;
+  state.name_length = sizeof(state.name);
   sockaddr_un address{};
-  address.sun_family = AF_UNIX;
-  constexpr size_t name_size = sizeof(zygiskd::kSocketName) - 1;
-  memcpy(address.sun_path + 1, zygiskd::kSocketName, name_size);
-  auto size =
-      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name_size);
-  assert(bind(fd, reinterpret_cast<sockaddr *>(&address), size) == 0);
-  assert(listen(fd, 1) == 0);
+  socklen_t length = sizeof(address);
+  assert(getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0);
+  memcpy(state.name, address.sun_path + 1, sizeof(state.name));
+  char path[] = "/tmp/yz-endpoint-config-XXXXXX";
+  int writable = mkstemp(path);
+  assert(writable >= 0 && ftruncate(writable, getpagesize()) == 0);
+  assert(pwrite(writable, &state, sizeof(state), 0) == sizeof(state));
+  int readonly = open(path, O_RDONLY | O_CLOEXEC);
+  assert(readonly >= 0);
+  assert(unlink(path) == 0);
+  close(writable);
+  int packet = make_packet(0);
+  yz_bootstrap_packet_header header{};
+  assert(pread(packet, &header, sizeof(header), 0) == sizeof(header));
+  header.endpoint_fd = readonly;
+  header.count = 0;
+  assert(pwrite(packet, &header, sizeof(header), 0) == sizeof(header));
+  assert(yukizygisk::endpoint::initialize(packet, true));
+  close(packet);
   return fd;
 }
 
@@ -129,6 +151,7 @@ void runtime_packets() {
 int main() {
   early_packets();
   runtime_packets();
+  yukizygisk::endpoint::release();
   puts("load configuration: four combinations, legacy packets, malformed "
        "packets, "
        "fragmented replies and unavailable daemon passed");
