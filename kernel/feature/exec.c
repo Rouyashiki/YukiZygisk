@@ -84,7 +84,7 @@ static bool yz_exec_is_init_child(void)
 	return is_init_child;
 }
 
-static void __nocfi yz_exec_bprm_committed_creds(yz_bprm_arg_t *bprm)
+static void __nocfi yz_exec_bprm_committed_creds_impl(yz_bprm_arg_t *bprm)
 {
 	const char *filename = bprm ? bprm->filename : NULL;
 	char native_label[YZ_NATIVE_TARGET_VALUE_MAX] = {};
@@ -137,6 +137,14 @@ static void __nocfi yz_exec_bprm_committed_creds(yz_bprm_arg_t *bprm)
 					     native_label);
 		}
 	}
+}
+
+static void __nocfi yz_exec_bprm_committed_creds(yz_bprm_arg_t *bprm)
+{
+	int index = yz_host_lsm_enter();
+
+	yz_exec_bprm_committed_creds_impl(bprm);
+	yz_host_lsm_leave(index);
 }
 
 void yz_exec_init(void)

@@ -46,6 +46,8 @@ struct yz_host_lsm_hook {
 		.offset = off,                                                 \
 	}
 
+int yz_host_lsm_enter(void);
+void yz_host_lsm_leave(int index);
 void yz_host_lsm_init(void);
 void yz_host_lsm_exit(void);
 int yz_host_register_lsm_hook(struct yz_host_lsm_hook *hook);

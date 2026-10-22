@@ -496,8 +496,8 @@ static int yz_tango_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 static struct yz_host_lsm_hook yz_tango_hook = YZ_HOST_LSM_HOOK_INIT(
     file_mprotect, "selinux_file_mprotect", yz_tango_mprotect, 0);
 
-static int yz_tango_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
-			     unsigned long prot)
+static int yz_tango_mprotect_impl(struct vm_area_struct *vma,
+				  unsigned long reqprot, unsigned long prot)
 {
 	typeof(((union security_list_options *)0)->file_mprotect) original =
 	    READ_ONCE(yz_tango_hook.original);
@@ -531,6 +531,16 @@ static int yz_tango_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 		kfree(work);
 		module_put(THIS_MODULE);
 	}
+	return ret;
+}
+
+static int yz_tango_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
+			     unsigned long prot)
+{
+	int index = yz_host_lsm_enter();
+	int ret = yz_tango_mprotect_impl(vma, reqprot, prot);
+
+	yz_host_lsm_leave(index);
 	return ret;
 }
 

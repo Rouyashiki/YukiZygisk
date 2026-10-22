@@ -13,6 +13,7 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
+#include <linux/rcupdate.h>
 
 #include "feature/api.h"
 #include "feature/process_exit.h"
@@ -257,6 +258,8 @@ static void __exit yukizygisk_exit(void)
 	yz_stage_bootstrap_active = false;
 	yukizygisk_deactivate_locked(true);
 	mutex_unlock(&yz_lifecycle_lock);
+	/* Module and SRCU references drop before callback epilogues return. */
+	synchronize_rcu_tasks();
 }
 
 module_init(yukizygisk_init);

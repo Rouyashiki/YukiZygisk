@@ -15,6 +15,7 @@
 #include <linux/lsm_hooks.h>
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
+#include <linux/srcu.h>
 #include <linux/string.h>
 #include <linux/version.h>
 
@@ -25,6 +26,18 @@
 #include "host/lsm.h"
 #include "host/patch_text.h"
 #include "host/runtime.h"
+
+DEFINE_STATIC_SRCU(yz_lsm_srcu);
+
+int yz_host_lsm_enter(void)
+{
+	return srcu_read_lock(&yz_lsm_srcu);
+}
+
+void yz_host_lsm_leave(int index)
+{
+	srcu_read_unlock(&yz_lsm_srcu, index);
+}
 
 struct yz_lsm_hook_entry {
 	struct yz_host_lsm_hook *hook;
@@ -450,7 +463,9 @@ static void yz_lsm_hook_remove(struct yz_host_lsm_hook *hook)
 	}
 #endif
 
-	synchronize_rcu();
+	/* Account for callers holding a retired function pointer before entry. */
+	synchronize_rcu_tasks();
+	synchronize_srcu(&yz_lsm_srcu);
 	pr_info("yukizygisk: lsm_hook restored %s slot %px to %px\n",
 		hook->head_name ?: "unknown", slot, hook->original);
 	yz_lsm_hook_untrack(hook);
