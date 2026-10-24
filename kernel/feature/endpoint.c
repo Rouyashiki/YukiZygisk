@@ -10,6 +10,7 @@
 #include <linux/sched/signal.h>
 #include <linux/shmem_fs.h>
 #include <linux/spinlock.h>
+#include <linux/swap.h>
 #include <linux/tracepoint.h>
 #include <linux/uaccess.h>
 #include <linux/un.h>
@@ -311,8 +312,9 @@ static void yz_endpoint_free(void)
 
 		if (slot->state)
 			kunmap(slot->page);
+		/* Keep optional page-pinner calls inside the kernel. */
 		if (slot->page)
-			put_page(slot->page);
+			release_pages(&slot->page, 1);
 		if (slot->file)
 			fput(slot->file);
 		memset(slot, 0, sizeof(*slot));
