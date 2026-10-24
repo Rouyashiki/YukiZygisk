@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "../../third_party/lsplt/lsplt/src/main/jni/elf_util.hpp"
 #include "art_method.hpp"
 #include "hook.hpp"
 #include "inline_hook.hpp"
@@ -75,6 +76,7 @@ Hook<char *(const char *)> g_strdup;
 Hook<void(void *, bool, bool)> g_art_post_fork_child;
 bool g_jni_hooked = false;
 bool g_art_fork_hook_retired = true;
+bool g_art_fork_hook_attempted = false;
 pid_t g_zygote_pid = 0;
 
 void hook_zygote_jni();
@@ -234,24 +236,100 @@ void new_art_post_fork_child(void *jit, bool is_system_server, bool is_zygote) {
   g_art_post_fork_child.original(jit, is_system_server, is_zygote);
 }
 
-void hook_art_post_fork_child() {
-  for (const auto &map : lsplt::MapInfo::Scan()) {
+int current_thread_count() {
+  DIR *dir = opendir("/proc/self/task");
+  if (dir == nullptr)
+    return -1;
+  int count = 0;
+  while (dirent *entry = readdir(dir)) {
+    if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9')
+      ++count;
+  }
+  closedir(dir);
+  return count;
+}
+
+void hook_art_post_fork_child(bool early) {
+  if (g_art_fork_hook_attempted)
+    return;
+  const char *stage = early ? "bootstrap" : "jni-ready";
+  const int threads = current_thread_count();
+  const auto maps = lsplt::MapInfo::Scan();
+  for (const auto &map : maps) {
     if (map.offset != 0 || !(map.perms & PROT_READ) || map.dev == 0 ||
         map.inode == 0 ||
         (!ends_with(map.path, "/libart.so") &&
          !ends_with(map.path, "/libartd.so")))
       continue;
+    Elf elf(map.start);
+    const auto slots = elf.Valid() ? elf.FindPltAddr(kArtPostForkChild)
+                                   : std::vector<uintptr_t>{};
+    std::vector<uintptr_t> before;
+    before.reserve(slots.size());
+    if (slots.empty()) {
+      g_art_fork_hook_attempted = true;
+      ZLOGE("ART post-fork hook: stage=%s threads=%d symbol unavailable", stage,
+            threads);
+      return;
+    }
+    for (uintptr_t slot : slots) {
+      const bool readable =
+          slot % alignof(uintptr_t) == 0 &&
+          std::any_of(maps.begin(), maps.end(), [&](const auto &region) {
+            return region.dev == map.dev && region.inode == map.inode &&
+                   (region.perms & PROT_READ) && slot >= region.start &&
+                   slot < region.end && region.end - slot >= sizeof(uintptr_t);
+          });
+      if (!readable) {
+        g_art_fork_hook_attempted = true;
+        ZLOGE("ART post-fork hook: stage=%s threads=%d invalid slot=%p", stage,
+              threads, reinterpret_cast<void *>(slot));
+        return;
+      }
+      const auto value = __atomic_load_n(reinterpret_cast<uintptr_t *>(slot),
+                                         __ATOMIC_ACQUIRE);
+      if (value == 0) {
+        g_art_fork_hook_attempted = !early;
+        ZLOGE("ART post-fork hook: stage=%s threads=%d slot=%p is null; %s",
+              stage, threads, reinterpret_cast<void *>(slot),
+              early ? "deferred" : "methods fd hiding is disabled");
+        return;
+      }
+      before.push_back(value);
+    }
+    g_art_fork_hook_attempted = true;
     g_art_maps = {map.dev, map.inode, true};
     g_art_fork_hook_retired = false;
-    if (!lsplt::RegisterHook(
+    errno = 0;
+    const bool installed =
+        lsplt::RegisterHook(
             map.dev, map.inode, kArtPostForkChild,
             reinterpret_cast<void *>(new_art_post_fork_child),
-            reinterpret_cast<void **>(&g_art_post_fork_child.original)) ||
-        !lsplt::CommitHook() || g_art_post_fork_child.original == nullptr)
+            reinterpret_cast<void **>(&g_art_post_fork_child.original)) &&
+        lsplt::CommitHook() && g_art_post_fork_child.original != nullptr;
+    const int error = installed ? 0 : errno;
+    ZLOGI("ART post-fork hook: stage=%s threads=%d slots=%zu installed=%d "
+          "errno=%d",
+          stage, threads, slots.size(), installed, error);
+    for (size_t i = 0; i < slots.size(); ++i) {
+      const auto after = __atomic_load_n(
+          reinterpret_cast<uintptr_t *>(slots[i]), __ATOMIC_ACQUIRE);
+      ZLOGI("ART post-fork slot=%p old=%p new=%p expected=%p",
+            reinterpret_cast<void *>(slots[i]),
+            reinterpret_cast<void *>(before[i]),
+            reinterpret_cast<void *>(after),
+            reinterpret_cast<void *>(new_art_post_fork_child));
+    }
+    if (!installed)
       ZLOGE("ART post-fork hook unavailable; methods fd hiding is disabled");
     return;
   }
-  ZLOGE("ART library unavailable; methods fd hiding is disabled");
+  if (early)
+    ZLOGI(
+        "ART post-fork hook: stage=%s threads=%d library not mapped; deferred",
+        stage, threads);
+  else
+    ZLOGE("ART library unavailable; methods fd hiding is disabled");
 }
 
 struct ZygiskContext {
@@ -1226,7 +1304,7 @@ void hook_zygote_jni() {
       g_zygote_methods[kForkSystemServer].fnPtr != nullptr;
   g_app_specialize_hooks_complete = fork_hooked && specialize_hooked;
   g_zygote_pid = getpid();
-  hook_art_post_fork_child();
+  hook_art_post_fork_child(false);
   yz_unmap_injection_stub();
   if (g_app_specialize_hooks_complete && system_server_hooked) {
     ZLOGI("zygote JNI takeover done");
@@ -1275,6 +1353,7 @@ void yz_drop_runtime_header_pages() {
 /* Install the early strdup hook. */
 bool zygisk_hook_bootstrap(const char *self_path) {
   ZLOGI("hook bootstrap, self=%s", self_path ? self_path : "(null)");
+  g_zygote_pid = getpid();
 
   if (!cache_libandroid_runtime()) {
     ZLOGE("libandroid_runtime.so not mapped yet; cannot bootstrap");
@@ -1298,6 +1377,7 @@ bool zygisk_hook_bootstrap(const char *self_path) {
 
   ZLOGI("lifecycle bootstrap armed on libandroid_runtime (dev=%u,%u inode=%lu)",
         major(dev), minor(dev), static_cast<unsigned long>(inode));
+  hook_art_post_fork_child(true);
   return true;
 }
 
