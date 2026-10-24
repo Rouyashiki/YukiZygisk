@@ -11,6 +11,7 @@
 #include "inline_hook.hpp"
 #include "load_config.hpp"
 #include "log.hpp"
+#include "plt_state.hpp"
 #include "solist.hpp"
 #include "userspace/zygisk/endpoint.hpp"
 #include "yukilinker.hpp"
@@ -803,8 +804,8 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
     return kFailed;
   }
   const bool ok = yukizygisk::hyos::in_specialized_child()
-                      ? lsplt::CommitHookCached()
-                      : lsplt::CommitHook();
+                      ? yukizygisk::commit_plt(true).success
+                      : yukizygisk::commit_plt(false).success;
   LOGI("plt hook: path=%s symbol=%s result=%u", info.path.c_str(), symbol,
        ok ? 0U : 1U);
   return ok ? kSuccess : kFailed;
