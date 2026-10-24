@@ -146,6 +146,9 @@ static void unrelated_registration() {
   CHECK(!install_registered_hooks());
   expect_values(region, distant, reinterpret_cast<uintptr_t>(original_fn),
                 reinterpret_cast<uintptr_t>(original_fn));
+  CHECK(unrelated.read(target_off) == reinterpret_cast<uintptr_t>(original_fn));
+  CHECK(backup == nullptr && register_info.size() == 1);
+  CHECK(lsplt::CommitHookDetailed().success);
   CHECK(unrelated.read(target_off) ==
         reinterpret_cast<uintptr_t>(replacement_fn));
   register_target(unrelated, nullptr, backup);

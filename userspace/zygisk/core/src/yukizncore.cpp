@@ -797,17 +797,18 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
     LOGE("plt hook: map not found base=%p symbol=%s", base_addr, symbol);
     return kFailed;
   }
-  if (!lsplt::RegisterHook(info.dev, info.inode, symbol, hook_handler,
-                           original)) {
-    LOGE("plt hook: register failed path=%s symbol=%s", info.path.c_str(),
-         symbol);
-    return kFailed;
-  }
-  const bool ok = yukizygisk::hyos::in_specialized_child()
-                      ? yukizygisk::commit_plt(true).success
-                      : yukizygisk::commit_plt(false).success;
-  LOGI("plt hook: path=%s symbol=%s result=%u", info.path.c_str(), symbol,
-       ok ? 0U : 1U);
+  const auto report = yukizygisk::apply_plt(
+      yukizygisk::hyos::in_specialized_child(),
+      {{info.dev, info.inode, symbol, hook_handler, original}});
+  const bool ok = yukizygisk::plt_request_succeeded(report, 0) &&
+                  (original == nullptr ||
+                   (*original != nullptr && *original != hook_handler));
+  const auto &result = report.results.front();
+  LOGI("plt hook: path=%s symbol=%s result=%u status=%d reason=%s errno=%d "
+       "rollback_pending=%d recovery_count=%zu",
+       info.path.c_str(), symbol, ok ? 0U : 1U, static_cast<int>(result.status),
+       yukizygisk::hook_error_name(result.error), result.error_number,
+       report.rollback_pending, report.recoveries.size());
   return ok ? kSuccess : kFailed;
 }
 

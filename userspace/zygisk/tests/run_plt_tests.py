@@ -37,6 +37,10 @@ with tempfile.TemporaryDirectory(prefix='yz-plt-state-') as temporary:
         extract_function(hyos, name)
         for name in ('rollback_partial_hooks', 'install_registered_hooks')
     ))
+    native = (core / 'yukizncore.cpp').read_text()
+    native_begin = native.index('int api_plt_hook(')
+    native_end = native.index('\nint api_inline_hook(', native_begin)
+    (build / 'native_plt_under_test.inc').write_text(native[native_begin:native_end])
     flags = [
         '-std=c++17', '-O1', '-g', '-pthread', '-D_GNU_SOURCE', '-DLOG_DISABLED',
         '-DDT_ANDROID_REL=0x6000000f', '-DDT_ANDROID_RELSZ=0x60000010',
@@ -44,6 +48,7 @@ with tempfile.TemporaryDirectory(prefix='yz-plt-state-') as temporary:
         '-I' + str(core), '-I' + str(lsplt / 'include'), '-I' + str(lsplt),
         '-I' + str(lsplt_root / 'test/host'), '-I' + str(build)
     ]
+    flags.append('-I' + str(core.parents[1] / 'include'))
     builds = [(os.environ.get('CXX', 'clang++'), 'host',
                ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'], [])]
     if args.qemu:
@@ -52,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix='yz-plt-state-') as temporary:
             ('arm-linux-gnueabihf-g++', 'arm32', ['-static'], ['qemu-arm'])
         ])
     for compiler, arch, extra_flags, runner in builds:
-        for name in ('plt_state_test', 'hyos_plt_test', 'art_retire_test'):
+        for name in ('plt_state_test', 'hyos_plt_test', 'art_retire_test', 'native_plt_test'):
             binary = build / (name + '-' + arch)
             sources = [str(Path(__file__).with_name(name + '.cpp'))]
             if name != 'plt_state_test':

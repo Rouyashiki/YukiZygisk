@@ -80,6 +80,7 @@ yukizygisk::ArtHookLifecycle g_art_hook;
 pid_t g_zygote_pid = 0;
 
 void hook_zygote_jni();
+void new_art_post_fork_child(void *jit, bool is_system_server, bool is_zygote);
 
 struct RuntimeHeaderRange {
   uintptr_t start = 0;
@@ -155,27 +156,20 @@ bool find_libandroid_runtime(dev_t &dev, ino_t &inode) {
 }
 
 bool retire_art_fork_hook() {
-  if (!yukizygisk::commit_plt(true).success)
+  if (!yukizygisk::apply_plt(true, {}).success)
     return g_art_hook.finish_cleanup(false);
   if (!g_art_hook.unhook_required)
     return g_art_hook.finish_cleanup(true);
-  if (g_art_post_fork_child.original == nullptr || !g_art_maps.ready ||
-      !lsplt::RegisterHook(
-          g_art_maps.dev, g_art_maps.inode, kArtPostForkChild,
-          reinterpret_cast<void *>(g_art_post_fork_child.original), nullptr))
+  if (g_art_post_fork_child.original == nullptr || !g_art_maps.ready)
     return g_art_hook.finish_cleanup(false);
-  const auto report = yukizygisk::commit_plt(true);
-  for (const auto &entry : report.registrations) {
-    if (!entry.recovery && entry.dev == g_art_maps.dev &&
-        entry.inode == g_art_maps.inode && entry.symbol == kArtPostForkChild &&
-        entry.callback ==
-            reinterpret_cast<void *>(g_art_post_fork_child.original) &&
-        (entry.status == lsplt::CommitStatus::Applied ||
-         entry.status == lsplt::CommitStatus::NoChange))
-      g_art_hook.unhook_required = false;
-  }
-  return g_art_hook.finish_cleanup(report.success &&
-                                   !g_art_hook.unhook_required);
+  const auto report = yukizygisk::apply_plt(
+      true, {yukizygisk::restore_plt(
+                g_art_maps.dev, g_art_maps.inode, kArtPostForkChild,
+                reinterpret_cast<void *>(g_art_post_fork_child.original),
+                reinterpret_cast<void *>(new_art_post_fork_child))});
+  if (yukizygisk::plt_request_succeeded(report, 0))
+    g_art_hook.unhook_required = false;
+  return g_art_hook.finish_cleanup(!g_art_hook.unhook_required);
 }
 
 bool reset_art_method_fd(void *jit, size_t jit_size, int fd) {
@@ -312,35 +306,29 @@ void hook_art_post_fork_child(bool early) {
       original = value;
     }
     g_art_maps = {map.dev, map.inode, true};
-    if (!lsplt::RegisterHook(
-            map.dev, map.inode, kArtPostForkChild,
-            reinterpret_cast<void *>(new_art_post_fork_child),
-            reinterpret_cast<void **>(&g_art_post_fork_child.original))) {
-      reject("registration-failed");
-      return;
-    }
-    const auto report = yukizygisk::commit_plt(false);
+    const auto report = yukizygisk::apply_plt(
+        false, {{map.dev, map.inode, kArtPostForkChild,
+                 reinterpret_cast<void *>(new_art_post_fork_child),
+                 reinterpret_cast<void **>(&g_art_post_fork_child.original)}});
     const auto callback = reinterpret_cast<uintptr_t>(new_art_post_fork_child);
     const auto backup =
         reinterpret_cast<uintptr_t>(g_art_post_fork_child.original);
     bool committed = false, installed = false, dirty = false;
-    for (const auto &entry : report.registrations) {
-      if (entry.recovery || entry.dev != map.dev || entry.inode != map.inode ||
-          entry.symbol != kArtPostForkChild ||
-          entry.callback != reinterpret_cast<void *>(callback))
-        continue;
+    for (const auto &entry : report.results) {
       const bool entry_committed =
           entry.status == lsplt::CommitStatus::Applied ||
           entry.status == lsplt::CommitStatus::NoChange;
       committed |= entry_committed;
-      installed = entry_committed && backup != 0 && !entry.slots.empty() &&
-                  std::all_of(entry.slots.begin(), entry.slots.end(),
-                              [&](const auto &slot) {
-                                return slot.observed &&
-                                       slot.after == callback &&
-                                       slot.before == backup &&
-                                       slot.permissions_restored;
-                              });
+      installed =
+          entry_committed && !report.rollback_pending && backup != 0 &&
+          backup != callback && !entry.slots.empty() &&
+          std::all_of(entry.slots.begin(), entry.slots.end(),
+                      [&](const auto &slot) {
+                        return slot.observed && slot.after == callback &&
+                               (entry.status == lsplt::CommitStatus::NoChange ||
+                                slot.before == backup) &&
+                               slot.permissions_restored;
+                      });
       for (const auto &slot : entry.slots) {
         dirty |= !slot.observed || slot.after == callback ||
                  !slot.permissions_restored;
@@ -1312,11 +1300,11 @@ void hook_zygote_jni() {
   ino_t rt_inode = 0;
   bool fork_plt_hooked = false;
   if (find_libandroid_runtime(rt_dev, rt_inode)) {
-    fork_plt_hooked =
-        lsplt::RegisterHook(rt_dev, rt_inode, "fork",
-                            reinterpret_cast<void *>(new_fork),
-                            reinterpret_cast<void **>(&g_orig_fork)) &&
-        yukizygisk::commit_plt(false).success && g_orig_fork != nullptr;
+    const auto report = yukizygisk::apply_plt(
+        false, {{rt_dev, rt_inode, "fork", reinterpret_cast<void *>(new_fork),
+                 reinterpret_cast<void **>(&g_orig_fork)}});
+    fork_plt_hooked = yukizygisk::plt_request_succeeded(report, 0) &&
+                      g_orig_fork != nullptr && g_orig_fork != new_fork;
   }
   if (!fork_plt_hooked) {
     ZLOGE("fork hook failed -- not hooking zygote natives");
@@ -1402,14 +1390,12 @@ bool zygisk_hook_bootstrap(const char *self_path) {
   if (!find_libandroid_runtime(dev, inode))
     return false;
 
-  if (!lsplt::RegisterHook(dev, inode, "strdup",
-                           reinterpret_cast<void *>(new_strdup),
-                           reinterpret_cast<void **>(&g_strdup.original))) {
-    ZLOGE("RegisterHook(strdup) failed");
-    return false;
-  }
-  if (!yukizygisk::commit_plt(false).success || g_strdup.original == nullptr) {
-    ZLOGE("CommitHook failed");
+  const auto report = yukizygisk::apply_plt(
+      false, {{dev, inode, "strdup", reinterpret_cast<void *>(new_strdup),
+               reinterpret_cast<void **>(&g_strdup.original)}});
+  if (!yukizygisk::plt_request_succeeded(report, 0) ||
+      g_strdup.original == nullptr || g_strdup.original == new_strdup) {
+    ZLOGE("bootstrap PLT installation failed");
     return false;
   }
 
@@ -1457,26 +1443,18 @@ bool zygisk_self_unhook(JNIEnv *env) {
   dev_t dev = 0;
   ino_t inode = 0;
   if (find_libandroid_runtime(dev, inode)) {
-    bool registered = true;
-    bool have_hook = false;
-    if (g_strdup.original != nullptr) {
-      have_hook = true;
-      if (!lsplt::RegisterHook(dev, inode, "strdup",
-                               reinterpret_cast<void *>(g_strdup.original),
-                               nullptr))
-        registered = false;
-    }
-    if (g_orig_fork != nullptr) {
-      have_hook = true;
-      if (!lsplt::RegisterHook(dev, inode, "fork",
-                               reinterpret_cast<void *>(g_orig_fork), nullptr))
-        registered = false;
-    }
-    if (have_hook) {
-      const bool committed = yukizygisk::commit_plt(true).success;
-      if (!registered || !committed)
-        unhooked = false;
-    }
+    std::vector<lsplt::HookRequest> requests;
+    if (g_strdup.original != nullptr)
+      requests.push_back(yukizygisk::restore_plt(
+          dev, inode, "strdup", reinterpret_cast<void *>(g_strdup.original),
+          reinterpret_cast<void *>(new_strdup)));
+    if (g_orig_fork != nullptr)
+      requests.push_back(yukizygisk::restore_plt(
+          dev, inode, "fork", reinterpret_cast<void *>(g_orig_fork),
+          reinterpret_cast<void *>(new_fork)));
+    const auto report = yukizygisk::apply_plt(true, requests);
+    if (!report.success)
+      unhooked = false;
   } else if (g_strdup.original != nullptr || g_orig_fork != nullptr) {
     unhooked = false;
   }
@@ -1486,7 +1464,7 @@ bool zygisk_self_unhook(JNIEnv *env) {
   if (unhooked && !lsplt::ReleaseInactiveCache())
     unhooked = false;
   if (yukizygisk::plt_lifetime.retain_core.load()) {
-    ZLOGE("self-unmap blocked: a failed PLT transaction published a callback");
+    ZLOGE("self-unmap blocked: PLT callback lifetime is uncertain");
     unhooked = false;
   }
   if (unhooked) {

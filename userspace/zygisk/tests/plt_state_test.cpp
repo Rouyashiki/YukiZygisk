@@ -45,6 +45,7 @@ static void *replacement;
 static void **original_output;
 static lsplt::CommitStatus outcome;
 static bool refuse_registration;
+static void *tracked_original;
 namespace lsplt {
 inline namespace v2 {
 std::vector<MapInfo> MapInfo::Scan(std::string_view) { return maps; }
@@ -66,13 +67,20 @@ CommitReport CommitHookDetailed() {
   entry.symbol = "target";
   entry.callback = replacement;
   entry.status = outcome;
-  entry.error = outcome == CommitStatus::Applied ? HookError::None
-                                                 : HookError::ProtectFailed;
-  entry.error_number = outcome == CommitStatus::Applied ? 0 : EACCES;
-  entry.ever_published = outcome != CommitStatus::Rejected;
+  entry.error =
+      (outcome == CommitStatus::Applied || outcome == CommitStatus::NoChange)
+          ? HookError::None
+          : HookError::ProtectFailed;
+  entry.error_number = entry.error == HookError::None ? 0 : EACCES;
+  entry.ever_published =
+      outcome != CommitStatus::Rejected && outcome != CommitStatus::NoChange;
   if (entry.ever_published && original_output)
     *original_output =
         reinterpret_cast<void *>(*reinterpret_cast<uintptr_t *>(addresses[0]));
+  if (original_output && entry.ever_published)
+    tracked_original = *original_output;
+  if (original_output && outcome == CommitStatus::NoChange)
+    *original_output = tracked_original;
   for (auto address : addresses) {
     auto *slot = reinterpret_cast<uintptr_t *>(address);
     const auto before = *slot;
@@ -82,12 +90,36 @@ CommitReport CommitHookDetailed() {
     entry.slots.push_back({address, before, *slot, true,
                            outcome != CommitStatus::RollbackIncomplete});
   }
-  report.success = outcome == CommitStatus::Applied;
+  report.success =
+      outcome == CommitStatus::Applied || outcome == CommitStatus::NoChange;
   report.rollback_pending = outcome == CommitStatus::RollbackIncomplete;
   report.registrations.push_back(std::move(entry));
   return report;
 }
 CommitReport CommitHookCachedDetailed() { return CommitHookDetailed(); }
+HookBatchReport ApplyHooksDetailed(const std::vector<HookRequest> &requests) {
+  HookBatchReport batch;
+  for (const auto &request : requests) {
+    if (!RegisterHook(request.dev, request.inode, request.symbol,
+                      request.callback, request.backup)) {
+      RegistrationResult rejected;
+      rejected.error = HookError::InvalidRequest;
+      rejected.error_number = EINVAL;
+      batch.results.push_back(rejected);
+      batch.success = false;
+      continue;
+    }
+    auto report = CommitHookDetailed();
+    batch.success &= report.success;
+    batch.rollback_pending |= report.rollback_pending;
+    batch.results.push_back(std::move(report.registrations.front()));
+  }
+  return batch;
+}
+HookBatchReport
+ApplyHooksCachedDetailed(const std::vector<HookRequest> &requests) {
+  return ApplyHooksDetailed(requests);
+}
 } // namespace v2
 } // namespace lsplt
 
@@ -118,6 +150,7 @@ static void reset() {
   yukizygisk::plt_lifetime.retain_core.store(false);
   g_art_post_fork_child.original = nullptr;
   calls = 0;
+  tracked_original = nullptr;
   outcome = lsplt::CommitStatus::Applied;
   elf_valid = true;
   refuse_registration = false;
@@ -218,6 +251,14 @@ int main() {
   refuse_registration = false;
   hook_art_post_fork_child(false);
   assert(g_art_hook.state == State::Installed);
+  reset();
+  hook_art_post_fork_child(true);
+  g_art_hook = {};
+  g_art_post_fork_child.original = nullptr;
+  outcome = lsplt::CommitStatus::NoChange;
+  hook_art_post_fork_child(false);
+  assert(g_art_hook.state == State::Installed && calls == 2);
+  assert(g_art_post_fork_child.original == original_fn);
   assert(current_thread_count() >= 1);
   std::atomic<bool> ready{false}, stop{false};
   std::thread worker([&] {

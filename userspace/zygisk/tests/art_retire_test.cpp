@@ -26,27 +26,7 @@ static bool ends_with(std::string_view text, std::string_view suffix) {
 
 #include "art_hook_under_test.inc"
 
-static bool reject_restore_registration, append_failed_request;
-namespace lsplt {
-inline namespace v2 {
-static bool test_retire_RegisterHook(dev_t dev, ino_t inode,
-                                     std::string_view symbol, void *callback,
-                                     void **backup) {
-  if (reject_restore_registration) {
-    errno = EINVAL;
-    return false;
-  }
-  const bool registered = RegisterHook(dev, inode, symbol, callback, backup);
-  if (registered && append_failed_request)
-    CHECK(RegisterHook(dev, inode, "missing", callback, nullptr));
-  return registered;
-}
-} // namespace v2
-} // namespace lsplt
-
-#define RegisterHook test_retire_RegisterHook
 #include "art_retire_under_test.inc"
-#undef RegisterHook
 
 using State = yukizygisk::ArtHookState;
 static const auto original = reinterpret_cast<uintptr_t>(original_fn);
@@ -77,7 +57,6 @@ struct ArtRegion : Region {
     g_art_maps = {};
     g_art_post_fork_child.original = nullptr;
     yukizygisk::plt_lifetime.retain_core.store(false);
-    reject_restore_registration = append_failed_request = false;
   }
 
   ~ArtRegion() {
@@ -196,14 +175,15 @@ static void unrelated_batch_failure() {
   clean();
   ArtRegion region(distant);
   install(region, distant);
-  append_failed_request = true;
-  CHECK(!retire_art_fork_hook());
-  CHECK(g_art_hook.state == State::NeedsCleanup && !g_art_hook.unhook_required);
-  expect_values(region, distant, original, original);
-  region.store(distant, foreign);
-  append_failed_request = false;
+  register_target(region, nullptr, reinterpret_cast<void *>(foreign),
+                  "missing");
   CHECK(retire_art_fork_hook());
   CHECK(g_art_hook.state == State::Retired && !g_art_hook.unhook_required);
+  CHECK(register_info.size() == 1);
+  expect_values(region, distant, original, original);
+  CHECK(!lsplt::CommitHookDetailed().success);
+  region.store(distant, foreign);
+  CHECK(retire_art_fork_hook());
   expect_values(region, distant, original, foreign);
   check_original();
   region.identity();
@@ -220,15 +200,34 @@ static void unavailable_restore() {
   CHECK(g_art_hook.state == State::NeedsCleanup && g_art_hook.unhook_required);
   expect_values(region, distant, callback, callback);
   g_art_post_fork_child.original = saved_original;
-  reject_restore_registration = true;
+  const auto inode = g_art_maps.inode;
+  g_art_maps.inode = 0;
   CHECK(!retire_art_fork_hook());
   CHECK(g_art_hook.state == State::NeedsCleanup && g_art_hook.unhook_required);
   expect_values(region, distant, callback, callback);
-  reject_restore_registration = false;
+  g_art_maps.inode = inode;
   CHECK(retire_art_fork_hook());
   CHECK(g_art_hook.state == State::Retired && !g_art_hook.unhook_required);
   expect_values(region, distant, original, original);
   region.identity();
+  clean();
+}
+
+static void foreign_hook_cleanup() {
+  clean();
+  ArtRegion region(distant);
+  install(region, distant);
+  region.store(distant, foreign);
+  faults();
+  CHECK(!retire_art_fork_hook());
+  CHECK(g_art_hook.unhook_required && cas_calls == 0);
+  CHECK(yukizygisk::plt_lifetime.retain_core);
+  expect_values(region, distant, callback, foreign);
+  check_original();
+  region.store(distant, original);
+  CHECK(retire_art_fork_hook());
+  expect_values(region, distant, original, original);
+  CHECK(yukizygisk::plt_lifetime.retain_core);
   clean();
 }
 
@@ -238,6 +237,7 @@ int main() {
   failed_unhook_retry();
   unrelated_batch_failure();
   unavailable_restore();
+  foreign_hook_cleanup();
   puts("PASS production ART install/retire: recovery-only cleanup, foreign "
        "slots, unhook retry, per-request success, original and retention");
 }

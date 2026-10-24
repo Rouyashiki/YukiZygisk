@@ -232,32 +232,24 @@ const ZygiskNextRuntime g_runtime = {
     .registerModule = register_module,
 };
 
-bool rollback_partial_hooks(const lsplt::CommitReport &report) {
-  bool pending = report.rollback_pending;
-  bool registered = true;
-  for (const auto &entry : report.registrations) {
-    if (entry.recovery || entry.status != lsplt::CommitStatus::Applied ||
-        entry.dev != g_target_dev || entry.inode != g_target_inode)
+bool rollback_partial_hooks(const lsplt::HookBatchReport &report) {
+  std::vector<lsplt::HookRequest> requests;
+  for (const auto &entry : report.results) {
+    if (entry.status != lsplt::CommitStatus::Applied)
       continue;
     void *original = nullptr;
-    if (entry.symbol == "fork" &&
-        entry.callback == reinterpret_cast<void *>(replacement_fork))
+    if (entry.symbol == "fork")
       original = reinterpret_cast<void *>(g_original_fork);
-    else if (entry.symbol == "selinux_android_setcontext" &&
-             entry.callback == reinterpret_cast<void *>(replacement_setcontext))
+    else if (entry.symbol == "selinux_android_setcontext")
       original = reinterpret_cast<void *>(g_original_setcontext);
     else
       continue;
-    pending = true;
-    if (original == nullptr ||
-        !lsplt::RegisterHook(entry.dev, entry.inode, entry.symbol, original,
-                             nullptr))
-      registered = false;
+    if (entry.ever_published)
+      yukizygisk::plt_lifetime.retain_core.store(true);
+    requests.push_back(yukizygisk::restore_plt(
+        entry.dev, entry.inode, entry.symbol, original, entry.callback));
   }
-  if (!pending)
-    return true;
-  const auto cleanup = yukizygisk::commit_plt(false);
-  return registered && cleanup.success;
+  return yukizygisk::apply_plt(false, requests).success;
 }
 
 } // namespace
@@ -308,17 +300,15 @@ bool install_registered_hooks() {
   if (!g_available || count == 0)
     return true;
 
-  const bool fork_registered =
-      lsplt::RegisterHook(g_target_dev, g_target_inode, "fork",
-                          reinterpret_cast<void *>(replacement_fork),
-                          reinterpret_cast<void **>(&g_original_fork));
-  const bool context_registered = lsplt::RegisterHook(
-      g_target_dev, g_target_inode, "selinux_android_setcontext",
-      reinterpret_cast<void *>(replacement_setcontext),
-      reinterpret_cast<void **>(&g_original_setcontext));
-  const auto report = yukizygisk::commit_plt(false);
-  const bool committed =
-      fork_registered && context_registered && report.success;
+  const auto report = yukizygisk::apply_plt(
+      false, {{g_target_dev, g_target_inode, "fork",
+               reinterpret_cast<void *>(replacement_fork),
+               reinterpret_cast<void **>(&g_original_fork)},
+              {g_target_dev, g_target_inode, "selinux_android_setcontext",
+               reinterpret_cast<void *>(replacement_setcontext),
+               reinterpret_cast<void **>(&g_original_setcontext)}});
+  const bool committed = yukizygisk::plt_request_succeeded(report, 0) &&
+                         yukizygisk::plt_request_succeeded(report, 1);
   bool control_ready = false;
   if (committed && g_original_fork != nullptr &&
       g_original_setcontext != nullptr && g_open_control_session != nullptr) {
