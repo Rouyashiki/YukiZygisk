@@ -112,8 +112,9 @@ struct ModuleHandle {
   uint32_t magic = kHandleMagic;
   uint32_t index = 0;
   void *so = nullptr;
+  uint64_t device = 0;
+  uint64_t inode = 0;
   std::string module_id;
-  bool yuki_loaded = false;
   bool early = false;
   bool has_companion = false;
   bool reported = false;
@@ -1033,59 +1034,74 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
     return false;
   }
 
-  std::string lib_name = basename_of(lib_path);
-  bool yuki_loaded = false;
-  int fallback_anonymized = 0;
-  void *so = g_yz_config.yukilinker
-                 ? yukilinker::dlopen_memfd(
-                       lib_fd, lib_path.c_str(),
-                       !yukizygisk::config::anonymous(g_yz_config))
-                 : nullptr;
-  if (so != nullptr) {
-    yuki_loaded = true;
-    LOGI("native core: yukilinker loaded id=%s idx=%u path=%s early=%u",
-         module_id.c_str(), idx, lib_path.c_str(), early ? 1U : 0U);
-  } else {
-    android_dlextinfo ext{};
-    ext.flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD;
-    ext.library_fd = lib_fd;
-    dlerror();
-    so = android_dlopen_ext(lib_name.c_str(), RTLD_NOW, &ext);
-    const char *name_err = dlerror();
-    std::string name_error = name_err != nullptr ? name_err : "";
-    if (so == nullptr) {
-      dlerror();
-      so = android_dlopen_ext(lib_path.c_str(), RTLD_NOW, &ext);
+  if (find_loaded_module(module_id) != nullptr) {
+    if (lib_fd >= 0)
+      close(lib_fd);
+    LOGI("native core: already initialized id=%s", module_id.c_str());
+    return true;
+  }
+  if (lib_fd < 0) {
+    LOGE("native core: invalid library fd id=%s idx=%u", module_id.c_str(),
+         idx);
+    return false;
+  }
+
+  struct stat identity{};
+  if (fstat(lib_fd, &identity) != 0) {
+    const int error = errno;
+    LOGE("native core: library identity failed id=%s idx=%u: %s",
+         module_id.c_str(), idx, strerror(error));
+    close(lib_fd);
+    return false;
+  }
+  for (const auto *loaded : g_loaded_modules) {
+    if (loaded->device == identity.st_dev && loaded->inode == identity.st_ino) {
+      LOGE("native core: library fd already initialized by id=%s, rejecting "
+           "id=%s",
+           loaded->module_id.c_str(), module_id.c_str());
+      close(lib_fd);
+      return false;
     }
-    const char *path_err = dlerror();
-    std::string path_error = path_err != nullptr ? path_err : "";
-    if (so == nullptr) {
-      LOGE("native core: dlopen failed id=%s idx=%u name=%s path=%s early=%u",
-           module_id.c_str(), idx, lib_name.c_str(), lib_path.c_str(),
-           early ? 1U : 0U);
-      LOGE("native core: dlopen name err=%s",
-           name_error.empty() ? "(null)" : name_error.c_str());
-      LOGE("native core: dlopen path err=%s",
-           path_error.empty() ? "(null)" : path_error.c_str());
-    }
-    if (so != nullptr && yukizygisk::config::anonymous(g_yz_config))
-      fallback_anonymized =
-          yuki::solist::spoof_fd_maps(lib_fd, /*private_only=*/true);
+  }
+
+  // Use the full path and fd identity; FORCE_LOAD would bypass Bionic reuse.
+  android_dlextinfo ext{};
+  ext.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+  ext.library_fd = lib_fd;
+  dlerror();
+  void *so = android_dlopen_ext(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL, &ext);
+  if (so == nullptr) {
+    const char *error = dlerror();
+    LOGE("native core: Bionic load failed id=%s idx=%u path=%s early=%u: %s",
+         module_id.c_str(), idx, lib_path.c_str(), early ? 1U : 0U,
+         error != nullptr ? error : "no linker error");
+    close(lib_fd);
+    return false;
   }
   close(lib_fd);
-  if (so == nullptr)
-    return false;
-
-  auto *mod = reinterpret_cast<ZygiskNextModule *>(
-      yuki_loaded ? yukilinker::dlsym(static_cast<yukilinker::SoHandle *>(so),
-                                      "zn_module")
-                  : dlsym(so, "zn_module"));
-  if (mod == nullptr) {
-    LOGE("native core: zn_module missing id=%s idx=%u", module_id.c_str(), idx);
-    if (yuki_loaded)
-      yukilinker::dlclose(static_cast<yukilinker::SoHandle *>(so));
-    else
+  for (const auto *loaded : g_loaded_modules) {
+    if (loaded->so == so) {
+      LOGE("native core: library already initialized by id=%s, rejecting id=%s",
+           loaded->module_id.c_str(), module_id.c_str());
       dlclose(so);
+      return false;
+    }
+  }
+  LOGI("native core: Bionic loaded id=%s idx=%u path=%s early=%u",
+       module_id.c_str(), idx, lib_path.c_str(), early ? 1U : 0U);
+  // Constructors may already have started threads that mutate these mappings.
+  if (yukizygisk::config::anonymous(g_yz_config))
+    LOGI("native core: anonymous mapping skipped id=%s; retaining live Bionic "
+         "mappings",
+         module_id.c_str());
+
+  dlerror();
+  auto *mod = reinterpret_cast<ZygiskNextModule *>(dlsym(so, "zn_module"));
+  if (mod == nullptr) {
+    const char *error = dlerror();
+    LOGE("native core: zn_module lookup failed id=%s idx=%u: %s",
+         module_id.c_str(), idx, error != nullptr ? error : "null entry");
+    dlclose(so);
     return false;
   }
   if ((mod->target_api_version != kApiVersion3 &&
@@ -1093,18 +1109,16 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
       mod->onModuleLoaded == nullptr) {
     LOGE("native core: unsupported module id=%s idx=%u api=%d entry=%p",
          module_id.c_str(), idx, mod->target_api_version, mod->onModuleLoaded);
-    if (yuki_loaded)
-      yukilinker::dlclose(static_cast<yukilinker::SoHandle *>(so));
-    else
-      dlclose(so);
+    dlclose(so);
     return false;
   }
 
   auto *handle = new ModuleHandle();
   handle->index = idx;
   handle->so = so;
+  handle->device = identity.st_dev;
+  handle->inode = identity.st_ino;
   handle->module_id = module_id;
-  handle->yuki_loaded = yuki_loaded;
   handle->early = early;
   handle->has_companion = info.has_companion != 0;
   g_loaded_modules.push_back(handle);
@@ -1117,11 +1131,8 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
   yukizygisk::hyos::end_module_registration();
   handle->hyos_registered =
       yukizygisk::hyos::registered_module_count() > registrations_before;
-  if (!yuki_loaded) {
-    // Native callbacks still need Bionic caller identity and dependencies.
-    LOGI("native module Bionic handle retained: %s maps=%d", module_id.c_str(),
-         fallback_anonymized);
-  }
+  // Keep the handle for process lifetime: callbacks can still use libdl.
+  LOGI("native module Bionic handle retained: %s", module_id.c_str());
   LOGI("native module loaded: %s early=%u", module_id.c_str(), early ? 1U : 0U);
   if (!early && !yukizygisk::hyos::available())
     handle->reported = report_native_injection(idx);
