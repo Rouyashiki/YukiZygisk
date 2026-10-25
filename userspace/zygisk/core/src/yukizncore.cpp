@@ -1118,11 +1118,9 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
   handle->hyos_registered =
       yukizygisk::hyos::registered_module_count() > registrations_before;
   if (!yuki_loaded) {
-    int hidden = yuki::solist::drop_lib_containing(
-        reinterpret_cast<uintptr_t>(mod->onModuleLoaded),
-        /*keep_mapped=*/true);
-    LOGI("native module fallback sanitized: %s maps=%d soinfo=%d",
-         module_id.c_str(), fallback_anonymized, hidden);
+    // Native callbacks still need Bionic caller identity and dependencies.
+    LOGI("native module Bionic handle retained: %s maps=%d", module_id.c_str(),
+         fallback_anonymized);
   }
   LOGI("native module loaded: %s early=%u", module_id.c_str(), early ? 1U : 0U);
   if (!early && !yukizygisk::hyos::available())
