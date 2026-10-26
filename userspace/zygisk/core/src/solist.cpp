@@ -10,6 +10,7 @@
 #include "solist.hpp"
 #include "log.hpp"
 #include "native_bionic.hpp"
+#include "soinfo_layout.hpp"
 
 #include <climits>
 #include <elf.h>
@@ -153,6 +154,7 @@ public:
   [[nodiscard]] yukizygisk::native_bionic::Object runtime_object() const {
     return {identity_, path_, load_bias_, runtime_base_};
   }
+  [[nodiscard]] const char *path() const { return path_; }
 
   ~LinkerSyms() {
     if (map_ != MAP_FAILED && map_ != nullptr)
@@ -482,7 +484,7 @@ private:
 };
 
 /* Runtime soinfo unload glue. */
-size_t g_size_off = 0, g_next_off = 0, g_ctor_off = 0;
+size_t g_base_off = 0, g_size_off = 0, g_next_off = 0, g_ctor_off = 0;
 void (*g_soinfo_unload)(void *) = nullptr;
 size_t *g_load_counter = nullptr;
 size_t *g_unload_counter = nullptr;
@@ -492,10 +494,6 @@ guard_fn g_pdg_ctor_u = nullptr, g_pdg_dtor_u = nullptr;
 void *g_solist_head = nullptr;
 void **g_solist_head_slot = nullptr;
 bool g_unload_done = false, g_unload_ok = false;
-
-constexpr size_t kSizeBlockRange = 1024; /* bytes scanned for soinfo fields */
-constexpr size_t kSizeMax = 0x100000;
-constexpr size_t kSizeMin = 0x100;
 
 inline void *u_next(void *si) {
   return *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(si) +
@@ -513,52 +511,36 @@ inline void u_set_size(void *si, size_t v) {
   *reinterpret_cast<size_t *>(reinterpret_cast<uintptr_t>(si) + g_size_off) = v;
 }
 inline void u_set_ctor(void *si, bool v) {
-  *reinterpret_cast<size_t *>(reinterpret_cast<uintptr_t>(si) + g_ctor_off) =
-      v ? 1 : 0;
+  *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(si) + g_ctor_off) = v;
 }
 
-/* Probe soinfo field offsets. */
-bool u_probe_offsets(void *somain, void *solinker, void *vdso,
-                     const char *linker_path) {
-  bool size_ok = false, next_ok = false, ctor_ok = false;
-  for (size_t i = 0; i < kSizeBlockRange / sizeof(void *); ++i) {
-    if (!size_ok) {
-      size_t v = *reinterpret_cast<size_t *>(
-          reinterpret_cast<uintptr_t>(somain) + i * sizeof(void *));
-      if (v > kSizeMin && v < kSizeMax) {
-        g_size_off = i * sizeof(void *);
-        size_ok = true;
-        continue;
-      }
-    }
-    if (!size_ok)
-      continue;
-    uintptr_t field =
-        reinterpret_cast<uintptr_t>(solinker) + i * sizeof(void *);
-    if (!next_ok) {
-      void *nx = *reinterpret_cast<void **>(field);
-      if (nx == somain || (vdso != nullptr && nx == vdso)) {
-        g_next_off = i * sizeof(void *);
-        next_ok = true;
-        continue;
-      }
-    }
-    if (!next_ok)
-      continue;
-    if (!ctor_ok) {
-      auto *lm = reinterpret_cast<link_map *>(field);
-      size_t gap = (sizeof(link_map) + sizeof(void *) - 1) / sizeof(void *);
-      uintptr_t fwd = field + gap * sizeof(void *);
-      if (*reinterpret_cast<bool *>(fwd) && lm->l_addr != 0 &&
-          lm->l_name != nullptr && strcmp(linker_path, lm->l_name) == 0) {
-        g_ctor_off = fwd - reinterpret_cast<uintptr_t>(solinker);
-        ctor_ok = true;
-        i += gap;
-        continue;
-      }
-    }
+bool u_probe_offsets(const layout::Memory &memory, void *somain, void *solinker,
+                     void *vdso, const char *linker_path) {
+  layout::Image main_image, linker_image;
+  const size_t page = page_size();
+  if (getauxval(AT_PHENT) != sizeof(ElfW(Phdr)) ||
+      !layout::main_image(memory, getauxval(AT_PHDR), getauxval(AT_PHNUM), page,
+                          main_image) ||
+      !layout::linker_image(memory, getauxval(AT_BASE), page, linker_image)) {
+    SLOGE("solist-unload: cannot validate runtime ELF ranges");
+    return false;
   }
-  return size_ok && next_ok && ctor_ok;
+  layout::Offsets offsets;
+  const auto result = layout::probe(
+      memory, reinterpret_cast<uintptr_t>(somain),
+      reinterpret_cast<uintptr_t>(solinker), reinterpret_cast<uintptr_t>(vdso),
+      main_image, linker_image, linker_path, offsets);
+  if (result != layout::Result::Valid) {
+    SLOGE("solist-unload: layout validation failed reason=%u main_size=%zu "
+          "linker_size=%zu",
+          static_cast<unsigned>(result), main_image.size, linker_image.size);
+    return false;
+  }
+  g_base_off = offsets.base;
+  g_size_off = offsets.size;
+  g_next_off = offsets.next;
+  g_ctor_off = offsets.ctor;
+  return true;
 }
 
 /* Resolve linker symbols and offsets. */
@@ -608,25 +590,17 @@ bool u_init() {
     return false;
   }
 
+  const auto maps = lsplt::MapInfo::Scan();
+  const layout::Memory memory{maps};
+  void *somain = nullptr, *vdso = nullptr;
+  if (!memory.read(head_var, g_solist_head) ||
+      !memory.read(somain_var, somain) ||
+      (vdso_var != 0 && !memory.read(vdso_var, vdso)) ||
+      g_solist_head == nullptr || somain == nullptr)
+    return false;
   g_solist_head_slot = reinterpret_cast<void **>(head_var);
-  g_solist_head = *g_solist_head_slot;
-  void *somain = *reinterpret_cast<void **>(somain_var);
-  void *vdso = vdso_var != 0 ? *reinterpret_cast<void **>(vdso_var) : nullptr;
-  if (g_solist_head == nullptr || somain == nullptr)
+  if (!u_probe_offsets(memory, somain, g_solist_head, vdso, syms.path()))
     return false;
-
-  const char *hp = g_realpath_u(g_solist_head);
-  if (hp == nullptr || strstr(hp, "linker") == nullptr) {
-    SLOGE("solist-unload: head realpath '%s' not linker-like",
-          hp != nullptr ? hp : "(null)");
-    return false;
-  }
-
-  if (!u_probe_offsets(somain, g_solist_head, vdso, hp)) {
-    SLOGE("solist-unload: offset probe failed [size=%zu next=%zu ctor=%zu]",
-          g_size_off, g_next_off, g_ctor_off);
-    return false;
-  }
 
   SLOGI("solist-unload: ready [size=%zu next=%zu ctor=%zu] unload=%p",
         g_size_off, g_next_off, g_ctor_off,
@@ -743,7 +717,7 @@ int drop_lib_containing(uintptr_t addr, bool keep_mapped) {
     return 0;
   if (g_size_off < sizeof(void *))
     return 0;
-  const size_t base_off = g_size_off - sizeof(void *);
+  const size_t base_off = g_base_off;
 
   int n = 0;
   char guard_obj[16] = {}; /* dummy `this`; guard touches only linker globals */
@@ -754,7 +728,7 @@ int drop_lib_containing(uintptr_t addr, bool keep_mapped) {
     uintptr_t base = *reinterpret_cast<uintptr_t *>(
         reinterpret_cast<uintptr_t>(cur) + base_off);
     size_t size = u_size(cur);
-    if (size > 0 && base != 0 && addr >= base && addr < base + size) {
+    if (size > 0 && base != 0 && addr >= base && addr - base < size) {
       const char *p = g_realpath_u(cur);
       SLOGI("solist-unload: dropping loader realpath=%s base=%p size=%zu "
             "munmap=%d",
@@ -794,7 +768,7 @@ static bool u_contains(void *needle) {
 int release_lib_containing(uintptr_t addr) {
   if (!u_init() || addr == 0 || g_size_off < sizeof(void *))
     return 0;
-  const size_t base_off = g_size_off - sizeof(void *);
+  const size_t base_off = g_base_off;
   bool released = false;
   char guard_obj[16] = {};
   g_pdg_ctor_u(guard_obj);

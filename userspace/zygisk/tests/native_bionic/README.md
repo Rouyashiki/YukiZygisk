@@ -7,6 +7,7 @@ must stay outside the checkout. None of the runners accesses a device.
 | --- | --- |
 | `run_native_bionic_tests.py` | Module identity, local dependencies, duplicate/invalid loads, PLT callbacks and handle lifetime |
 | `run_caller_anchor_tests.py` | Linker export validation, bound libc selection, four-argument FD loading and failure without fallback |
+| `run_soinfo_layout_tests.py` | Runtime ELF layout matching, ambiguous/unreadable fields, constructor-flag writes and real loader retirement |
 
 Run from the repository root; substitute a runner from the table:
 
