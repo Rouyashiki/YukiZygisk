@@ -19,6 +19,7 @@
 
 #include "yukilinker.hpp"
 #include "load_config.hpp"
+#include "loader_handoff.hpp"
 #include "userspace/zygisk/endpoint.hpp"
 
 #include <algorithm>
@@ -2315,16 +2316,56 @@ bool shutdown() {
   return true;
 }
 
-bool release_bootstrap_metadata(SoHandle *handle) {
+bool release_bootstrap_metadata(SoHandle *handle,
+                                yukizygisk::handoff::TakeDependencies take) {
   ImageState *image = state_of(handle);
-  if (image == nullptr || image->tls.active || g_first_image != image ||
-      g_last_image != image)
+  if (take == nullptr || image == nullptr || image->tls.active ||
+      g_first_image != image || g_last_image != image)
     return false;
-  // The core owns its mapping after verifying every borrowed entry point.
+  size_t count = 0;
+  for (auto *dependency = image->dependencies; dependency != nullptr;
+       dependency = dependency->next) {
+    if (dependency->system_handle == nullptr ||
+        count == SIZE_MAX / sizeof(void *))
+      return false;
+    ++count;
+  }
+  auto **handles = count == 0
+                       ? nullptr
+                       : static_cast<void **>(calloc(count, sizeof(void *)));
+  if (count != 0 && handles == nullptr)
+    return false;
+  size_t index = 0;
+  for (auto *dependency = image->dependencies; dependency != nullptr;
+       dependency = dependency->next)
+    handles[index++] = dependency->system_handle;
+  const bool accepted = take(handles, count);
+  free(handles);
+  if (!accepted)
+    return false;
+  // Ownership moved to the core. Closing here could invalidate its imports.
+  for (auto *dependency = image->dependencies; dependency != nullptr;
+       dependency = dependency->next)
+    dependency->system_handle = nullptr;
   unregister_image(image);
-  close_dependencies(image);
   handle->private_state = nullptr;
   return shutdown();
+}
+
+bool prepare_bootstrap_retirement(SoHandle *core, bool has_finalizer,
+                                  bool (*references_ready)(),
+                                  yukizygisk::handoff::TakeDependencies take,
+                                  yukizygisk::handoff::FinishHandoff finish) {
+  if (!has_finalizer || references_ready == nullptr || finish == nullptr ||
+      !references_ready()) {
+    ZLOGE("bootstrap handoff unverified; retaining loader and dependencies");
+    return false;
+  }
+  if (core != nullptr && !release_bootstrap_metadata(core, take)) {
+    ZLOGE("bootstrap metadata cleanup failed; retaining loader");
+    return false;
+  }
+  return finish(core != nullptr);
 }
 
 extern "C" void __cxa_finalize(void *);
@@ -2464,12 +2505,17 @@ yuki_core_dlopen_memfd(int memfd, const char *vma_name, bool file_backed) {
   using FinalizeLoader = void (*)(int, int);
   auto finalize =
       reinterpret_cast<FinalizeLoader>(symbol("zygisk_finalize_loader"));
-  using HandoffComplete = bool (*)();
-  auto handoff_complete = reinterpret_cast<HandoffComplete>(
-      symbol("zygisk_bootstrap_handoff_complete"));
-  if (core != nullptr && finalize != nullptr && handoff_complete != nullptr &&
-      handoff_complete() && !yukilinker::release_bootstrap_metadata(core)) {
-    ZLOGE("bootstrap metadata cleanup failed; retaining loader");
+  using HandoffReady = bool (*)();
+  auto references_ready =
+      reinterpret_cast<HandoffReady>(symbol("zygisk_bootstrap_handoff_ready"));
+  auto take_dependencies =
+      reinterpret_cast<yukizygisk::handoff::TakeDependencies>(
+          symbol("zygisk_bootstrap_take_dependencies"));
+  auto finish_handoff = reinterpret_cast<yukizygisk::handoff::FinishHandoff>(
+      symbol("zygisk_bootstrap_finish_handoff"));
+  if (!yukilinker::prepare_bootstrap_retirement(
+          core, finalize != nullptr, references_ready, take_dependencies,
+          finish_handoff)) {
     yukizygisk::endpoint::release();
     return;
   }

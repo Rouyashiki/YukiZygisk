@@ -10,6 +10,7 @@
 #include "hyos_runtime.hpp"
 #include "inline_hook.hpp"
 #include "load_config.hpp"
+#include "loader_handoff.hpp"
 #include "log.hpp"
 #include "native_bionic.hpp"
 #include "plt_state.hpp"
@@ -1348,126 +1349,6 @@ void run_ctors_once() {
       (*p)();
 }
 
-#ifndef R_AARCH64_GLOB_DAT
-#define R_AARCH64_GLOB_DAT 1025
-#endif // #ifndef R_AARCH64_GLOB_DAT
-#ifndef R_AARCH64_JUMP_SLOT
-#define R_AARCH64_JUMP_SLOT 1026
-#endif // #ifndef R_AARCH64_JUMP_SLOT
-#ifndef R_ARM_GLOB_DAT
-#define R_ARM_GLOB_DAT 21
-#endif // #ifndef R_ARM_GLOB_DAT
-#ifndef R_ARM_JUMP_SLOT
-#define R_ARM_JUMP_SLOT 22
-#endif // #ifndef R_ARM_JUMP_SLOT
-
-#if defined(__LP64__)
-using SelfRelocation = ElfW(Rela);
-#else
-using SelfRelocation = ElfW(Rel);
-#endif // #if defined(__LP64__)
-
-extern "C" const ElfW(Dyn) _DYNAMIC[];
-
-const ElfW(Dyn) * self_dynamic_table(uintptr_t load_bias) {
-  uintptr_t dyn = reinterpret_cast<uintptr_t>(_DYNAMIC);
-  if (load_bias != 0 && g_self_size != 0 && dyn < g_self_size)
-    dyn += load_bias;
-  return reinterpret_cast<const ElfW(Dyn) *>(dyn);
-}
-
-void *resolve_system_dl_iterate_phdr() {
-  volatile char vn[] = "dl_iterate_phdr";
-  char nm[sizeof(vn)];
-  for (size_t i = 0; i < sizeof(vn); ++i)
-    nm[i] = vn[i];
-  return dlsym(RTLD_DEFAULT, nm);
-}
-
-bool rebind_self_dl_iterate_slot(uintptr_t load_bias) {
-  if (load_bias == 0)
-    return true;
-  void *sysfn = resolve_system_dl_iterate_phdr();
-
-  const ElfW(Sym) *symtab = nullptr;
-  const char *strtab = nullptr;
-  const SelfRelocation *jmprel = nullptr;
-  const SelfRelocation *rel = nullptr;
-  size_t pltrelsz = 0;
-  size_t relasz = 0;
-  for (const ElfW(Dyn) *d = self_dynamic_table(load_bias); d->d_tag != DT_NULL;
-       ++d) {
-    switch (d->d_tag) {
-    case DT_SYMTAB:
-      symtab = reinterpret_cast<const ElfW(Sym) *>(load_bias + d->d_un.d_ptr);
-      break;
-    case DT_STRTAB:
-      strtab = reinterpret_cast<const char *>(load_bias + d->d_un.d_ptr);
-      break;
-    case DT_JMPREL:
-      jmprel =
-          reinterpret_cast<const SelfRelocation *>(load_bias + d->d_un.d_ptr);
-      break;
-    case DT_PLTRELSZ:
-      pltrelsz = d->d_un.d_val;
-      break;
-#if defined(__LP64__)
-    case DT_RELA:
-#else
-    case DT_REL:
-#endif // #if defined(__LP64__)
-      rel = reinterpret_cast<const SelfRelocation *>(load_bias + d->d_un.d_ptr);
-      break;
-#if defined(__LP64__)
-    case DT_RELASZ:
-#else
-    case DT_RELSZ:
-#endif // #if defined(__LP64__)
-      relasz = d->d_un.d_val;
-      break;
-    default:
-      break;
-    }
-  }
-  if (symtab == nullptr || strtab == nullptr)
-    return false;
-
-  const long pg = getpagesize();
-  bool safe = true;
-  auto patch = [&](const SelfRelocation *r, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-#if defined(__LP64__)
-      uint32_t type = ELF64_R_TYPE(r[i].r_info);
-      if (type != R_AARCH64_JUMP_SLOT && type != R_AARCH64_GLOB_DAT)
-        continue;
-      uint32_t si = ELF64_R_SYM(r[i].r_info);
-#else
-      uint32_t type = ELF32_R_TYPE(r[i].r_info);
-      if (type != R_ARM_JUMP_SLOT && type != R_ARM_GLOB_DAT)
-        continue;
-      uint32_t si = ELF32_R_SYM(r[i].r_info);
-#endif // #if defined(__LP64__)
-      if (strcmp(strtab + symtab[si].st_name, "dl_iterate_phdr") != 0)
-        continue;
-      if (sysfn == nullptr) {
-        safe = false;
-        continue;
-      }
-      auto **slot = reinterpret_cast<void **>(load_bias + r[i].r_offset);
-      uintptr_t pbase =
-          reinterpret_cast<uintptr_t>(slot) & ~static_cast<uintptr_t>(pg - 1);
-      mprotect(reinterpret_cast<void *>(pbase), static_cast<size_t>(pg),
-               PROT_READ | PROT_WRITE);
-      *slot = sysfn;
-    }
-  };
-  if (jmprel != nullptr)
-    patch(jmprel, pltrelsz / sizeof(SelfRelocation));
-  if (rel != nullptr)
-    patch(rel, relasz / sizeof(SelfRelocation));
-  return safe;
-}
-
 void core_start() {
   run_ctors_once();
   g_inline_hooks.reserve(YZ_NATIVE_TARGET_MAX);
@@ -1643,8 +1524,27 @@ zygisk_core_entry(const char * /*self_path*/, void *loader_self,
     g_early_packet_fd = -1;
     return;
   }
-  g_loader_unmap_safe = rebind_self_dl_iterate_slot(g_self_base);
   core_start();
+  const auto result =
+      g_self_base == 0
+          ? yukizygisk::handoff::verify_loaded(
+                reinterpret_cast<uintptr_t>(core_start), g_loader_base)
+          : yukizygisk::handoff::verify(g_self_base, g_self_size,
+                                        g_loader_base);
+  g_loader_unmap_safe = result.complete;
+  LOGI("native loader handoff: %s; slot=%p target=%p; retain=%d", result.reason,
+       reinterpret_cast<void *>(result.slot),
+       reinterpret_cast<void *>(result.target), !g_loader_unmap_safe);
+}
+
+extern "C" [[gnu::visibility("default")]] bool
+zygisk_bootstrap_handoff_ready() {
+  return g_loader_unmap_safe;
+}
+
+extern "C" [[gnu::visibility("default")]] bool
+zygisk_bootstrap_handoff_complete() {
+  return g_loader_unmap_safe && yukizygisk::handoff::retirement_ready();
 }
 
 extern "C" [[gnu::visibility("default")]] void
@@ -1666,7 +1566,11 @@ zygisk_core_entry_direct(int /*core_fd*/, int early_packet_fd_plus1) {
 
 extern "C" [[gnu::visibility("default")]] void zygisk_finalize_loader(int,
                                                                       int) {
-  int n =
-      yuki::solist::drop_lib_containing(g_loader_base, !g_loader_unmap_safe);
+  if (!zygisk_bootstrap_handoff_complete()) {
+    LOGI("loader retirement not authorized; retaining loader and dependencies");
+    return;
+  }
+
+  int n = yuki::solist::drop_lib_containing(g_loader_base, false);
   LOGI("native finalize_loader: unloaded %d soinfo(s)", n);
 }

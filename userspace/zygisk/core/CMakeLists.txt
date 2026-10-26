@@ -57,6 +57,8 @@ add_library(zygisk SHARED
     ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/core.cpp
+    src/core_bindings.cpp
+    src/loader_handoff.cpp
     src/hook.cpp
     ${YUKIZYGISK_RUNTIME_LOG_SOURCES}
     # the anonymous in-memory loader, compiled INTO the core so it carries its
@@ -117,6 +119,8 @@ add_library(yukizncore SHARED
     ${YUKIZYGISK_CXX_SLIM}
     src/hyos_runtime.cpp
     src/yukizncore.cpp
+    src/core_bindings.cpp
+    src/loader_handoff.cpp
     src/native_bionic.cpp
     src/yukilinker.cpp
     ${YUKILINKER_ARCH_SOURCES}

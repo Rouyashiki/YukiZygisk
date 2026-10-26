@@ -12,6 +12,7 @@
 
 #include "hook.hpp"
 #include "load_config.hpp"
+#include "loader_handoff.hpp"
 #include "log.hpp"
 #include "solist.hpp"
 #include "userspace/zygisk/daemon/zygiskd.hpp"
@@ -882,18 +883,11 @@ static void core_start(const char *self_path) {
 /* Address inside the first-stage loader mapping. */
 uintptr_t g_loader_base = 0;
 
-extern "C" const ElfW(Dyn) _DYNAMIC[];
-
-static const ElfW(Dyn) * self_dynamic_table(uintptr_t load_bias) {
-  uintptr_t dyn = reinterpret_cast<uintptr_t>(_DYNAMIC);
-  if (load_bias != 0 && g_self_size != 0 && dyn < g_self_size)
-    dyn += load_bias;
-  return reinterpret_cast<const ElfW(Dyn) *>(dyn);
-}
-
 using SystemIterateFunction = int (*)(int (*)(struct dl_phdr_info *, size_t,
                                               void *),
                                       void *);
+
+extern "C" void __cxa_finalize(void *);
 
 static SystemIterateFunction resolve_system_dl_iterate_phdr() {
   volatile char vn[] = "dl_iterate_phdr";
@@ -903,17 +897,6 @@ static SystemIterateFunction resolve_system_dl_iterate_phdr() {
   return reinterpret_cast<SystemIterateFunction>(dlsym(RTLD_DEFAULT, nm));
 }
 
-// These are core-local bindings. They prevent the first-stage relocation pass
-// from leaving callbacks into its own mapping in the core's GOT. The core is
-// built with -fno-c++-static-destructors, while modules retain their normal
-// yukilinker-owned destructor registry through the module relocation path.
-extern "C" __attribute__((visibility("hidden"))) int
-__cxa_atexit(void (*)(void *), void *, void *) {
-  return 0;
-}
-
-extern "C" __attribute__((visibility("hidden"))) void __cxa_finalize(void *) {}
-
 extern "C" __attribute__((visibility("hidden"))) int
 dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
                 void *data) {
@@ -922,253 +905,22 @@ dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
   return system_iterator == nullptr ? 0 : system_iterator(callback, data);
 }
 
-// The bootstrap loader must remain mapped until every capability borrowed by
-// the core no longer resolves into it. The core itself is custom-mapped, so
-// map identity is more dependable here than dladdr()/system-linker metadata.
-struct LoaderMapIdentity {
-  unsigned int dev_major = 0;
-  unsigned int dev_minor = 0;
-  unsigned long inode = 0;
-};
-
-static bool parse_proc_map_line(const char *line, uintptr_t *start,
-                                uintptr_t *end, unsigned int *dev_major,
-                                unsigned int *dev_minor, unsigned long *inode) {
-  unsigned long map_start = 0;
-  unsigned long map_end = 0;
-  unsigned long map_inode = 0;
-  unsigned int map_dev_major = 0;
-  unsigned int map_dev_minor = 0;
-  char perms[5] = {};
-  if (sscanf(line, "%lx-%lx %4s %*lx %x:%x %lu", &map_start, &map_end, perms,
-             &map_dev_major, &map_dev_minor, &map_inode) != 6) {
-    return false;
-  }
-  *start = map_start;
-  *end = map_end;
-  *dev_major = map_dev_major;
-  *dev_minor = map_dev_minor;
-  *inode = map_inode;
-  return true;
-}
-
-static bool get_loader_map_identity(LoaderMapIdentity *identity) {
-  FILE *maps = fopen("/proc/self/maps", "re");
-  if (maps == nullptr) {
-    LOGE("loader handoff: cannot open /proc/self/maps");
-    return false;
-  }
-
-  bool found = false;
-  char line[512];
-  while (fgets(line, sizeof(line), maps) != nullptr) {
-    uintptr_t start = 0;
-    uintptr_t end = 0;
-    unsigned int dev_major = 0;
-    unsigned int dev_minor = 0;
-    unsigned long inode = 0;
-    if (!parse_proc_map_line(line, &start, &end, &dev_major, &dev_minor,
-                             &inode) ||
-        g_loader_base < start || g_loader_base >= end) {
-      continue;
-    }
-    if (inode == 0) {
-      LOGE("loader handoff: first-stage mapping has no stable identity");
-      break;
-    }
-    *identity = {dev_major, dev_minor, inode};
-    found = true;
-    break;
-  }
-  fclose(maps);
-  if (!found) {
-    LOGE("loader handoff: cannot identify first-stage mapping at %p",
-         reinterpret_cast<void *>(g_loader_base));
-  }
-  return found;
-}
-
-enum class PointerOwner {
-  FirstStage,
-  Other,
-  Unknown,
-};
-
-static PointerOwner pointer_owner(uintptr_t address,
-                                  const LoaderMapIdentity &loader) {
-  if (address == 0)
-    return PointerOwner::Other;
-
-  FILE *maps = fopen("/proc/self/maps", "re");
-  if (maps == nullptr)
-    return PointerOwner::Unknown;
-
-  PointerOwner owner = PointerOwner::Unknown;
-  char line[512];
-  while (fgets(line, sizeof(line), maps) != nullptr) {
-    uintptr_t start = 0;
-    uintptr_t end = 0;
-    unsigned int dev_major = 0;
-    unsigned int dev_minor = 0;
-    unsigned long inode = 0;
-    if (!parse_proc_map_line(line, &start, &end, &dev_major, &dev_minor,
-                             &inode) ||
-        address < start || address >= end) {
-      continue;
-    }
-    owner = dev_major == loader.dev_major && dev_minor == loader.dev_minor &&
-                    inode == loader.inode
-                ? PointerOwner::FirstStage
-                : PointerOwner::Other;
-    break;
-  }
-  fclose(maps);
-  return owner;
-}
-
-static bool verify_handoff_pointer(const char *name, uintptr_t address,
-                                   const LoaderMapIdentity &loader) {
-  switch (pointer_owner(address, loader)) {
-  case PointerOwner::Other:
-    return true;
-  case PointerOwner::FirstStage:
-    LOGE("loader handoff incomplete: %s still points into first stage (%p)",
-         name, reinterpret_cast<void *>(address));
-    return false;
-  case PointerOwner::Unknown:
-    LOGE("loader handoff incomplete: cannot classify %s (%p)", name,
-         reinterpret_cast<void *>(address));
-    return false;
-  }
-  return false;
-}
-
-#if defined(__LP64__)
-using SelfRelocation = ElfW(Rela);
-#else
-using SelfRelocation = ElfW(Rel);
-#endif // #if defined(__LP64__)
-
-struct SelfDynamicInfo {
-  const ElfW(Sym) *symtab = nullptr;
-  const char *strtab = nullptr;
-  const SelfRelocation *jmprel = nullptr;
-  size_t pltrelsz = 0;
-  const SelfRelocation *rel = nullptr;
-  size_t relsz = 0;
-};
-
-static bool get_self_dynamic_info(uintptr_t load_bias, SelfDynamicInfo *info) {
-  const ElfW(Dyn) *dynamic = self_dynamic_table(load_bias);
-  if (dynamic == nullptr)
-    return false;
-
-  for (const ElfW(Dyn) *entry = dynamic; entry->d_tag != DT_NULL; ++entry) {
-    switch (entry->d_tag) {
-    case DT_SYMTAB:
-      info->symtab =
-          reinterpret_cast<const ElfW(Sym) *>(load_bias + entry->d_un.d_ptr);
-      break;
-    case DT_STRTAB:
-      info->strtab =
-          reinterpret_cast<const char *>(load_bias + entry->d_un.d_ptr);
-      break;
-    case DT_JMPREL:
-      info->jmprel = reinterpret_cast<const SelfRelocation *>(
-          load_bias + entry->d_un.d_ptr);
-      break;
-    case DT_PLTRELSZ:
-      info->pltrelsz = entry->d_un.d_val;
-      break;
-#if defined(__LP64__)
-    case DT_RELA:
-#else
-    case DT_REL:
-#endif // #if defined(__LP64__)
-      info->rel = reinterpret_cast<const SelfRelocation *>(load_bias +
-                                                           entry->d_un.d_ptr);
-      break;
-#if defined(__LP64__)
-    case DT_RELASZ:
-#else
-    case DT_RELSZ:
-#endif // #if defined(__LP64__)
-      info->relsz = entry->d_un.d_val;
-      break;
-    default:
-      break;
-    }
-  }
-
-  if (info->symtab == nullptr || info->strtab == nullptr ||
-      info->pltrelsz % sizeof(SelfRelocation) != 0 ||
-      info->relsz % sizeof(SelfRelocation) != 0) {
-    LOGE("loader handoff: malformed core dynamic relocation metadata");
-    return false;
-  }
-  return true;
-}
-
-static bool verify_relocation_table(const SelfRelocation *table,
-                                    size_t table_size,
-                                    const SelfDynamicInfo &info,
-                                    const LoaderMapIdentity &loader) {
-  if (table == nullptr && table_size != 0) {
-    LOGE("loader handoff: missing core relocation table");
-    return false;
-  }
-
-  bool complete = true;
-  const size_t count = table_size / sizeof(SelfRelocation);
-  for (size_t i = 0; i < count; ++i) {
-    const auto &reloc = table[i];
-    if (reloc.r_offset > g_self_size ||
-        sizeof(uintptr_t) > g_self_size - reloc.r_offset) {
-      LOGE("loader handoff: relocation slot lies outside the core image");
-      complete = false;
-      continue;
-    }
-
-#if defined(__LP64__)
-    const auto symbol_index = ELF64_R_SYM(reloc.r_info);
-#else
-    const auto symbol_index = ELF32_R_SYM(reloc.r_info);
-#endif // #if defined(__LP64__)
-    const char *name = symbol_index == 0
-                           ? "<relative>"
-                           : info.strtab + info.symtab[symbol_index].st_name;
-    const auto *slot =
-        reinterpret_cast<const uintptr_t *>(g_self_base + reloc.r_offset);
-    if (!verify_handoff_pointer(name, *slot, loader))
-      complete = false;
-  }
-  return complete;
-}
-
 static bool first_stage_handoff_complete() {
-  if (g_loader_base == 0 || g_self_base == 0 || g_self_size == 0) {
-    LOGE("loader handoff: image bounds are unavailable");
-    return false;
-  }
-
-  LoaderMapIdentity loader;
-  if (!get_loader_map_identity(&loader))
-    return false;
-
-  bool complete = true;
-  complete &= verify_handoff_pointer(
-      "yuki_dlopen_memfd", reinterpret_cast<uintptr_t>(g_yuki_dlopen), loader);
-  complete &= verify_handoff_pointer(
-      "yuki_dlsym", reinterpret_cast<uintptr_t>(g_yuki_dlsym), loader);
-  complete &= verify_handoff_pointer(
-      "yuki_dlclose", reinterpret_cast<uintptr_t>(g_yuki_dlclose), loader);
-
-  SelfDynamicInfo info;
-  if (!get_self_dynamic_info(g_self_base, &info))
-    return false;
-  complete &= verify_relocation_table(info.jmprel, info.pltrelsz, info, loader);
-  complete &= verify_relocation_table(info.rel, info.relsz, info, loader);
-  return complete;
+  const uintptr_t capabilities[] = {
+      reinterpret_cast<uintptr_t>(g_yuki_dlopen),
+      reinterpret_cast<uintptr_t>(g_yuki_dlsym),
+      reinterpret_cast<uintptr_t>(g_yuki_dlclose)};
+  const auto result =
+      g_self_base == 0
+          ? yukizygisk::handoff::verify_loaded(
+                reinterpret_cast<uintptr_t>(core_start), g_loader_base,
+                capabilities, 3)
+          : yukizygisk::handoff::verify(g_self_base, g_self_size, g_loader_base,
+                                        capabilities, 3);
+  LOGI("loader handoff: %s; slot=%p target=%p", result.reason,
+       reinterpret_cast<void *>(result.slot),
+       reinterpret_cast<void *>(result.target));
+  return result.complete;
 }
 
 bool g_loader_unmap_safe = false;
@@ -1196,8 +948,7 @@ zygisk_core_entry(const char *self_path, void *loader_self, void *core_base,
   core_start(self_path);
   // Never turn the first stage into an unmapped trampoline. A partial handoff
   // is safe only while its mapping remains pinned.
-  const bool all_pointers_handed_off =
-      g_self_base == 0 || first_stage_handoff_complete();
+  const bool all_pointers_handed_off = first_stage_handoff_complete();
   g_loader_unmap_safe = all_pointers_handed_off;
   if (!g_loader_unmap_safe)
     LOGI("loader handoff is incomplete; retaining first-stage mapping");
@@ -1206,8 +957,13 @@ zygisk_core_entry(const char *self_path, void *loader_self, void *core_base,
 }
 
 extern "C" [[gnu::visibility("default")]] bool
-zygisk_bootstrap_handoff_complete() {
+zygisk_bootstrap_handoff_ready() {
   return g_loader_unmap_safe;
+}
+
+extern "C" [[gnu::visibility("default")]] bool
+zygisk_bootstrap_handoff_complete() {
+  return g_loader_unmap_safe && yukizygisk::handoff::retirement_ready();
 }
 
 extern "C" [[gnu::visibility("default")]] void
@@ -1337,19 +1093,22 @@ void zygisk_cleanup_tango_stub() {
   g_tango_stub = 0;
 }
 
-/* Remove the first-stage soinfo; retain its mapping if handoff is incomplete.
- */
+/* Retire the first stage only after both references and ownership moved. */
 extern "C" [[gnu::visibility("default")]] void zygisk_finalize_loader(int,
                                                                       int) {
+  if (!zygisk_bootstrap_handoff_complete()) {
+    LOGI("loader retirement not authorized; retaining loader and dependencies");
+    return;
+  }
+
   zd_load_config();
   // The bootstrap has finished resolving symbols through the core handle.
   if (g_self_base == 0)
     prepare_system_core_unmap(
         reinterpret_cast<uintptr_t>(zygisk_finalize_loader));
   LOGI("finalize_loader: finalizing loader at base=%p munmap=%d",
-       (void *)g_loader_base, g_loader_unmap_safe);
-  int n =
-      yuki::solist::drop_lib_containing(g_loader_base, !g_loader_unmap_safe);
+       reinterpret_cast<void *>(g_loader_base), g_loader_unmap_safe);
+  int n = yuki::solist::drop_lib_containing(g_loader_base, false);
   LOGI("finalize_loader: unloaded %d soinfo(s)", n);
 }
 
