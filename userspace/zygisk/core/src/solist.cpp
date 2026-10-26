@@ -9,6 +9,7 @@
 
 #include "solist.hpp"
 #include "log.hpp"
+#include "native_bionic.hpp"
 
 #include <climits>
 #include <elf.h>
@@ -82,6 +83,75 @@ public:
     if (!map_and_parse())
       return false;
     return symtab_ != nullptr && strtab_ != nullptr;
+  }
+
+  bool init_runtime(const yukizygisk::native_bionic::Maps &maps,
+                    yukizygisk::native_bionic::Failure &failure) {
+    maps_ = &maps;
+    failure_ = &failure;
+    failure = {yukizygisk::native_bionic::Stage::Linker,
+               yukizygisk::native_bionic::Error::InvalidElf, 0};
+    return find_linker_base() && map_and_parse();
+  }
+
+  uintptr_t find_exact(const char *name, uint64_t &file_offset) const {
+    using namespace yukizygisk::native_bionic;
+    failure_->error = Error::SymbolUnavailable;
+    uintptr_t result = 0;
+    size_t matches = 0;
+    for (size_t i = 0; i < sym_cnt_; ++i) {
+      const ElfW(Sym) &symbol = symtab_[i];
+      if (symbol.st_name >= strtab_sz_)
+        return 0;
+      const char *candidate = strtab_ + symbol.st_name;
+      if (memchr(candidate, '\0', strtab_sz_ - symbol.st_name) == nullptr)
+        return 0;
+      if (strcmp(candidate, name) != 0 || symbol.st_shndx == SHN_UNDEF)
+        continue;
+      if (++matches > 1) {
+        failure_->error = Error::SymbolAmbiguous;
+        return 0;
+      }
+      if (ELF64_ST_TYPE(symbol.st_info) != STT_FUNC ||
+          ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL ||
+          (symbol.st_other & 3) != STV_DEFAULT ||
+          symbol.st_shndx >= SHN_LORESERVE || symbol.st_value == 0 ||
+          !add_address(load_bias_, symbol.st_value, result))
+        return 0;
+      const uintptr_t code = code_address(result);
+      if (code % instruction_size(result) != 0)
+        return 0;
+      bool executable = false;
+      for (size_t j = 0; j < runtime_phnum_; ++j) {
+        const auto &ph = runtime_phdr_[j];
+        uintptr_t start = 0;
+        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0 ||
+            !add_address(load_bias_, ph.p_vaddr, start) || code < start)
+          continue;
+        const uint64_t relative = code - start;
+        const uint64_t bytes =
+            symbol.st_size != 0 ? symbol.st_size : instruction_size(result);
+        if (relative > ph.p_filesz || bytes > ph.p_filesz - relative ||
+            relative > UINT64_MAX - ph.p_offset || bytes > SIZE_MAX)
+          continue;
+        const uint64_t offset = ph.p_offset + relative;
+        executable = mapped_range(*maps_, code, static_cast<size_t>(bytes),
+                                  PROT_EXEC, &identity_, &offset);
+        if (executable) {
+          file_offset = offset;
+          break;
+        }
+      }
+      if (!executable)
+        return 0;
+    }
+    if (matches == 1)
+      failure_->error = Error::None;
+    return result;
+  }
+
+  [[nodiscard]] yukizygisk::native_bionic::Object runtime_object() const {
+    return {identity_, path_, load_bias_, runtime_base_};
   }
 
   ~LinkerSyms() {
@@ -173,6 +243,13 @@ private:
     if (linker_base == 0)
       return false;
 
+    using namespace yukizygisk::native_bionic;
+    runtime_base_ = linker_base;
+    if (maps_ != nullptr &&
+        (linker_base % alignof(ElfW(Ehdr)) != 0 ||
+         !mapped_range(*maps_, linker_base, sizeof(ElfW(Ehdr)), PROT_READ)))
+      return false;
+
     const auto *eh = reinterpret_cast<const ElfW(Ehdr) *>(linker_base);
     if (!valid_ident(eh->e_ident) || !valid_machine(eh->e_machine) ||
         eh->e_type != ET_DYN || eh->e_version != EV_CURRENT ||
@@ -187,10 +264,19 @@ private:
     runtime_phdr_ =
         reinterpret_cast<const ElfW(Phdr) *>(linker_base + eh->e_phoff);
     runtime_phnum_ = eh->e_phnum;
+    if (maps_ != nullptr &&
+        (eh->e_phoff % alignof(ElfW(Phdr)) != 0 ||
+         !mapped_range(*maps_, reinterpret_cast<uintptr_t>(runtime_phdr_),
+                       runtime_phnum_ * sizeof(ElfW(Phdr)), PROT_READ)))
+      return false;
     for (size_t i = 0; i < runtime_phnum_; ++i) {
       const ElfW(Phdr) &ph = runtime_phdr_[i];
       if (ph.p_type != PT_LOAD)
         continue;
+      if (maps_ != nullptr &&
+          (ph.p_offset != 0 || ph.p_vaddr > linker_base ||
+           ph.p_filesz < sizeof(ElfW(Ehdr)) || ph.p_filesz > ph.p_memsz))
+        return false;
       uintptr_t mapped =
           elf_runtime_address(static_cast<ElfW(Addr)>(linker_base),
                               static_cast<ElfW(Addr)>(ph.p_offset));
@@ -206,6 +292,11 @@ private:
     if (main_phdr_addr == 0 || main_phnum == 0 || main_phnum > 128 ||
         main_phent != sizeof(ElfW(Phdr)))
       return false;
+    if (maps_ != nullptr &&
+        (main_phdr_addr % alignof(ElfW(Phdr)) != 0 ||
+         !mapped_range(*maps_, main_phdr_addr, main_phnum * sizeof(ElfW(Phdr)),
+                       PROT_READ)))
+      return false;
 
     const auto *main_phdr =
         reinterpret_cast<const ElfW(Phdr) *>(main_phdr_addr);
@@ -214,6 +305,8 @@ private:
     const ElfW(Phdr) *interp_phdr = nullptr;
     for (size_t i = 0; i < main_phnum; ++i) {
       if (main_phdr[i].p_type == PT_PHDR) {
+        if (maps_ != nullptr && main_phdr[i].p_vaddr > main_phdr_addr)
+          return false;
         main_bias = elf_load_bias(main_phdr_addr, main_phdr[i].p_vaddr);
         have_main_bias = true;
       } else if (main_phdr[i].p_type == PT_INTERP) {
@@ -239,6 +332,13 @@ private:
     if (!interp_mapped)
       return false;
 
+    uintptr_t interp_address = 0;
+    if (maps_ != nullptr &&
+        (!add_address(main_bias, interp_phdr->p_vaddr, interp_address) ||
+         !mapped_range(*maps_, interp_address, interp_phdr->p_filesz,
+                       PROT_READ)))
+      return false;
+
     const char *interp = reinterpret_cast<const char *>(elf_runtime_address(
         static_cast<ElfW(Addr)>(main_bias), interp_phdr->p_vaddr));
     size_t path_len = strnlen(interp, interp_phdr->p_filesz);
@@ -251,17 +351,37 @@ private:
 
   bool map_and_parse() {
     int fd = open(path_, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
+    if (fd < 0) {
+      if (failure_ != nullptr)
+        failure_->system_error = errno;
       return false;
+    }
     struct stat st{};
-    if (fstat(fd, &st) != 0 || st.st_size < 0 ||
+    const int stat_result = fstat(fd, &st);
+    if (stat_result != 0 || st.st_size < 0 ||
         static_cast<uint64_t>(st.st_size) < sizeof(ElfW(Ehdr)) ||
         static_cast<uint64_t>(st.st_size) > SIZE_MAX) {
+      if (failure_ != nullptr && stat_result != 0)
+        failure_->system_error = errno;
       close(fd);
       return false;
     }
     map_sz_ = (size_t)st.st_size;
+    if (maps_ != nullptr) {
+      identity_ = {static_cast<uint64_t>(st.st_dev),
+                   static_cast<uint64_t>(st.st_ino)};
+      const uint64_t zero = 0;
+      if (!S_ISREG(st.st_mode) ||
+          !mapped_range(*maps_, runtime_base_, sizeof(ElfW(Ehdr)), PROT_READ,
+                        &identity_, &zero)) {
+        failure_->error = yukizygisk::native_bionic::Error::IdentityMismatch;
+        close(fd);
+        return false;
+      }
+    }
     map_ = mmap(nullptr, map_sz_, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_ == MAP_FAILED && failure_ != nullptr)
+      failure_->system_error = errno;
     close(fd);
     if (map_ == MAP_FAILED)
       return false;
@@ -283,17 +403,54 @@ private:
       return false;
 
     const auto *ph = reinterpret_cast<const ElfW(Phdr) *>(base + eh->e_phoff);
+    if (maps_ != nullptr) {
+      const uint64_t offset = eh->e_phoff;
+      if (eh->e_phoff % alignof(ElfW(Phdr)) != 0 ||
+          eh->e_shoff % alignof(ElfW(Shdr)) != 0 ||
+          !mapped_range(*maps_, reinterpret_cast<uintptr_t>(runtime_phdr_),
+                        runtime_phnum_ * sizeof(ElfW(Phdr)), PROT_READ,
+                        &identity_, &offset))
+        return false;
+      for (size_t i = 0; i < eh->e_phnum; ++i) {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        if (ph[i].p_type == PT_LOAD &&
+            (ph[i].p_filesz > ph[i].p_memsz ||
+             (ph[i].p_align > 1 &&
+              ((ph[i].p_align & (ph[i].p_align - 1)) != 0 ||
+               ph[i].p_offset % ph[i].p_align !=
+                   ph[i].p_vaddr % ph[i].p_align)) ||
+             !file_range_valid(ph[i].p_offset, ph[i].p_filesz, map_sz_) ||
+             !yukizygisk::native_bionic::add_address(load_bias_, ph[i].p_vaddr,
+                                                     start) ||
+             !yukizygisk::native_bionic::add_address(start, ph[i].p_memsz,
+                                                     end)))
+          return false;
+      }
+    }
     if (!runtime_phdr_matches(eh, ph))
       return false;
 
     const auto *sh = reinterpret_cast<const ElfW(Shdr) *>(base + eh->e_shoff);
+    ElfW(Word) table_type = SHT_SYMTAB;
+    if (maps_ != nullptr)
+      table_type = SHT_DYNSYM;
+    if (maps_ != nullptr) {
+      size_t tables = 0;
+      for (size_t i = 0; i < eh->e_shnum; ++i)
+        tables += sh[i].sh_type == SHT_DYNSYM ? 1 : 0;
+      if (tables != 1)
+        return false;
+    }
     for (size_t i = 0; i < eh->e_shnum; ++i) {
-      if (sh[i].sh_type != SHT_SYMTAB)
+      if (sh[i].sh_type != table_type)
         continue;
       if (sh[i].sh_link >= eh->e_shnum ||
           sh[i].sh_entsize != sizeof(ElfW(Sym)) ||
           sh[i].sh_size % sizeof(ElfW(Sym)) != 0 ||
           !file_range_valid(sh[i].sh_offset, sh[i].sh_size, map_sz_))
+        return false;
+      if (maps_ != nullptr && sh[i].sh_offset % alignof(ElfW(Sym)) != 0)
         return false;
       const ElfW(Shdr) &str = sh[sh[i].sh_link];
       if (str.sh_type != SHT_STRTAB || str.sh_size == 0 ||
@@ -318,6 +475,10 @@ private:
   const char *strtab_ = nullptr;
   size_t strtab_sz_ = 0;
   size_t sym_cnt_ = 0;
+  const yukizygisk::native_bionic::Maps *maps_ = nullptr;
+  yukizygisk::native_bionic::Failure *failure_ = nullptr;
+  yukizygisk::native_bionic::Identity identity_;
+  uintptr_t runtime_base_ = 0;
 };
 
 /* Runtime soinfo unload glue. */
@@ -1013,3 +1174,32 @@ int name_anonymous_exec() {
 }
 
 } // namespace yuki::solist
+
+namespace yukizygisk::native_bionic {
+
+bool resolve_loader(const Maps &maps, LoaderApi &api, Failure &failure) {
+  api = {};
+  yuki::solist::LinkerSyms symbols;
+  if (!symbols.init_runtime(maps, failure))
+    return false;
+  const uintptr_t open =
+      symbols.find_exact("__loader_android_dlopen_ext", api.file_offsets[0]);
+  if (open == 0)
+    return false;
+  const uintptr_t iterate =
+      symbols.find_exact("__loader_dl_iterate_phdr", api.file_offsets[1]);
+  if (iterate == 0)
+    return false;
+  const uintptr_t address_info =
+      symbols.find_exact("__loader_dladdr", api.file_offsets[2]);
+  if (address_info == 0)
+    return false;
+  api.open = reinterpret_cast<OpenExt>(open);
+  api.iterate = reinterpret_cast<Iterate>(iterate);
+  api.address_info = reinterpret_cast<AddressInfo>(address_info);
+  api.linker = symbols.runtime_object();
+  failure = {Stage::Linker, Error::None, 0};
+  return true;
+}
+
+} // namespace yukizygisk::native_bionic

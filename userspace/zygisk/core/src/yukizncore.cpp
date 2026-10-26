@@ -11,6 +11,7 @@
 #include "inline_hook.hpp"
 #include "load_config.hpp"
 #include "log.hpp"
+#include "native_bionic.hpp"
 #include "plt_state.hpp"
 #include "solist.hpp"
 #include "userspace/zygisk/endpoint.hpp"
@@ -1068,13 +1069,29 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
   android_dlextinfo ext{};
   ext.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
   ext.library_fd = lib_fd;
-  dlerror();
-  void *so = android_dlopen_ext(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL, &ext);
+  const auto load = yukizygisk::native_bionic::load(lib_path.c_str(),
+                                                    RTLD_NOW | RTLD_LOCAL, ext);
+  const auto &context = load.context;
+  LOGI("native caller: id=%s pid=%d early=%u stage=%s "
+       "reason=%s errno=%d linker=%s bias=%p libc=%s bias=%p "
+       "libc_dev=%llu libc_ino=%llu anchor=%p end=%p",
+       module_id.c_str(), getpid(), early ? 1U : 0U,
+       yukizygisk::native_bionic::stage_name(load.failure.stage),
+       yukizygisk::native_bionic::error_name(load.failure.error),
+       load.failure.system_error, context.api.linker.path.c_str(),
+       reinterpret_cast<void *>(context.api.linker.bias),
+       context.libc.path.c_str(), reinterpret_cast<void *>(context.libc.bias),
+       static_cast<unsigned long long>(context.libc.identity.device),
+       static_cast<unsigned long long>(context.libc.identity.inode),
+       reinterpret_cast<void *>(context.anchor),
+       reinterpret_cast<void *>(context.segment_end));
+  void *so = load.handle;
   if (so == nullptr) {
-    const char *error = dlerror();
     LOGE("native core: Bionic load failed id=%s idx=%u path=%s early=%u: %s",
          module_id.c_str(), idx, lib_path.c_str(), early ? 1U : 0U,
-         error != nullptr ? error : "no linker error");
+         load.loader_error.empty()
+             ? yukizygisk::native_bionic::error_name(load.failure.error)
+             : load.loader_error.c_str());
     close(lib_fd);
     return false;
   }
@@ -1087,13 +1104,11 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
       return false;
     }
   }
-  LOGI("native core: Bionic loaded id=%s idx=%u path=%s early=%u",
+  LOGI("native core: Bionic loaded id=%s idx=%u path=%s early=%u "
+       "caller=libc mappings=bionic",
        module_id.c_str(), idx, lib_path.c_str(), early ? 1U : 0U);
-  // Constructors may already have started threads that mutate these mappings.
-  if (yukizygisk::config::anonymous(g_yz_config))
-    LOGI("native core: anonymous mapping skipped id=%s; retaining live Bionic "
-         "mappings",
-         module_id.c_str());
+  // Native modules retain Bionic mappings and identity independently of Core
+  // anonymity.
 
   dlerror();
   auto *mod = reinterpret_cast<ZygiskNextModule *>(dlsym(so, "zn_module"));

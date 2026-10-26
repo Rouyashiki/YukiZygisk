@@ -117,6 +117,7 @@ add_library(yukizncore SHARED
     ${YUKIZYGISK_CXX_SLIM}
     src/hyos_runtime.cpp
     src/yukizncore.cpp
+    src/native_bionic.cpp
     src/yukilinker.cpp
     ${YUKILINKER_ARCH_SOURCES}
     src/self_unmap.S
@@ -128,6 +129,7 @@ add_library(yukizncore SHARED
 set_target_properties(yukizncore PROPERTIES
     PREFIX "lib"
     OUTPUT_NAME "yukizncore${YUKIZYGISK_ABI_SUFFIX}")
+
 target_include_directories(yukizncore PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../include

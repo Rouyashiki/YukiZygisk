@@ -19,7 +19,26 @@ def function(source, signature):
     return source[start:end]
 
 
+def generate_linker(core, build):
+    source = (core / 'solist.cpp').read_text()
+    helpers = '\n'.join(function(source, signature) for signature in (
+        'inline uintptr_t elf_runtime_address(', 'inline uintptr_t elf_load_bias('))
+    reader = function(source, 'class LinkerSyms {') + ';'
+    resolver = function(source, 'bool resolve_loader(').replace(
+        'bool resolve_loader(', 'bool checked_resolve(', 1)
+    (build / 'caller_linker_under_test.inc').write_text(
+        'namespace yuki::solist { namespace {\n' + helpers + '\n' + reader +
+        '\n}}\nnamespace yukizygisk::native_bionic {\n' + resolver + '\n}\n')
+
+
 def generate(core, build):
+    generate_linker(core, build)
+    (build / 'caller_native_under_test.inc').write_text(
+        (core / 'native_bionic.cpp').read_text().replace('LoadResult load(', 'LoadResult checked_load(', 1))
+    native = (core / 'native_bionic.cpp').read_text()
+    (build / 'caller_names_under_test.inc').write_text('\n'.join(
+        function(native, signature) for signature in (
+            'const char *stage_name(', 'const char *error_name(')))
     source = (core / 'yukizncore.cpp').read_text()
     handle = source.index('struct ModuleHandle {')
     (build / 'native_handle_under_test.inc').write_text(
@@ -55,7 +74,7 @@ def build_tests(root, build, compiler, flags, runner=None):
     android = any('--target=' in flag for flag in flags)
     elf_source = lsplt / 'elf_util.cc'
     if not android:
-        common += ['-I' + str(lsplt.parents[3] / 'test/host')]
+        common += ['-I' + str(lsplt.parents[3] / 'test/host'), '-I' + str(sources / 'host')]
         # glibc rebases DT_* pointers in place; Bionic leaves them relative.
         elf = elf_source.read_text()
         old = 'auto val = bias + off;'

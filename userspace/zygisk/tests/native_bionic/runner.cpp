@@ -4,8 +4,11 @@
 #include "userspace/zygisk/load_policy.hpp"
 #include "zygisk_next_api.h"
 
+#include <algorithm>
+#include <climits>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -17,15 +20,8 @@
 #include <utility>
 #include <vector>
 
-#if defined(__ANDROID__)
+#include "native_bionic.hpp"
 #include <android/dlext.h>
-#else
-struct android_dlextinfo {
-  uint64_t flags;
-  int library_fd;
-};
-constexpr uint64_t ANDROID_DLEXT_USE_LIBRARY_FD = 0x10;
-#endif
 
 namespace {
 int events[6]{};
@@ -52,26 +48,13 @@ bool logged(std::string_view text) {
   return false;
 }
 
-void *observed_dlopen(const char *path, int flags,
-                      const android_dlextinfo *ext) {
-  ++loads;
-  CHECK(path[0] == '/');
-  CHECK(flags == (RTLD_NOW | RTLD_LOCAL));
-  CHECK(ext->flags == ANDROID_DLEXT_USE_LIBRARY_FD);
-  CHECK(fcntl(ext->library_fd, F_GETFD) >= 0);
-#if defined(__ANDROID__)
-  void *so = android_dlopen_ext(path, flags, ext);
-#else
-  // Host adapter; only the Android build exercises Bionic fd loading.
-  void *so = dlopen(path, flags);
-#endif
+void observe_loaded(void *so) {
   if (so != nullptr) {
     const auto probe =
         reinterpret_cast<void (*)()>(dlsym(so, "native_identity_probe"));
     if (probe != nullptr)
       probe();
   }
-  return so;
 }
 
 constexpr int kApiVersion3 = 3;
@@ -103,6 +86,47 @@ std::string self_exe_path() {
 std::string clean_map_path(const std::string &path) { return path; }
 } // namespace
 
+#if defined(__ANDROID__)
+#include "caller_linker_under_test.inc"
+namespace yukizygisk::native_bionic {
+bool resolve_loader(const Maps &maps, LoaderApi &api, Failure &failure) {
+  return checked_resolve(maps, api, failure);
+}
+} // namespace yukizygisk::native_bionic
+#include "caller_native_under_test.inc"
+#endif
+
+namespace yukizygisk::native_bionic {
+#if !defined(__ANDROID__)
+#include "caller_names_under_test.inc"
+#endif
+LoadResult load(const char *path, int flags, const android_dlextinfo &ext) {
+  ++loads;
+  CHECK(path[0] == '/');
+  CHECK(flags == (RTLD_NOW | RTLD_LOCAL));
+  CHECK(ext.flags == ANDROID_DLEXT_USE_LIBRARY_FD);
+  CHECK(fcntl(ext.library_fd, F_GETFD) >= 0);
+#if defined(__ANDROID__)
+  auto result = checked_load(path, flags, ext);
+#else
+  // The Android fixture runs the production Bionic resolver and FD loader.
+  LoadResult result;
+  result.failure.stage = Stage::Load;
+  dlerror();
+  errno = 0;
+  result.handle = dlopen(path, flags);
+  if (result.handle == nullptr) {
+    const int saved_errno = errno;
+    const char *error = dlerror();
+    result.loader_error = error != nullptr ? error : "no linker error";
+    result.failure = {Stage::Load, Error::LoaderFailure, saved_errno};
+  }
+#endif
+  observe_loaded(result.handle);
+  return result;
+}
+} // namespace yukizygisk::native_bionic
+
 namespace yukizygisk::hyos {
 bool available() { return false; }
 bool in_specialized_child() { return false; }
@@ -117,9 +141,7 @@ namespace {
 
 const ZygiskNextAPI g_api{api_plt_hook};
 
-#define android_dlopen_ext observed_dlopen
 #include "native_load_under_test.inc"
-#undef android_dlopen_ext
 
 zygiskd::NativeModuleInfo info(const char *id, const std::string &path) {
   zygiskd::NativeModuleInfo result{};
@@ -197,7 +219,6 @@ int main(int argc, char **argv) {
   CHECK(events[1] == prior_ctors + 1 && events[2] == prior_dtors);
   CHECK(events[3] == 1 && g_loaded_modules.size() == 1);
   CHECK(reports == (early ? 0 : 1));
-  CHECK(logged("anonymous mapping skipped") == (atoi(argv[3]) != 0));
   const auto probe = reinterpret_cast<void (*)()>(
       dlsym(g_loaded_modules[0]->so, "native_identity_probe"));
   CHECK(probe != nullptr);
