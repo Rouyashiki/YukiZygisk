@@ -14,6 +14,7 @@
 #include <linux/fs.h>
 #include <linux/lsm_hooks.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/printk.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
@@ -36,6 +37,8 @@
 #include "host/runtime.h"
 
 #define YZ_POLICY_PERM_BITS 32
+/* avtab_write_item(): four 16-bit key fields and a 32-bit access vector. */
+#define YZ_POLICY_AVTAB_ALLOWED_SIZE (4 * sizeof(u16) + sizeof(u32))
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 extern int avc_ss_reset(u32 seqno);
@@ -365,8 +368,7 @@ yz_policy_get_avtab_node(struct policydb *db,
 
 	node = yz_call_avtab_insert_nonunique(&db->te_avtab, &avkey, &datum);
 	if (node)
-		db->len += sizeof(struct avtab_key) +
-			   sizeof(struct avtab_datum);
+		db->len += YZ_POLICY_AVTAB_ALLOWED_SIZE;
 
 	return node;
 }
@@ -400,8 +402,7 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 			removed.htable[0] = cur;
 			removed.nel = 1;
 			yz_call_avtab_destroy(&removed);
-			db->len -= sizeof(struct avtab_key) +
-				   sizeof(struct avtab_datum);
+			db->len -= YZ_POLICY_AVTAB_ALLOWED_SIZE;
 			return true;
 		}
 	}
@@ -536,6 +537,8 @@ int yz_host_policy_prepare_runtime_current(void)
 
 	sid = yz_policy_cred_sid(current_cred());
 	if (!sid) {
+		pr_err("yukizygisk: runtime SELinux policy: current credential "
+		       "has no SID\n");
 		ret = -EINVAL;
 		goto out_unlock;
 	}
@@ -596,16 +599,26 @@ static void yz_policy_destroy(struct selinux_policy *policy)
 	kfree(policy);
 }
 
-static struct selinux_policy *
-yz_policy_dup(struct selinux_policy *old_policy)
+static struct selinux_policy *yz_policy_dup(struct selinux_policy *old_policy)
 {
 	struct selinux_policy *policy;
 	struct policy_file fp;
 	void *data;
+	size_t ebitmap_extra;
 	size_t len;
 	int ret;
 
-	len = old_policy->policydb.len;
+	/*
+	 * policydb_read() adds every type to its own attribute map, so the
+	 * serialized copy can grow by one ebitmap node per type (KernelSU
+	 * #3680).
+	 */
+	if (check_mul_overflow((size_t)old_policy->policydb.p_types.nprim,
+			       sizeof(u32) + sizeof(u64), &ebitmap_extra) ||
+	    check_add_overflow(old_policy->policydb.len, ebitmap_extra, &len)) {
+		pr_err("yukizygisk: SELinux policy buffer length overflow\n");
+		return ERR_PTR(-EOVERFLOW);
+	}
 	data = vmalloc(len);
 	if (!data)
 		return ERR_PTR(-ENOMEM);
@@ -613,8 +626,13 @@ yz_policy_dup(struct selinux_policy *old_policy)
 	fp.data = data;
 	fp.len = len;
 	ret = yz_call_policydb_write(&old_policy->policydb, &fp);
-	if (ret)
+	if (ret) {
+		pr_err("yukizygisk: policydb_write failed: %d (capacity=%zu "
+		       "remaining=%zu)\n",
+		       ret, len, fp.len);
 		goto out_free_data;
+	}
+	len -= fp.len;
 
 #ifdef POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
 	if (len >= 24) {
@@ -641,9 +659,13 @@ yz_policy_dup(struct selinux_policy *old_policy)
 	fp.data = data;
 	fp.len = len;
 	ret = yz_call_policydb_read(&policy->policydb, &fp);
-	if (ret)
+	if (ret) {
+		pr_err("yukizygisk: policydb_read failed: %d (length=%zu "
+		       "remaining=%zu)\n",
+		       ret, len, fp.len);
 		goto out_free_policy;
-	policy->policydb.len = old_policy->policydb.len;
+	}
+	policy->policydb.len = len;
 	vfree(data);
 	return policy;
 
