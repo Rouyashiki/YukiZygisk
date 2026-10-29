@@ -307,7 +307,8 @@ static int yz_init_symbol_resolver(void)
 	return 0;
 }
 
-bool yz_kernel_read_nofault(void *dst, unsigned long src, size_t size)
+YZ_LEGACY_INDIRECT_CALL bool
+yz_kernel_read_nofault(void *dst, unsigned long src, size_t size)
 {
 	if (!yz_copy_from_kernel_nofault_fn)
 		yz_copy_from_kernel_nofault_fn =
@@ -318,7 +319,7 @@ bool yz_kernel_read_nofault(void *dst, unsigned long src, size_t size)
 	       yz_copy_from_kernel_nofault_fn(dst, (const void *)src, size) == 0;
 }
 
-__attribute__((__noinline__)) bool
+YZ_LEGACY_INDIRECT_CALL bool
 yz_lookup_size_offset(unsigned long addr, unsigned long *symbolsize,
 		      unsigned long *offset)
 {
@@ -395,13 +396,13 @@ YZ_INDIRECT_CALL int yz_kern_path(const char *name, unsigned int flags,
 	return yz_kern_path_fn ? yz_kern_path_fn(name, flags, path) : -ENOENT;
 }
 
-void yz_path_put(const struct path *path)
+YZ_LEGACY_INDIRECT_CALL void yz_path_put(const struct path *path)
 {
 	if (yz_path_put_fn)
 		yz_path_put_fn(path);
 }
 
-noinline int yz_close_fd(unsigned int fd)
+YZ_LEGACY_INDIRECT_CALL int yz_close_fd(unsigned int fd)
 {
 #if YZ_USE_LEGACY_CLOSE_FD
 	/* Android 12's old-CFI jump-table slot has no callable symbol name.

@@ -72,6 +72,56 @@ static typeof(&selnl_notify_policyload) yz_selnl_notify_policyload;
 static typeof(&selinux_status_update_policyload)
 	yz_selinux_status_update_policyload;
 
+/* These private SELinux functions need not have named old-CFI jump-table
+ * entries. Keep each resolved call in its own boundary, including after LTO. */
+static YZ_LEGACY_INDIRECT_CALL int
+yz_call_policydb_write(struct policydb *db, void *fp)
+{
+	return yz_policydb_write(db, fp);
+}
+
+static YZ_LEGACY_INDIRECT_CALL int
+yz_call_policydb_read(struct policydb *db, void *fp)
+{
+	return yz_policydb_read(db, fp);
+}
+
+static YZ_LEGACY_INDIRECT_CALL void
+yz_call_policydb_destroy(struct policydb *db)
+{
+	yz_policydb_destroy(db);
+}
+
+static YZ_LEGACY_INDIRECT_CALL void *
+yz_call_symtab_search(struct symtab *table, const char *name)
+{
+	return yz_symtab_search(table, name);
+}
+
+static YZ_LEGACY_INDIRECT_CALL struct avtab_node *
+yz_call_avtab_search_node(struct avtab *table, struct avtab_key *key)
+{
+	return yz_avtab_search_node(table, key);
+}
+
+static YZ_LEGACY_INDIRECT_CALL struct avtab_node *
+yz_call_avtab_insert_nonunique(struct avtab *table, struct avtab_key *key,
+			      struct avtab_datum *datum)
+{
+	return yz_avtab_insert_nonunique(table, key, datum);
+}
+
+static YZ_LEGACY_INDIRECT_CALL int
+yz_call_avtab_alloc(struct avtab *table, u32 entries)
+{
+	return yz_avtab_alloc(table, entries);
+}
+
+static YZ_LEGACY_INDIRECT_CALL void yz_call_avtab_destroy(struct avtab *table)
+{
+	yz_avtab_destroy(table);
+}
+
 static const char *const yz_file_load_perms[] = {
 	"read", "open", "getattr", "map", "execute",
 };
@@ -180,7 +230,7 @@ yz_policy_inode_security(const struct inode *inode)
 	return inode->i_security + yz_selinux_blob_sizes->lbs_inode;
 }
 
-static struct context *
+static YZ_LEGACY_INDIRECT_CALL struct context *
 yz_policy_sidtab_search(struct sidtab *sidtab, u32 sid)
 {
 	struct sidtab_entry *entry;
@@ -218,7 +268,7 @@ yz_policy_type_value_by_name(struct policydb *db, const char *name)
 
 	if (!db || !name)
 		return 0;
-	type = yz_symtab_search(&db->p_types, name);
+	type = yz_call_symtab_search(&db->p_types, name);
 	return type ? type->value : 0;
 }
 
@@ -243,9 +293,9 @@ yz_policy_perm_mask(struct class_datum *cls, const char *perm_name)
 	if (!cls || !perm_name)
 		return 0;
 
-	perm = yz_symtab_search(&cls->permissions, perm_name);
+	perm = yz_call_symtab_search(&cls->permissions, perm_name);
 	if (!perm && cls->comdatum)
-		perm = yz_symtab_search(&cls->comdatum->permissions, perm_name);
+		perm = yz_call_symtab_search(&cls->comdatum->permissions, perm_name);
 	if (!perm || perm->value == 0 || perm->value > YZ_POLICY_PERM_BITS)
 		return 0;
 
@@ -276,7 +326,7 @@ yz_policy_direct_allowed_av_locked(struct policydb *db,
 	avkey.target_class = key->tclass;
 	avkey.specified = AVTAB_ALLOWED;
 
-	node = yz_avtab_search_node(&db->te_avtab, &avkey);
+	node = yz_call_avtab_search_node(&db->te_avtab, &avkey);
 	return node ? node->datum.u.data : 0;
 }
 
@@ -309,11 +359,11 @@ yz_policy_get_avtab_node(struct policydb *db,
 	avkey.target_class = key->tclass;
 	avkey.specified = AVTAB_ALLOWED;
 
-	node = yz_avtab_search_node(&db->te_avtab, &avkey);
+	node = yz_call_avtab_search_node(&db->te_avtab, &avkey);
 	if (node)
 		return node;
 
-	node = yz_avtab_insert_nonunique(&db->te_avtab, &avkey, &datum);
+	node = yz_call_avtab_insert_nonunique(&db->te_avtab, &avkey, &datum);
 	if (node)
 		db->len += sizeof(struct avtab_key) +
 			   sizeof(struct avtab_datum);
@@ -330,7 +380,7 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 	int ret;
 	size_t i;
 
-	ret = yz_avtab_alloc(&removed, 1);
+	ret = yz_call_avtab_alloc(&removed, 1);
 	if (ret < 0)
 		return false;
 
@@ -349,14 +399,14 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 			cur->next = NULL;
 			removed.htable[0] = cur;
 			removed.nel = 1;
-			yz_avtab_destroy(&removed);
+			yz_call_avtab_destroy(&removed);
 			db->len -= sizeof(struct avtab_key) +
 				   sizeof(struct avtab_datum);
 			return true;
 		}
 	}
 
-	yz_avtab_destroy(&removed);
+	yz_call_avtab_destroy(&removed);
 	return false;
 }
 
@@ -381,7 +431,7 @@ yz_policy_apply_av(struct policydb *db, const struct yz_policy_key *key,
 		return 0;
 	}
 
-	node = yz_avtab_search_node(
+	node = yz_call_avtab_search_node(
 		&db->te_avtab,
 		&(struct avtab_key){
 			.source_type = key->src_type,
@@ -410,7 +460,7 @@ static int yz_policy_allow_all_sources(
 	u32 av;
 	u32 src_type;
 
-	cls = yz_symtab_search(&db->p_classes, spec->name);
+	cls = yz_call_symtab_search(&db->p_classes, spec->name);
 	if (!cls || cls->value > U16_MAX)
 		return spec->optional ? 0 : -ENOENT;
 
@@ -426,7 +476,7 @@ static int yz_policy_allow_all_sources(
 
 		if (!name)
 			continue;
-		type = yz_symtab_search(&db->p_types, name);
+		type = yz_call_symtab_search(&db->p_types, name);
 		if (!type || type->attribute)
 			continue;
 
@@ -449,9 +499,9 @@ static int yz_policy_allow_named(
 	struct yz_policy_key key;
 	u32 av;
 
-	source_type = yz_symtab_search(&db->p_types, source);
-	target_type = yz_symtab_search(&db->p_types, target);
-	cls = yz_symtab_search(&db->p_classes, class_name);
+	source_type = yz_call_symtab_search(&db->p_types, source);
+	target_type = yz_call_symtab_search(&db->p_types, target);
+	cls = yz_call_symtab_search(&db->p_classes, class_name);
 	if (!source_type || source_type->attribute || !target_type ||
 	    target_type->attribute || !cls || source_type->value > U16_MAX ||
 	    target_type->value > U16_MAX || cls->value > U16_MAX)
@@ -542,7 +592,7 @@ static void yz_policy_destroy(struct selinux_policy *policy)
 {
 	if (!policy)
 		return;
-	yz_policydb_destroy(&policy->policydb);
+	yz_call_policydb_destroy(&policy->policydb);
 	kfree(policy);
 }
 
@@ -562,7 +612,7 @@ yz_policy_dup(struct selinux_policy *old_policy)
 
 	fp.data = data;
 	fp.len = len;
-	ret = yz_policydb_write(&old_policy->policydb, &fp);
+	ret = yz_call_policydb_write(&old_policy->policydb, &fp);
 	if (ret)
 		goto out_free_data;
 
@@ -590,7 +640,7 @@ yz_policy_dup(struct selinux_policy *old_policy)
 
 	fp.data = data;
 	fp.len = len;
-	ret = yz_policydb_read(&policy->policydb, &fp);
+	ret = yz_call_policydb_read(&policy->policydb, &fp);
 	if (ret)
 		goto out_free_policy;
 	policy->policydb.len = old_policy->policydb.len;
@@ -604,7 +654,7 @@ out_free_data:
 	return ERR_PTR(ret);
 }
 
-static void yz_policy_reset_avc(void)
+static YZ_LEGACY_INDIRECT_CALL void yz_policy_reset_avc(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 	yz_avc_ss_reset(0);
@@ -846,7 +896,7 @@ yz_policy_base_get_file_load_keys(
 	if (!scontext || !tcontext)
 		return -ENOENT;
 
-	cls = yz_symtab_search(&db->p_classes, "file");
+	cls = yz_call_symtab_search(&db->p_classes, "file");
 	if (!cls || cls->value > U16_MAX)
 		return -ENOENT;
 
@@ -861,7 +911,7 @@ yz_policy_base_get_file_load_keys(
 					ARRAY_SIZE(yz_file_load_perms));
 
 	if (include_dir) {
-		cls = yz_symtab_search(&db->p_classes, "dir");
+		cls = yz_call_symtab_search(&db->p_classes, "dir");
 		if (!cls || cls->value > U16_MAX)
 			return -ENOENT;
 		keys->dir.src_type = scontext->type;
@@ -875,7 +925,7 @@ yz_policy_base_get_file_load_keys(
 			     yz_policy_type_value_by_name(db, "tmpfs") :
 			     0;
 	if (tmpfs_type) {
-		cls = yz_symtab_search(&db->p_classes, "file");
+		cls = yz_call_symtab_search(&db->p_classes, "file");
 		if (!cls || cls->value > U16_MAX)
 			return -ENOENT;
 		if (tmpfs_type == tcontext->type) {
@@ -928,7 +978,7 @@ yz_policy_base_get_execmem_key(const struct cred *cred,
 	if (!scontext)
 		return -ENOENT;
 
-	cls = yz_symtab_search(&db->p_classes, "process");
+	cls = yz_call_symtab_search(&db->p_classes, "process");
 	if (!cls || cls->value > U16_MAX)
 		return -ENOENT;
 

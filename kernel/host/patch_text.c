@@ -153,7 +153,9 @@ struct yz_patch_text_info {
 	int flags;
 };
 
-static int yz_patch_text_nosync(void *dst, void *src, size_t len, int flags)
+/* __set_fixmap and copy_to_kernel_nofault may only have raw old-CFI entries. */
+static YZ_LEGACY_INDIRECT_CALL int
+yz_patch_text_nosync(void *dst, void *src, size_t len, int flags)
 {
 	unsigned long target = (unsigned long)dst;
 	unsigned long phys;

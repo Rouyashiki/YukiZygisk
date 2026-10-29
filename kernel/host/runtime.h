@@ -15,6 +15,7 @@
 #include <linux/sched.h>
 #include <linux/task_work.h>
 #include <linux/types.h>
+#include <linux/version.h>
 
 struct path;
 
@@ -32,6 +33,14 @@ struct path;
  * non-inlined function. This makes the CFI/KCFI exclusion auditable and stops
  * an optimizer from moving the indirect call back into instrumented code. */
 #define YZ_INDIRECT_CALL __attribute__((__noinline__)) YZ_NOCFI
+
+/* Old CFI may have no named jump-table entry for a private kernel function.
+ * Isolate calls through its raw address; keep KCFI checks for typed C entries. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+#define YZ_LEGACY_INDIRECT_CALL YZ_INDIRECT_CALL
+#else
+#define YZ_LEGACY_INDIRECT_CALL __attribute__((__noinline__))
+#endif
 
 extern unsigned long (*yz_kallsyms_lookup_name)(const char *name);
 extern struct file *(*yz_filp_open)(const char *filename, int flags,
