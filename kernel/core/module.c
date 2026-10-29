@@ -27,6 +27,23 @@
 #include <viola.h>
 #include <viola_identity.h>
 
+#if defined(CONFIG_ARM64) && defined(MODULE) &&                                \
+    defined(CONFIG_STACKPROTECTOR) && !defined(CONFIG_STACKPROTECTOR_PER_TASK)
+#include <linux/random.h>
+#include <linux/stackprotector.h>
+#include <linux/version.h>
+
+/*
+ * A module built with global stack protection can run on a kernel rebuilt
+ * with per-task protection, where the kernel has no global canary symbol.
+ * Adapted from KernelSU #3264 by 5ec1cff:
+ * https://github.com/tiann/KernelSU/commit/221542b6972ee2355f0b7e4b7033b97702bf17c5
+ */
+unsigned long __stack_chk_guard __ro_after_init
+    __attribute__((visibility("hidden")));
+#define YZ_NEEDS_OWN_STACKPROTECTOR
+#endif
+
 VIOLA_EMBED_IDENTITY(VIOLA_ROLE_KO, VIOLA_ABI_ARM64, VIOLA_BUILD_KMI);
 
 static unsigned int yz_init_stage_mask = 0x3f;
@@ -130,7 +147,8 @@ void yukizygisk_bootstrap_fail_closed(void)
 	mutex_unlock(&yz_lifecycle_lock);
 }
 
-static int __init yukizygisk_init(void)
+/* Keep stack-protected code out of the canary setup frame under LTO. */
+static noinline int __init yukizygisk_init(void)
 {
 	int ret;
 
@@ -262,7 +280,23 @@ static void __exit yukizygisk_exit(void)
 	synchronize_rcu_tasks();
 }
 
+#ifdef YZ_NEEDS_OWN_STACKPROTECTOR
+static __attribute__((no_stack_protector)) int __init yz_init_early(void)
+{
+	unsigned long canary;
+
+	get_random_bytes(&canary, sizeof(canary));
+	canary ^= LINUX_VERSION_CODE;
+	__stack_chk_guard = canary & CANARY_MASK;
+
+	/* Let the compiler preserve registers and the int(void) CFI type. */
+	return yukizygisk_init();
+}
+
+module_init(yz_init_early);
+#else
 module_init(yukizygisk_init);
+#endif
 module_exit(yukizygisk_exit);
 
 MODULE_LICENSE("GPL");
