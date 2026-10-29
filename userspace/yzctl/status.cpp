@@ -231,15 +231,9 @@ bool query_runtime(Host &host, RuntimeSnapshot *snapshot, std::string *error) {
 
 yz_config read_config(const std::string &path) {
   yz_config config{1, 0, 0, 0};
-  std::ifstream stream(path);
-  if (!stream.is_open())
-    return config;
-
-  std::ostringstream contents;
-  contents << stream.rdbuf();
   try {
-    const json::Value root = json::parse(contents.str());
-    if (root.type != json::Type::Object)
+    json::Value root;
+    if (!yukizygisk::settings::read(path, &root))
       return config;
     const json::Value &yukilinker = root.at("yukilinker");
     if (yukilinker.type == json::Type::Bool)
