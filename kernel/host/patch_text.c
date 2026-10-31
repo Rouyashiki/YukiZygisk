@@ -164,11 +164,8 @@ yz_patch_text_nosync(void *dst, void *src, size_t len, int flags)
 	int ret;
 
 	phys = yz_phys_from_virt(target, &phys_err);
-	if (phys_err) {
-		pr_err("yukizygisk: failed to resolve patch target phys addr 0x%lx\n",
-		       target);
+	if (phys_err)
 		return phys_err;
-	}
 
 	yz_set_fixmap(FIX_TEXT_POKE0, phys, FIXMAP_PAGE_NORMAL);
 	map = (void *)(fix_to_virt(FIX_TEXT_POKE0) + (phys & ~PAGE_MASK));
@@ -220,5 +217,8 @@ int yz_patch_text(void *dst, void *src, size_t len, int flags)
 		return ret;
 	}
 
-	return stop_machine(yz_patch_text_cb, &info, cpu_online_mask);
+	ret = stop_machine(yz_patch_text_cb, &info, cpu_online_mask);
+	if (ret)
+		pr_err("yukizygisk: failed to patch %p: %d\n", dst, ret);
+	return ret;
 }
