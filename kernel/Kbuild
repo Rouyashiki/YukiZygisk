@@ -22,6 +22,7 @@ yukizygisk-objs := \
 	host/root_impl.o \
 	host/mount.o \
 	host/policy.o \
+	host/inode.o \
 	host/policy_temp.o \
 	host/patch_text.o \
 	host/lsm.o \

@@ -31,6 +31,7 @@
 #include "ss/symtab.h"
 #include "xfrm.h"
 
+#include "host/inode.h"
 #include "host/policy_base.h"
 #include "host/policy.h"
 #include "host/policy_temp.h"
@@ -223,14 +224,6 @@ static u32 yz_policy_cred_sid(const struct cred *cred)
 		return 0;
 	csec = cred->security + yz_selinux_blob_sizes->lbs_cred;
 	return csec->sid;
-}
-
-static struct inode_security_struct *
-yz_policy_inode_security(const struct inode *inode)
-{
-	if (!inode || !inode->i_security || !yz_selinux_blob_sizes)
-		return NULL;
-	return inode->i_security + yz_selinux_blob_sizes->lbs_inode;
 }
 
 static YZ_LEGACY_INDIRECT_CALL struct context *
@@ -897,7 +890,9 @@ yz_policy_base_get_file_load_keys(
 
 	*keys = (struct yz_policy_file_load_keys){};
 
-	isec = yz_policy_inode_security(file_inode(file));
+	isec = yz_selinux_inode(file_inode(file));
+	if (IS_ERR(isec))
+		return PTR_ERR(isec);
 	if (!isec)
 		return -EINVAL;
 
@@ -1017,6 +1012,8 @@ yz_policy_base_get_execmem_key(const struct cred *cred,
 
 int yz_host_policy_init(void)
 {
+	int ret;
+
 	yz_selinux_state =
 		(void *)yz_lookup_name_quiet("selinux_state");
 	yz_selinux_blob_sizes =
@@ -1050,6 +1047,10 @@ int yz_host_policy_init(void)
 		pr_warn("yukizygisk: KernelSU-style SELinux policy backend unavailable\n");
 		return 0;
 	}
+
+	ret = yz_selinux_inode_init(yz_selinux_blob_sizes);
+	if (ret)
+		return ret;
 
 	pr_info("yukizygisk: KernelSU-style SELinux policy backend available\n");
 	return 0;
