@@ -6,7 +6,7 @@
 #
 # Author: Anatdx
 
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.22)
 project(zygisk_core VERSION 1.0.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -43,21 +43,25 @@ if(CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 endif()
 
-# Vendored PLT-hook engine (LGPL-3.0). Static only -- we ship no extra .so.
-set(LSPLT_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-add_subdirectory(
-    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lsplt/lsplt/src/main/jni
-    ${CMAKE_BINARY_DIR}/lsplt)
-# Silence lsplt's logcat output: it logs hook details to the "LSPlt" tag, which a
-# detector reading logcat would see. LOG_DISABLED maps all its LOG* to 0, which
-# also drops the liblog dependency.
-target_compile_definitions(lsplt_static PRIVATE LOG_DISABLED)
+# Each Core owns a private YukiPLT registry until its explicit retirement.
+set(YUKIPLT_LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
+if(NOT DEFINED ANDROID_ABI)
+    set(ANDROID_ABI "${CMAKE_ANDROID_ARCH_ABI}")
+endif()
+add_subdirectory(../third_party/yukiplt ${CMAKE_BINARY_DIR}/yukiplt)
+target_compile_definitions(yukiplt PRIVATE YUKIPLT_SYSTEM_PHDR_ITERATOR=core_system_iterate_phdr)
+target_compile_options(yukiplt PRIVATE -fexceptions -fno-stack-protector
+    -fno-c++-static-destructors -ffunction-sections -fdata-sections)
+set_source_files_properties(src/core.cpp src/hook.cpp src/hyos_runtime.cpp
+    src/yukizncore.cpp src/process_maps.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
 
 add_library(zygisk SHARED
     ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/core.cpp
     src/core_bindings.cpp
+    src/plt_lifecycle.cpp
+    src/process_maps.cpp
     src/loader_handoff.cpp
     src/hook.cpp
     ${YUKIZYGISK_RUNTIME_LOG_SOURCES}
@@ -108,11 +112,12 @@ if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
         YUKIZYGISK_RUNTIME_LOG=1
         YUKIZYGISK_LOG_SOURCE=1)
 endif()
-target_link_libraries(zygisk PRIVATE dl lsplt_static)
-# --as-needed drops the liblog DT_NEEDED that lsplt links PUBLIC: with LOG_DISABLED
-# we never call into it, so no point advertising the dependency.
-target_link_options(zygisk PRIVATE -Wl,--gc-sections -Wl,--strip-all
-                    -Wl,--as-needed)
+target_link_libraries(zygisk PRIVATE dl YukiPLT::yukiplt)
+target_link_options(zygisk PRIVATE "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/zygisk.map" -Wl,--wrap=dl_iterate_phdr -Wl,--wrap=dl_unwind_find_exidx -Wl,--gc-sections -Wl,--strip-all
+                    -Wl,--as-needed -Wl,--exclude-libs,ALL
+                    -Wl,-z,now -Wl,-z,relro -Wl,-Bsymbolic-functions
+                    -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete
+                    -Wl,-z,max-page-size=16384)
 
 add_library(yukizncore SHARED
     ../endpoint.cpp
@@ -120,6 +125,8 @@ add_library(yukizncore SHARED
     src/hyos_runtime.cpp
     src/yukizncore.cpp
     src/core_bindings.cpp
+    src/plt_lifecycle.cpp
+    src/process_maps.cpp
     src/loader_handoff.cpp
     src/native_bionic.cpp
     src/yukilinker.cpp
@@ -138,7 +145,6 @@ target_include_directories(yukizncore PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../daemon
-    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lsplt/lsplt/src/main/jni/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xz-embedded
     ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 target_compile_options(yukizncore PRIVATE
@@ -154,15 +160,19 @@ target_compile_definitions(yukizncore PRIVATE
     XZ_DEC_ANY_CHECK=1
     XZ_INTERNAL_CRC32=1
     NOINLINE=noinline_for_stack)
-target_link_libraries(yukizncore PRIVATE dl lsplt_static)
-target_link_options(yukizncore PRIVATE -Wl,--gc-sections -Wl,--strip-all
-                    -Wl,--as-needed)
+target_link_libraries(yukizncore PRIVATE dl YukiPLT::yukiplt)
+target_link_options(yukizncore PRIVATE "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/yukizncore.map" -Wl,--wrap=dl_iterate_phdr -Wl,--wrap=dl_unwind_find_exidx -Wl,--gc-sections -Wl,--strip-all
+                    -Wl,--as-needed -Wl,--exclude-libs,ALL
+                    -Wl,-z,now -Wl,-z,relro -Wl,-Bsymbolic-functions
+                    -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete
+                    -Wl,-z,max-page-size=16384)
 
 # libyukilinker64.so / libyukilinker32.so -- the anonymous in-memory module
-# loader, split into its own .so that core dlopen+dlsym's at runtime (exports
-# yuki_dlopen_memfd/dlsym/dlclose). Same source as compiled-in; no lsplt/solist
-# deps.
+# loader, split into its own
+# .so that core dlopen+dlsym's at runtime (exports yuki_dlopen_memfd/dlsym/
+# dlclose). Same source as compiled-in; no PLT-engine/solist dependencies.
 add_library(yukilinker SHARED
+    src/core_bindings.cpp
     ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/yukilinker.cpp
@@ -191,7 +201,8 @@ if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
         YUKIZYGISK_LOG_SOURCE=3)
 endif()
 target_link_libraries(yukilinker PRIVATE dl)
-target_link_options(yukilinker PRIVATE -Wl,--gc-sections -Wl,--strip-all)
+target_link_options(yukilinker PRIVATE -Wl,--gc-sections -Wl,--strip-all
+    -Wl,-Bsymbolic-functions -Wl,--exclude-libs,ALL -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete)
 
 find_program(LLVM_STRIP NAMES llvm-strip)
 if(LLVM_STRIP)

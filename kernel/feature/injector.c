@@ -421,8 +421,9 @@ static void yz_inject_tw_func(struct callback_head *cb)
 		dlopen_addr = at_base + dlopen_off;
 		dlsym_addr = at_base + dlsym_off;
 
-		/* Stage loader/core fds in the target. */
-		yuki = native || yz_config_first_stage_loader();
+		/* Core always uses the anonymous bootstrap; userspace selects
+		 * module policy. */
+		yuki = true;
 		loader_path =
 		    native && tw->early_native
 			? yz_early_native_loader_path(compat)
@@ -699,12 +700,14 @@ bool yz_tango_active(void)
 	       yz_auth_injection_allowed(false, true);
 }
 
-int yz_tango_prepare(u32 *generation)
+int yz_tango_prepare(u32 *generation, int *core_fd)
 {
 	struct yz_file_load_policy *policy;
 	char socket_name[YZ_ZYGOTE_NAME_MAX];
 	char process[YZ_RUNTIME_PROCESS_MAX];
 	int fd;
+
+	*core_fd = -1;
 
 	if (!yz_tango_active() ||
 	    !yz_runtime_parse_zygote_args(current->mm, socket_name,
@@ -727,16 +730,27 @@ int yz_tango_prepare(u32 *generation)
 				     YZ_RUNTIME_STATE_FAILED);
 		return PTR_ERR(policy);
 	}
-	fd = yz_payload_stage_image(YZ_CORE32_PATH, YZ_VMA_NAME, policy,
-				    VIOLA_ROLE_CORE, true);
+	fd = yz_payload_stage_image(YZ_LOADER32_PATH, YZ_VMA_NAME, policy,
+				    VIOLA_ROLE_LOADER, true);
 	if (fd < 0) {
 		yz_load_policy_restore_state(policy);
 		yz_runtime_set_state(current->tgid, *generation,
 				     YZ_RUNTIME_STATE_FAILED);
 		return fd;
 	}
+	*core_fd = yz_payload_stage_image(YZ_CORE32_PATH, YZ_VMA_NAME, NULL,
+				       VIOLA_ROLE_CORE, true);
+	if (*core_fd < 0) {
+		yz_payload_close_fd(fd);
+		yz_load_policy_restore_state(policy);
+		yz_runtime_set_state(current->tgid, *generation,
+				     YZ_RUNTIME_STATE_FAILED);
+		return *core_fd;
+	}
 	if (yz_host_file_load_policy_allow_execmem_current(policy)) {
 		yz_payload_close_fd(fd);
+		yz_payload_close_fd(*core_fd);
+		*core_fd = -1;
 		yz_load_policy_restore_state(policy);
 		yz_runtime_set_state(current->tgid, *generation,
 				     YZ_RUNTIME_STATE_FAILED);
@@ -746,10 +760,11 @@ int yz_tango_prepare(u32 *generation)
 	return fd;
 }
 
-void yz_tango_finish(u32 generation, int fd, bool redirected)
+void yz_tango_finish(u32 generation, int fd, int core_fd, bool redirected)
 {
 	if (!redirected) {
 		yz_payload_close_fd(fd);
+		yz_payload_close_fd(core_fd);
 		yz_load_policy_restore_native(current->tgid);
 	}
 	yz_runtime_set_state(current->tgid, generation,

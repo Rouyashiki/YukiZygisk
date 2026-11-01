@@ -8,12 +8,12 @@ must stay outside the checkout. None of the runners accesses a device.
 | `run_native_bionic_tests.py` | Module identity, local dependencies, duplicate/invalid loads, PLT callbacks and handle lifetime |
 | `run_caller_anchor_tests.py` | Linker export validation, bound libc selection, four-argument FD loading and failure without fallback |
 | `run_soinfo_layout_tests.py` | Runtime ELF layout matching, ambiguous/unreadable fields, constructor-flag writes and real loader retirement |
-| `run_loader_handoff_tests.py` | Relocation references, dependency ownership, failed retirement gates and callbacks after Loader unmapping |
+| `run_loader_handoff_tests.py` | Anonymous Core loading, Hook/Unhook, private runtime cleanup and self-unmapping |
 
-Run from the repository root; substitute a runner from the table:
+Run the first three runners from the repository root:
 
 ```sh
-runner=userspace/zygisk/tests/run_loader_handoff_tests.py
+runner=userspace/zygisk/tests/run_caller_anchor_tests.py
 
 # ASan/UBSan on the host, plus ARM64 and ARM32 Linux QEMU.
 python3 "$runner" --build-dir /tmp/yz-handoff-host --qemu
@@ -24,16 +24,25 @@ python3 "$runner" --build-dir /tmp/yz-handoff-android \
   --android-sysroot /path/to/aosp-runtime
 ```
 
+The anonymous handoff runner supports only the NDK build and Android sysroot
+commands above. First build the production runtime with CMake in
+`<runtime-build-dir>/arm64-v8a` and `<runtime-build-dir>/armeabi-v7a`, then pass
+`--runtime-build-dir <runtime-build-dir>` with `--ndk`. It uses those pinned
+YukiPLT archives to exercise cold and exception-runtime cleanup paths.
+
 Use a different output directory for each runner. The Android sysroot needs
 `system/bin/linker{,64}` and matching
 `apex/com.android.runtime/lib{,64}/bionic/{libc,libdl,libm}.so`.
+The native module builder copies its matching NDK `libc++_shared.so` into each
+ABI's fixture directory. It runs ordinary and early loading presets; Core
+loader settings do not change the native modules' Bionic loading path.
 Older ARM32 Bionic requires PIDs below 65536; on a busy host, run QEMU in a
 fresh local PID namespace with `unshare --pid --fork --mount-proc`.
 
 The host fixtures substitute platform inputs and extract selected production
-functions; they do not emulate Bionic namespaces. Android fixtures use the
-real Bionic loader. Separate DSOs are required to exercise `DT_NEEDED`
-ownership and callback lifetime across Loader removal.
+functions; they do not emulate Bionic namespaces. Android native module
+fixtures use the real Bionic loader. The handoff fixture loads its Core with
+YukiLinker and checks actual unmapping after Hook/Unhook.
 
 Native modules keep Bionic identities and file mappings while the Core may
 remain anonymous. Successful loading does not prove module initialization or

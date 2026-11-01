@@ -56,9 +56,11 @@ Third-party components
 
   - The Zygisk public API header is derived from Magisk and is distributed
     under its original ISC terms. Copyright (c) 2022-2023 John "topjohnwu" Wu.
-  - LSPlt is distributed under LGPL-3.0. Copyright (c) 2022 LSPosed.
-    The complete linked source and build files are available in this source
-    tree; generated packages do not carry standalone license files.
+  - YukiPLT is distributed under Apache-2.0.
+    Copyright 2026 Rouyashiki <https://rouyashiki.org>.
+    Its source and LICENSE are pinned in the submodule
+    userspace/zygisk/third_party/yukiplt.
+    Source: https://github.com/Rouyashiki/YukiPLT/tree/31d3104e27889cb6b45f83d0c614f8074f937bf0
   - XZ Embedded is by Lasse Collin and Igor Pavlov and has been placed in the
     public domain by its authors.
   - The AArch64 TLSDESC resolver assembly includes work from the Android Open
