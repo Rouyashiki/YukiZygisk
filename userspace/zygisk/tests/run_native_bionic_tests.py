@@ -51,6 +51,8 @@ def generate(core, build):
             'std::string module_id_of(', 'bool load_native_module_from_fd(')))
     (build / 'native_map_under_test.inc').write_text(
         function(source, 'bool map_from_base('))
+    (build / 'native_companion_under_test.inc').write_text(
+        function(source, 'int api_connect_companion('))
 
 
 def run(command, **kwargs):
@@ -91,7 +93,7 @@ def build_tests(root, build, compiler, flags, runner=None):
     library('invalid', 'invalid.cpp', ['-DINVALID_VERSION'])
     library('null', 'invalid.cpp', ['-DNULL_ENTRY'])
     (build / 'malformed.so').write_bytes(b'not an ELF shared object\n')
-    run([*common, '-fPIE', '-pie', sources / 'runner.cpp',
+    run([*common, '-fPIE', '-pie', '-pthread', sources / 'runner.cpp',
          '-lyz_plt_backend', core / 'process_maps.cpp', '-fexceptions',
          '-L' + str(build), '-lyz_native_target', '-ldl',
          '-Wl,--export-dynamic', '-Wl,-z,now', '-Wl,-rpath,$ORIGIN',

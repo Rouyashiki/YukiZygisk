@@ -1,4 +1,5 @@
 #include "check.hpp"
+#include "hyos_runtime.hpp"
 #include "plt_lifecycle.hpp"
 #include "process_maps.hpp"
 #include "userspace/zygisk/daemon/zygiskd.hpp"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -30,6 +32,9 @@ int events[6]{};
 int loads;
 int reports;
 std::vector<std::string> logs;
+bool companion_probe = false, companion_child = false;
+std::atomic<bool> snapshot_taken{false}, binding_updated{false};
+uint32_t requested_companion = UINT32_MAX;
 
 void log_message(const char *format, ...) {
   char message[2048];
@@ -131,9 +136,16 @@ LoadResult load(const char *path, int flags, const android_dlextinfo &ext) {
 
 namespace yukizygisk::hyos {
 bool available() { return false; }
-bool in_specialized_child() { return false; }
+bool in_specialized_child() {
+  if (companion_probe) {
+    snapshot_taken.store(true, std::memory_order_release);
+    while (!binding_updated.load(std::memory_order_acquire))
+      std::this_thread::yield();
+  }
+  return companion_child;
+}
 size_t registered_module_count() { return 0; }
-void begin_module_registration(uint32_t *) {}
+void begin_module_registration(const NativeModuleBinding *) {}
 void end_module_registration() {}
 } // namespace yukizygisk::hyos
 
@@ -147,6 +159,43 @@ void recover_native_plt() { fixture_recover_plt(); }
 const ZygiskNextAPI g_api{fixture_plt_hook};
 
 #include "native_load_under_test.inc"
+
+enum class ZdRequest { ConnectNativeCompanion };
+int request_fd(ZdRequest request, uint32_t index) {
+  CHECK(request == ZdRequest::ConnectNativeCompanion);
+  requested_companion = index;
+  return 17;
+}
+int request_fd_from_hyos_session(ZdRequest request, uint32_t index) {
+  return request_fd(request, index);
+}
+#include "native_companion_under_test.inc"
+
+void check_companion_snapshot(ModuleHandle &module) {
+  const auto original = module.binding.load();
+  const bool early = module.early;
+  module.early = true;
+  companion_probe = true;
+  for (bool child : {false, true}) {
+    companion_child = child;
+    snapshot_taken.store(false);
+    binding_updated.store(false);
+    module.binding.publish(1, true);
+    int result = -1;
+    std::thread reader([&] { result = api_connect_companion(&module); });
+    while (!snapshot_taken.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    // Publish while the production reader is between availability and IPC.
+    module.binding.publish(2, false);
+    binding_updated.store(true, std::memory_order_release);
+    reader.join();
+    CHECK(result == 17 && requested_companion == 1);
+    CHECK(api_connect_companion(&module) == -1 && requested_companion == 1);
+  }
+  companion_probe = companion_child = false;
+  module.binding.publish(original.index, original.has_companion);
+  module.early = early;
+}
 
 zygiskd::NativeModuleInfo info(const char *id, const std::string &path) {
   zygiskd::NativeModuleInfo result{};
@@ -185,6 +234,7 @@ extern "C" void fixture_event(int event) {
 }
 
 int main(int argc, char **argv) {
+  alarm(30);
   CHECK(setvbuf(stdout, nullptr, _IONBF, 0) == 0);
   CHECK(argc == 5);
   const std::string directory = argv[1];
@@ -224,6 +274,7 @@ int main(int argc, char **argv) {
   CHECK(events[1] == prior_ctors + 1 && events[2] == prior_dtors);
   CHECK(events[3] == 1 && g_loaded_modules.size() == 1);
   CHECK(reports == (early ? 0 : 1));
+  check_companion_snapshot(*g_loaded_modules[0]);
   const auto probe = reinterpret_cast<void (*)()>(
       dlsym(g_loaded_modules[0]->so, "native_identity_probe"));
   CHECK(probe != nullptr);

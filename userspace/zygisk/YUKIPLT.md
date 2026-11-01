@@ -53,7 +53,8 @@ ELF must retain the expected two NDK CRT finalizers, private runtime bindings,
 and only libc, libdl and libm dependencies. Exceptions stay within the Core.
 
 Standalone endpoint authentication, module paths, logging and mount cleanup
-remain owned by this repository.
+remain owned by this repository. Native companion index and availability are
+published together so concurrent IPC uses a consistent binding.
 
 ## Build and verification
 

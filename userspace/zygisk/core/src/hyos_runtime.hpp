@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include "native_module_binding.hpp"
 #include "zygisk_next_api.h"
 
 #include <cstddef>
@@ -29,7 +30,7 @@ bool in_specialized_child();
 void lock_child_control_session();
 void unlock_child_control_session();
 void invalidate_child_control_session();
-void begin_module_registration(const uint32_t *module_index);
+void begin_module_registration(const NativeModuleBinding *binding);
 void end_module_registration();
 
 } // namespace yukizygisk::hyos
