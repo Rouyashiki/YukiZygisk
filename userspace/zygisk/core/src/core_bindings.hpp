@@ -4,6 +4,12 @@
 #include <link.h>
 
 bool core_private_tsd_used() noexcept;
+// Freeze other threads' key operations; the fork caller may run atfork
+// handlers.
+// Other threads' create/delete fail with EAGAIN/EBUSY until completion.
+bool core_prepare_fork() noexcept;
+void core_after_fork_parent() noexcept;
+void core_after_fork_child() noexcept;
 // Requires other participants to have exited and no active exception.
 // Drains current-thread values, without deleting keys or proving quiescence.
 int core_drain_current_thread_tsd() noexcept;

@@ -37,11 +37,3 @@ struct PltFixture {
     return std::move(found.value());
   }
 };
-
-inline void write_fixture_slot(uintptr_t address, void *value) {
-  const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
-  void *base = reinterpret_cast<void *>(address & ~(page - 1));
-  CHECK(mprotect(base, page, PROT_READ | PROT_WRITE) == 0);
-  __atomic_store_n(reinterpret_cast<void **>(address), value, __ATOMIC_RELEASE);
-  CHECK(mprotect(base, page, PROT_READ) == 0);
-}

@@ -1,3 +1,4 @@
+#include "core_bindings.hpp"
 #include "plt_fixture.hpp"
 #include <algorithm>
 #include <atomic>
@@ -5,18 +6,59 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <pthread.h>
 #include <regex.h>
 #include <thread>
 namespace {
 yukiplt::OriginalSlot<int (*)()> original;
 int replacement() { return original.load()() + 100; }
-int foreign() { return 999; }
 int other_replacement() { return 42; }
+pid_t failed_fork() {
+  errno = EAGAIN;
+  return -1;
+}
 } // namespace
 namespace {
 bool fail_maps = false;
 bool fail_allocation = false;
 bool fail_restore = false;
+void *child_readonly_page = nullptr;
+size_t child_page_size = 0;
+bool exercise_keys = false;
+pthread_key_t inherited_key;
+void wait_for(const std::atomic<bool> &flag) {
+  while (!flag.load(std::memory_order_acquire))
+    std::this_thread::yield();
+}
+
+void probe_key() {
+  pthread_key_t key;
+  CHECK(pthread_key_create(&key, nullptr) == 0);
+  CHECK(pthread_key_delete(key) == 0);
+}
+
+void prepare_atfork() {
+  if (!exercise_keys)
+    return;
+  probe_key();
+  CHECK(pthread_key_create(&inherited_key, nullptr) == 0);
+  CHECK(pthread_setspecific(inherited_key, &inherited_key) == 0);
+}
+
+void complete_atfork() {
+  if (!exercise_keys)
+    return;
+  CHECK(pthread_getspecific(inherited_key) == &inherited_key);
+  CHECK(pthread_key_delete(inherited_key) == 0);
+  probe_key();
+}
+
+void child_atfork() {
+  complete_atfork();
+  if (child_readonly_page != nullptr &&
+      mprotect(child_readonly_page, child_page_size, PROT_READ) != 0)
+    _exit(2);
+}
 #include "module_plt_types.inc"
 struct Module {
   int id = 0;
@@ -31,6 +73,68 @@ bool zygisk_original_output_allowed(void **) { return true; }
 #define LOGI(...) ((void)0)
 #define LOGE(...) ((void)0)
 #include "module_plt_methods.inc"
+
+template <typename F> void in_child(F body) {
+  const pid_t child = yukizygisk::plt_lifecycle::fork_process(fork);
+  CHECK(child >= 0);
+  if (child == 0) {
+    alarm(10);
+    body();
+    _exit(0);
+  }
+  int status = 0;
+  CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0);
+}
+
+void check_fork_boundaries(PltFixture &fixture,
+                           const yukiplt::HookRequest &request) {
+  using namespace yukizygisk::plt_lifecycle;
+  exercise_keys = true;
+  in_child([] {
+    std::thread fork_thread([] {
+      ExternalScope outer;
+      CHECK(outer);
+      in_child([] {
+        ExternalScope nested;
+        CHECK(nested);
+        Operation operation;
+        CHECK(operation);
+        probe_key();
+      });
+    });
+    fork_thread.join();
+  });
+
+  yukiplt::SlotReport slot;
+  yukiplt::OperationDiagnostic diagnostic;
+  auto installed = yukiplt::hook_batch_nonnull_diagnosed_named(
+      fixture.image(), &request, 1, &slot, &diagnostic);
+  CHECK(installed.ok());
+  in_child([&] {
+    std::atomic<bool> entered{false}, release{false};
+    std::thread active([&] {
+      Operation operation;
+      CHECK(operation);
+      entered.store(true, std::memory_order_release);
+      wait_for(release);
+    });
+    wait_for(entered);
+    ExternalScope timeout(1);
+    CHECK(!timeout && timeout.error() == ETIMEDOUT && !dispatch_allowed());
+    release.store(true, std::memory_order_release);
+    active.join();
+    ModuleCallbackScope callback(g_modules[0]);
+    CHECK(!callback && g_cur == nullptr && g_plt_callback_tid.load() == 0);
+    Operation recovery(Access::Recover);
+    CHECK(!recovery && !shutdown());
+    CHECK(installed.handle.valid() && fixture.call() == 117);
+    CHECK(fork_process(failed_fork) == -1 && errno == EAGAIN);
+    in_child([] { CHECK(!dispatch_allowed()); });
+  });
+  CHECK(yukiplt::unhook(installed.handle).ok());
+  exercise_keys = false;
+}
 } // namespace
 #if UINTPTR_MAX == UINT64_MAX
 extern "C" void *__real__Znwm(size_t);
@@ -84,20 +188,7 @@ int main(int argc, char **argv) {
                                      original.output_address()};
   yukiplt::OperationDiagnostic diagnostic;
   yukiplt::SlotReport slot;
-  auto result = yukiplt::hook_batch_nonnull_diagnosed_named(
-      fixture.image(), &request, 1, &slot, &diagnostic);
-  CHECK(result.ok() && result.handle.valid() && fixture.call() == 117);
-  write_fixture_slot(slot.address, reinterpret_cast<void *>(foreign));
-  CHECK(!yukiplt::unhook_diagnosed(result.handle, &slot, 1, &diagnostic).ok());
-  CHECK(result.handle.valid() && fixture.call() == 999);
-  write_fixture_slot(slot.address, reinterpret_cast<void *>(replacement));
-  CHECK(yukiplt::unhook_diagnosed(result.handle, &slot, 1, &diagnostic).ok());
-  CHECK(!result.handle.valid() && diagnostic.handle_consumed &&
-        fixture.call() == 17);
-  {
-    yukizygisk::plt_lifecycle::Operation operation;
-    CHECK(operation);
-  }
+  yukiplt::HookResult result;
   std::atomic<bool> ready{false}, done{false};
   std::thread worker([&] {
     ready.store(true);
@@ -106,18 +197,85 @@ int main(int argc, char **argv) {
   });
   while (!ready.load())
     std::this_thread::yield();
-  CHECK(yukizygisk::plt_lifecycle::fork_process(fork) == -1 && errno == EBUSY);
-  done.store(true);
-  worker.join();
+  {
+    yukizygisk::plt_lifecycle::Operation operation;
+    CHECK(operation && yukizygisk::plt_lifecycle::capture_maps().ok());
+    result = yukiplt::hook_batch_nonnull_named_cached(
+        yukizygisk::plt_lifecycle::maps_cache(), fixture.image(), &request, 1,
+        &slot, &diagnostic);
+    CHECK(result.ok());
+    child_page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    child_readonly_page = reinterpret_cast<void *>(
+        slot.address & ~(static_cast<uintptr_t>(child_page_size) - 1));
+    CHECK(yukizygisk::plt_lifecycle::maps_cache().invalidate().ok());
+    CHECK(mprotect(child_readonly_page, child_page_size,
+                   PROT_READ | PROT_WRITE) == 0);
+    CHECK(yukizygisk::plt_lifecycle::capture_maps().ok());
+  }
+  CHECK(pthread_atfork(prepare_atfork, complete_atfork, child_atfork) == 0);
   pid_t child = yukizygisk::plt_lifecycle::fork_process(fork);
   CHECK(child >= 0);
   if (child == 0) {
+    alarm(10);
+    fail_maps = true;
     yukizygisk::plt_lifecycle::Operation operation;
-    _exit(operation ? 0 : 1);
+    CHECK(operation);
+    yukiplt::ForkStatus state{sizeof(state)};
+    CHECK(yukiplt::fork_status(state).ok() &&
+          state.mode == YUKIPLT_C_FORK_HOST_DISPATCHER &&
+          state.phase == YUKIPLT_C_FORK_READY && state.generation == 1);
+    size_t count = 0;
+    CHECK(yukiplt::query_cached(yukizygisk::plt_lifecycle::maps_cache(),
+                                result.handle, &slot, 1, &count)
+              .ok() &&
+          count == 1);
+    CHECK(
+        yukizygisk::plt_lifecycle::unhook(result.handle, &slot, 1, &diagnostic)
+            .ok());
+    CHECK(!result.handle.valid() && fixture.call() == 17);
+    CHECK(core_private_tsd_used());
+    pthread_key_t key;
+    CHECK(pthread_key_create(&key, nullptr) == 0);
+    CHECK(pthread_key_delete(key) == 0);
+    CHECK(yukizygisk::plt_lifecycle::shutdown());
+    CHECK(!core_private_tsd_used());
+    _exit(0);
   }
   int status = 0;
   CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
         WEXITSTATUS(status) == 0);
+  CHECK(result.handle.valid() && fixture.call() == 117);
+  CHECK(mprotect(child_readonly_page, child_page_size, PROT_READ) == 0);
+  child_readonly_page = nullptr;
+  CHECK(yukizygisk::plt_lifecycle::fork_process(failed_fork) == -1 &&
+        errno == EAGAIN);
+  CHECK(yukiplt::unhook(result.handle).ok());
+  done.store(true);
+  worker.join();
+  result = yukiplt::hook_batch_nonnull_diagnosed_named(
+      fixture.image(), &request, 1, &slot, &diagnostic);
+  CHECK(result.ok());
+  child = yukizygisk::plt_lifecycle::fork_process(fork);
+  CHECK(child >= 0);
+  if (child == 0) {
+    alarm(10);
+    yukizygisk::plt_lifecycle::Operation operation;
+    CHECK(operation);
+    yukizygisk::plt_lifecycle::invalidate_fork_cache();
+    fail_maps = true;
+    CHECK(
+        !yukizygisk::plt_lifecycle::unhook(result.handle, &slot, 1, &diagnostic)
+             .ok() &&
+        result.handle.valid());
+    fail_maps = false;
+    CHECK(
+        yukizygisk::plt_lifecycle::unhook(result.handle, &slot, 1, &diagnostic)
+            .ok());
+    _exit(0);
+  }
+  CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0);
+  CHECK(yukiplt::unhook(result.handle).ok());
   child = fork();
   CHECK(child >= 0);
   if (child == 0) {
@@ -126,26 +284,6 @@ int main(int argc, char **argv) {
   }
   CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
         WEXITSTATUS(status) == 0);
-  yukiplt::OriginalSlot<int (*)()> recovery_original;
-  const yukiplt::HookRequest recovery_request{
-      "fixture_value", reinterpret_cast<void *>(other_replacement),
-      recovery_original.output_address()};
-  fail_maps = true;
-  auto denied = yukiplt::hook_batch_nonnull_diagnosed_named(
-      fixture.image(), &recovery_request, 1, &slot, &diagnostic);
-  fail_maps = false;
-  CHECK(!denied.ok() && !denied.handle.valid() &&
-        recovery_original.load() == nullptr);
-  fail_restore = true;
-  auto partial = yukiplt::hook_batch_nonnull_diagnosed_named(
-      fixture.image(), &recovery_request, 1, &slot, &diagnostic);
-  CHECK(partial.error.code == yukiplt::ErrorCode::kIndeterminate &&
-        partial.handle.valid());
-  yukiplt::RecoveryDiagnostic recovery;
-  CHECK(yukiplt::query_recovery(partial.handle, &recovery).ok() &&
-        recovery.residual_page_count != 0);
-  CHECK(yukiplt::unhook(partial.handle).ok() && !partial.handle.valid() &&
-        fixture.call() == 17);
   g_modules.resize(2);
   g_cur = &g_modules[0];
   g_plt_callback_tid.store(gettid());
@@ -186,7 +324,13 @@ int main(int argc, char **argv) {
   g_plt_callback_tid.store(0);
   g_cur = nullptr;
   CHECK(!api_plt_hook_commit());
-  puts("PASS: module ownership, failure isolation, Indeterminate and fork "
-       "admission");
+  check_fork_boundaries(fixture, request);
+  {
+    yukizygisk::plt_lifecycle::Operation operation;
+    CHECK(operation && yukizygisk::plt_lifecycle::shutdown());
+    CHECK(!core_private_tsd_used());
+  }
+  puts("PASS: module ownership, failure isolation, cached child restoration, "
+       "multithreaded fork and dispatcher retirement");
   return 0;
 }

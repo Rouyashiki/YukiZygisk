@@ -60,7 +60,7 @@ Third-party components
     Copyright 2026 Rouyashiki <https://rouyashiki.org>.
     Its source and LICENSE are pinned in the submodule
     userspace/zygisk/third_party/yukiplt.
-    Source: https://github.com/Rouyashiki/YukiPLT/tree/31d3104e27889cb6b45f83d0c614f8074f937bf0
+    Source: https://github.com/Rouyashiki/YukiPLT/tree/f8988f3730cc93ba8121d0e0a3873f320dda7497
   - XZ Embedded is by Lasse Collin and Igor Pavlov and has been placed in the
     public domain by its authors.
   - The AArch64 TLSDESC resolver assembly includes work from the Android Open

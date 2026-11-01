@@ -25,13 +25,19 @@ read published originals. Targets must expose unique, publicly enumerable
 JUMP_SLOT imports; their image, replacement and original storage must remain
 alive through recovery and callback completion.
 
-## Fork lifetime
+## Fork and cache lifetime
 
-Core operations use a process-owned admission gate. Fork forwarding rejects
-contention, pending recovery and multithreaded callers. A successful controlled
-fork adopts the child's process identity; an uncoordinated fork child cannot
-use the inherited Core state. Targets and published original storage must stay
-alive through restoration and callback completion.
+Core operations use a common admission gate. Module callbacks and loader
+boundaries drain active operations and invalidate cached map permissions.
+Contention, recursive boundaries and timeouts reject unsafe dispatch.
+
+Managed Zygote and HyperOS forks use YukiPLT's HostDispatcher protocol, which
+drains library operations and coordinates the Core's private pthread keys.
+The child adopts its own process and thread identity, then captures permissions
+after Bionic's child callbacks. Only the resulting bounded window may use
+cached restoration; external callbacks close it. Ordinary restoration uses
+live maps. Uncoordinated fork children cannot use inherited Core state.
+No anonymous Core callback is permanently registered with libc's atfork list.
 
 ## Anonymous Core retirement
 
@@ -40,7 +46,7 @@ entry. Viola verifies the loader and Core using their respective image roles.
 The module linker setting still controls module loading policy.
 
 Retirement restores hooks, checks quiescence, consumes recovery handles,
-releases registry and loader ownership,
+unsubscribes the fork dispatcher, releases registry and loader ownership,
 and drains private runtime state before the existing assembly self-unmap tail.
 The Core remains resident if a required condition cannot be proved. The final
 ELF must retain the expected two NDK CRT finalizers, private runtime bindings,
@@ -52,12 +58,12 @@ remain owned by this repository.
 ## Build and verification
 
 Initialize dependencies with `git submodule update --init --recursive`.
-Runtime builds require CMake 3.22 or newer.
+Runtime builds require CMake 3.24 or newer for YukiPLT's default Full LTO.
 The submodule gitlink identifies the exact library source; attribution is in
 the root NOTICE and the dependency's LICENSE.
 
 The existing PLT, bootstrap and native Bionic runners cover ownership,
-recovery, controlled fork, anonymous loading and retirement. See
+recovery, managed fork, anonymous loading and retirement. See
 `tests/native_bionic/README.md` for offline commands. Host sanitizers, QEMU and
 cross-builds do not establish Android/OEM runtime compatibility. Deploy the
 LKM and payloads from the same build; older Tango stubs use a different entry

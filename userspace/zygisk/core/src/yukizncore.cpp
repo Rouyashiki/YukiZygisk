@@ -483,6 +483,8 @@ uint32_t request_runtime_generation() {
 }
 
 bool report_native_injection(uint32_t idx) {
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+    return false;
   if (g_runtime_generation == 0)
     g_runtime_generation = request_runtime_generation();
   if (g_runtime_generation == 0)
@@ -847,6 +849,12 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
            yukiplt::error_name(image.error().code), image.error().sys_errno);
       return kFailed;
     }
+    const auto captured = yukizygisk::plt_lifecycle::capture_maps();
+    if (!captured.ok()) {
+      LOGE("PLT maps: %s errno=%d", yukiplt::error_name(captured.code),
+           captured.sys_errno);
+      return kFailed;
+    }
     NativePltBinding *existing = nullptr;
     for (const auto &binding : g_native_plt) {
       if (same_native_image(binding->image, image.value()) &&
@@ -869,7 +877,9 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
         if (binding->handle.valid()) {
           yukiplt::SlotReport slot;
           size_t count = 0;
-          if (!yukiplt::query(binding->handle, &slot, 1, &count).ok() ||
+          if (!yukiplt::query_cached(yukizygisk::plt_lifecycle::maps_cache(),
+                                     binding->handle, &slot, 1, &count)
+                   .ok() ||
               count != 1 ||
               slot.address == reinterpret_cast<uintptr_t>(original))
             return kFailed;
@@ -879,7 +889,9 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
     if (existing != nullptr) {
       yukiplt::SlotReport current;
       size_t count = 0;
-      const auto error = yukiplt::query(existing->handle, &current, 1, &count);
+      const auto error =
+          yukiplt::query_cached(yukizygisk::plt_lifecycle::maps_cache(),
+                                existing->handle, &current, 1, &count);
       if (!error.ok() || count != 1 ||
           current.status != yukiplt::SlotStatus::kInstalled ||
           current.value_observed != reinterpret_cast<uintptr_t>(hook_handler))
@@ -903,8 +915,9 @@ int api_plt_hook(void *base_addr, const char *symbol, void *hook_handler,
     const yukiplt::HookRequest request{
         binding->symbol.c_str(), hook_handler,
         original != nullptr ? original : &binding->original};
-    auto result = yukiplt::hook_batch_nonnull_diagnosed_named(
-        binding->image, &request, 1, &binding->slot, &binding->install);
+    auto result = yukiplt::hook_batch_nonnull_named_cached(
+        yukizygisk::plt_lifecycle::maps_cache(), binding->image, &request, 1,
+        &binding->slot, &binding->install);
     binding->handle = std::move(result.handle);
     const bool published =
         binding->install.stage >= yukiplt::OperationStage::kCommit;
@@ -938,8 +951,8 @@ void recover_native_plt() {
     if (!binding->recovery)
       continue;
     yukiplt::SlotReport slot;
-    const auto error =
-        yukiplt::unhook_diagnosed(binding->handle, &slot, 1, &binding->restore);
+    const auto error = yukizygisk::plt_lifecycle::unhook(binding->handle, &slot,
+                                                         1, &binding->restore);
     yukizygisk::plt_lifecycle::set_recovery(binding->recovery,
                                             binding->handle.valid());
     LOGI("native PLT recovery: symbol=%s result=%s errno=%d consumed=%d",
@@ -1159,6 +1172,13 @@ std::string module_id_of(const zygiskd::NativeModuleInfo &info) {
 
 bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
                                 uint32_t idx, int lib_fd, bool early) {
+  yukizygisk::plt_lifecycle::ExternalScope external;
+  if (!external) {
+    LOGE("native module load barrier: idx=%u errno=%d", idx, external.error());
+    if (lib_fd >= 0)
+      close(lib_fd);
+    return false;
+  }
   std::string module_id = module_id_of(info);
   std::string lib_path = bounded_cstr(info.lib_path, sizeof(info.lib_path));
   if (module_id.empty() || lib_path.empty()) {
@@ -1230,6 +1250,22 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
     return false;
   }
   close(lib_fd);
+  const auto retain = [&] {
+    auto *handle = new ModuleHandle();
+    handle->index = idx;
+    handle->so = so;
+    handle->device = identity.st_dev;
+    handle->inode = identity.st_ino;
+    handle->module_id = module_id;
+    handle->early = early;
+    handle->has_companion = info.has_companion != 0;
+    g_loaded_modules.push_back(handle);
+    return handle;
+  };
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed()) {
+    (void)retain();
+    return false;
+  }
   for (const auto *loaded : g_loaded_modules) {
     if (loaded->so == so) {
       LOGE("native core: library already initialized by id=%s, rejecting id=%s",
@@ -1262,15 +1298,9 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
     return false;
   }
 
-  auto *handle = new ModuleHandle();
-  handle->index = idx;
-  handle->so = so;
-  handle->device = identity.st_dev;
-  handle->inode = identity.st_ino;
-  handle->module_id = module_id;
-  handle->early = early;
-  handle->has_companion = info.has_companion != 0;
-  g_loaded_modules.push_back(handle);
+  auto *handle = retain();
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+    return false;
   LOGI("native module onModuleLoaded: %s early=%u", module_id.c_str(),
        early ? 1U : 0U);
   const size_t registrations_before =
@@ -1279,6 +1309,8 @@ bool load_native_module_from_fd(const zygiskd::NativeModuleInfo &info,
   mod->onModuleLoaded(handle, &g_api);
   recover_native_plt();
   yukizygisk::hyos::end_module_registration();
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+    return false;
   handle->hyos_registered =
       yukizygisk::hyos::registered_module_count() > registrations_before;
   // Keep the handle for process lifetime: callbacks can still use libdl.
@@ -1360,6 +1392,8 @@ void load_early_modules() {
 }
 
 void load_matching_modules() {
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+    return;
   std::string exe = self_exe_path();
   std::string exe_base = basename_of(exe);
   LOGI("native core: exe=%s base=%s", exe.c_str(), exe_base.c_str());
@@ -1370,6 +1404,8 @@ void load_matching_modules() {
   LOGI("native core: module count=%u", count);
 
   for (uint32_t i = 0; i < count; ++i) {
+    if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+      break;
     zygiskd::NativeModuleInfo info{};
     if (!request_native_info(i, &info))
       continue;
@@ -1403,6 +1439,8 @@ void load_matching_modules() {
 }
 
 bool sync_early_native_reports_once() {
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+    return false;
   if (!has_pending_early_report())
     return true;
 
@@ -1441,6 +1479,10 @@ void *deferred_native_sync_main(void *) {
   constexpr useconds_t kSleepUs = 100000;
 
   for (int i = 0; i < kAttempts; i++) {
+    if (!yukizygisk::plt_lifecycle::dispatch_allowed()) {
+      restore_native_load_policy();
+      return nullptr;
+    }
     if (sync_early_native_reports_once()) {
       restore_native_load_policy();
       LOGI("native core: deferred early sync complete");
@@ -1453,6 +1495,8 @@ void *deferred_native_sync_main(void *) {
 }
 
 void maybe_start_deferred_native_sync() {
+  if (!yukizygisk::plt_lifecycle::dispatch_allowed())
+    return;
   if (!has_pending_early_report())
     return;
   if (sync_early_native_reports_once())
@@ -1675,16 +1719,22 @@ zygisk_core_entry(const char * /*self_path*/, void *loader_self,
 
 extern "C" [[gnu::visibility("default")]] bool
 zygisk_bootstrap_handoff_ready() {
-  return g_loader_unmap_safe;
+  return yukizygisk::plt_lifecycle::dispatch_allowed() && g_loader_unmap_safe;
 }
 
 extern "C" [[gnu::visibility("default")]] bool
 zygisk_bootstrap_handoff_complete() {
-  return g_loader_unmap_safe && yukizygisk::handoff::retirement_ready();
+  return yukizygisk::plt_lifecycle::dispatch_allowed() && g_loader_unmap_safe &&
+         yukizygisk::handoff::retirement_ready();
 }
 
 extern "C" [[gnu::visibility("default")]] void zygisk_finalize_loader(int,
                                                                       int) {
+  yukizygisk::plt_lifecycle::ExternalScope external;
+  if (!external) {
+    LOGE("native loader retirement barrier: errno=%d", external.error());
+    return;
+  }
   if (!zygisk_bootstrap_handoff_complete()) {
     LOGI("loader retirement not authorized; retaining loader and dependencies");
     return;

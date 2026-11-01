@@ -6,7 +6,7 @@
 #
 # Author: Anatdx
 
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.24)
 project(YukiZygisk VERSION 0.2.0 LANGUAGES C CXX ASM)
 
 # Drop package artifacts left by releases from before filenames became
