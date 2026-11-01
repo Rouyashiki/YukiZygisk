@@ -669,16 +669,16 @@ out_free_data:
 	return ERR_PTR(ret);
 }
 
-static YZ_LEGACY_INDIRECT_CALL void yz_policy_reset_avc(void)
+static YZ_LEGACY_INDIRECT_CALL void yz_policy_reset_avc(u32 seqno)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-	yz_avc_ss_reset(0);
-	yz_selnl_notify_policyload(0);
-	yz_selinux_status_update_policyload(0);
+	yz_avc_ss_reset(seqno);
+	yz_selnl_notify_policyload(seqno);
+	yz_selinux_status_update_policyload(seqno);
 #else
-	yz_avc_ss_reset(yz_selinux_state->avc, 0);
-	yz_selnl_notify_policyload(0);
-	yz_selinux_status_update_policyload(yz_selinux_state, 0);
+	yz_avc_ss_reset(yz_selinux_state->avc, seqno);
+	yz_selnl_notify_policyload(seqno);
+	yz_selinux_status_update_policyload(yz_selinux_state, seqno);
 #endif
 	selinux_xfrm_notify_policyload();
 }
@@ -721,10 +721,11 @@ yz_policy_cancel_edit_locked(struct yz_policy_edit *edit)
 static void
 yz_policy_commit_edit_locked(struct yz_policy_edit *edit)
 {
+	edit->policy->latest_granting = edit->old_policy->latest_granting + 1;
 	rcu_assign_pointer(yz_selinux_state->policy, edit->policy);
 	synchronize_rcu();
 	yz_policy_destroy(edit->old_policy);
-	yz_policy_reset_avc();
+	yz_policy_reset_avc(edit->policy->latest_granting);
 	memset(edit, 0, sizeof(*edit));
 }
 
