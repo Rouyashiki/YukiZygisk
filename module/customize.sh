@@ -94,7 +94,7 @@ ln -sf ./zygiskd64 "$MODPATH/bin/zygiskd"
 chmod 0644 "$MODPATH"/lkm/*.ko "$MODPATH/common.sh"
 chmod 0644 "$MODPATH"/lib64/*.so "$MODPATH"/lib/*.so
 chmod 0755 "$MODPATH/bin/zygiskd64" "$MODPATH/bin/zygiskd32" "$MODPATH/bin/yzctl" \
-	"$MODPATH/post-fs-data.sh" \
+	"$MODPATH/post-fs-data.sh" "$MODPATH/late-load.sh" \
 	"$MODPATH/boot-completed.sh" "$MODPATH/action.sh" \
 	"$MODPATH/cleanup.sh" "$MODPATH/uninstall.sh"
 

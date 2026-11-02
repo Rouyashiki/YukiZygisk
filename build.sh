@@ -625,7 +625,7 @@ package_module() {
 		"$PACKAGE_DIR"/lib64/*.so "$PACKAGE_DIR"/lib/*.so
 	chmod 0755 "$PACKAGE_DIR/bin/viola" "$PACKAGE_DIR/bin/zygiskd64" "$PACKAGE_DIR/bin/zygiskd32" \
 		"$PACKAGE_DIR/bin/yzctl" \
-		"$PACKAGE_DIR/post-fs-data.sh" \
+		"$PACKAGE_DIR/post-fs-data.sh" "$PACKAGE_DIR/late-load.sh" \
 		"$PACKAGE_DIR/boot-completed.sh" "$PACKAGE_DIR/customize.sh" \
 		"$PACKAGE_DIR/action.sh" \
 		2>/dev/null || true

@@ -153,7 +153,7 @@ jobs:
       - name: Install module integrity shell tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends busybox dash
+          sudo apt-get install --yes --no-install-recommends busybox dash util-linux
 
       - name: Select fixed Android NDK
         run: |
@@ -180,6 +180,7 @@ jobs:
           shellcheck build.sh tests/module-kmi.sh module/*.sh
           ./tests/module-kmi.sh
           python3 tests/module-integrity.py
+          python3 tests/module-late-load.py
 
       - name: Build daemon, control client, and runtime payloads
         run: |
