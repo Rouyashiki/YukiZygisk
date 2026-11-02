@@ -11,6 +11,7 @@
 #include "health.hpp"
 #include "userspace/zygisk/crash_evidence.hpp"
 #include "userspace/zygisk/crash_protection.hpp"
+#include "userspace/zygisk/late_load.hpp"
 #include "userspace/zygisk/native_exit_evidence.hpp"
 #include "userspace/zygisk/settings.hpp"
 
@@ -726,6 +727,10 @@ bool query_status(Host &host, const StatusOptions &options,
   document->abi = snapshot_abi(runtime);
   document->root_impl = root_impl_name(root_status);
   document->safe_mode = runtime.safe_mode;
+  const auto late_load = yukizygisk::late_load::query(
+      runtime.safe_mode, runtime.records.data(), runtime.records.size());
+  document->late_load = late_load.active;
+  document->late_load_pending = late_load.pending;
   document->injected = injected_base_count(runtime);
   document->zygotes = static_cast<size_t>(std::count_if(
       runtime.records.begin(), runtime.records.end(), [](const auto &record) {
@@ -755,6 +760,10 @@ bool query_status(Host &host, const StatusOptions &options,
   output += ",\"count\":" + std::to_string(document->injected);
   output += ",\"safe_mode\":";
   output += runtime.safe_mode ? "true" : "false";
+  output += ",\"late_load\":";
+  output += document->late_load ? "true" : "false";
+  output += ",\"late_load_pending\":";
+  output += document->late_load_pending ? "true" : "false";
   output += ",\"zygisk_module_monitor\":";
   output += (runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT) != 0
                 ? "true"

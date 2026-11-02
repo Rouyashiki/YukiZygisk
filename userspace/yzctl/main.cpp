@@ -106,6 +106,8 @@ int status_command(int argc, char **argv) {
            status.abi.c_str(), status.root_impl.c_str(),
            status.safe_mode ? "active" : "inactive", status.injected,
            status.zygotes, status.zygisk_modules, status.native_modules);
+    if (status.late_load_pending)
+      puts("  Late-load mode: please soft-reboot Android to complete injection.");
   }
   return 0;
 }

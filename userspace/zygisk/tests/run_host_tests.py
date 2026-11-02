@@ -107,6 +107,11 @@ int main() {
 '''
 with tempfile.TemporaryDirectory(prefix='yz-host-tests-') as temporary:
     build = Path(temporary)
+    binary = build / 'late_load_test'
+    run(compiler, *flags, str(root / 'userspace/zygisk/tests/late_load_test.cpp'),
+        str(root / 'userspace/zygisk/daemon/module_description.cpp'),
+        '-Wl,--wrap=lstat', '-o', str(binary))
+    run(str(binary))
     replay = build / 'crash_protection_test'
     run(compiler, *flags, str(root / 'userspace/zygisk/tests/crash_protection_test.cpp'),
         str(root / 'userspace/zygisk/daemon/crash_monitor.cpp'),

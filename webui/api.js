@@ -33,6 +33,8 @@ export const DEFAULT_STATUS = {
   root_policy_cache_ready: false,
   count: 0,
   safe_mode: false,
+  late_load: false,
+  late_load_pending: false,
   zygote_crashes: 0,
   safe_mode_zygote: "zygote",
   yukilinker: true,
@@ -92,6 +94,8 @@ function normalizeStatus(value = {}) {
     ...clone(DEFAULT_STATUS),
     ...value,
     available: value.kernel_alive === true,
+    late_load: value.late_load === true,
+    late_load_pending: value.late_load === true && value.late_load_pending === true,
   };
   for (const key of ["recent", "zygotes", "zygote_monitor", "modules", "native_modules", "native_injections", "suspended_modules"]) {
     if (!Array.isArray(status[key]))

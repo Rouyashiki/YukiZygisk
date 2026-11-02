@@ -8,6 +8,7 @@
  */
 
 #include "module_description.hpp"
+#include "userspace/zygisk/late_load.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -183,7 +184,7 @@ std::string render(const yz_viola_status &viola,
                    const yz_runtime_record *records, size_t count) {
   unsigned injected64 = 0;
   unsigned injected32 = 0;
-  bool failed = false;
+  bool zygote_failed = false;
   bool safe_mode = runtime.safe_mode != 0;
   for (size_t i = 0; records != nullptr && i < count; ++i) {
     const auto &record = records[i];
@@ -191,10 +192,12 @@ std::string render(const yz_viola_status &viola,
       continue;
     if (record.state == YZ_RUNTIME_STATE_SAFEMODE)
       safe_mode = true;
-    if (record.state == YZ_RUNTIME_STATE_FAILED)
-      failed = true;
+    // Module records retain child-load failures for the Zygote generation.
+    // Keep those diagnostics out of the current core-health summary.
     if (record.kind != YZ_RUNTIME_KIND_ZYGOTE || record.module_id[0] != '\0')
       continue;
+    if (record.state == YZ_RUNTIME_STATE_FAILED)
+      zygote_failed = true;
     if (record.state == YZ_RUNTIME_STATE_INJECTED) {
       bool duplicate = false;
       for (size_t j = 0; j < i; ++j) {
@@ -222,13 +225,19 @@ std::string render(const yz_viola_status &viola,
   const bool daemon_ready =
       viola.catalog_ready && viola.daemon64 == YZ_VIOLA_READY &&
       (!viola.compat_required || viola.daemon32 == YZ_VIOLA_READY);
+  const bool daemon_failed =
+      !daemon_ready && (viola.last_error || viola.recovery_error || daemon_lost);
   std::string state;
   if (safe_mode)
     state = "safe mode⚠️ | ";
-  else if (failed || (!daemon_ready && (viola.last_error ||
-                                        viola.recovery_error || daemon_lost)))
-    state = "error❌ | ";
-  state += daemon_lost ? "daemon❌" : daemon_ready ? "daemon✅" : "daemon⏳";
+  else if (zygote_failed)
+    state = "zygote❌ | ";
+  const auto late_load = yukizygisk::late_load::query(safe_mode, records, count);
+  if (late_load.pending)
+    state += "late-load⚠️ 请软重启完成注入 / soft reboot required | ";
+  else if (late_load.active)
+    state += "late-load | ";
+  state += daemon_failed ? "daemon❌" : daemon_ready ? "daemon✅" : "daemon⏳";
   state += " kernel✅ | zygote64: " + std::to_string(injected64);
   state += ", zygote32: " + std::to_string(injected32);
   return state;

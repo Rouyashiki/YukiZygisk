@@ -23,6 +23,12 @@ YukiZygisk 是一个独立的、基于内核的 Zygisk 实现，让已 root 的 
 
 如果安装时无法识别内核的 KMI，按**音量上键**循环切换安装包内的 KMI，按**音量下键**确认。安装完成后仅保留选中 KMI 的内核模块，节省存储空间。更换内核后，若 KMI 改变或仍需手动选择，请重新安装模块。
 
+### KernelSU late-load
+
+YukiZygisk 支持 KernelSU 的 [late-load 模式](https://kernelsu.org/guide/module.html#late-load-mode)。先安装并启用模块，再运行 KernelSU 的 late-load 流程。`late-load.sh` 启动经过认证的核心，不会自动重启 Android。**请在 late-load 流程完成后，自行软重启 Android，让 Zygisk 注入生效。** 已经运行的 Zygote 在重启前不会被补注入。WebUI 和模块描述会显示提示，直到系统配置所需的主、副 Zygote 均报告注入成功。内核安全模式下会撤下这条提示，因为软重启无法解除该保护。模块的**操作（Action）**按钮也会显示当前状态和启动日志。重复执行 late-load 阶段会重试经过认证的启动流程，并保留现有守护进程及其日志，启动中断后也可重试。
+
+Late-load 不会补注入已经运行的原生服务，ZN 原生目标需要重新执行后才能注入。模块安装和更新仍遵循 root 管理器原有的暂存流程，此功能不启用热安装。
+
 ## 使用
 
 - 需要使用的 Zygisk 或 ZN 原生模块，照常通过 root 管理器安装，然后重启。

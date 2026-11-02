@@ -25,6 +25,8 @@ struct StatusDocument {
   std::string abi;
   std::string root_impl;
   bool safe_mode = false;
+  bool late_load = false;
+  bool late_load_pending = false;
   size_t injected = 0;
   size_t zygotes = 0;
   size_t zygisk_modules = 0;

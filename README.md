@@ -23,6 +23,12 @@ YukiZygisk is a standalone, kernel-based Zygisk implementation for rooted Androi
 
 If the installer cannot identify your kernel's KMI, use **Volume Up** to cycle through the packaged KMIs and **Volume Down** to confirm. After installation, only the selected KMI's kernel module is kept to save space. Reinstall after switching kernels if the KMI changes or needs manual selection again.
 
+### KernelSU late-load
+
+YukiZygisk supports KernelSU's [late-load mode](https://kernelsu.org/guide/module.html#late-load-mode). Install and enable the module before running KernelSU's late-load flow. Its `late-load.sh` starts the authenticated core without restarting Android. **After the late-load flow finishes, manually soft-reboot Android to activate Zygisk.** The existing Zygote remains uninjected until it restarts. The WebUI and module description show a reminder until the configured primary and secondary Zygotes report successful injection. In kernel safe mode, this reminder is suppressed because a soft reboot cannot clear that protection. The module's **Action** button also shows the current status and startup log. Repeating the late-load stage retries authenticated startup while preserving an existing daemon and its logs, including after an interrupted attempt.
+
+Late-load does not inject into already running native services. ZN native targets need to execute again before injection can take effect. Module installation and updates still use the root manager's usual staging flow; this does not enable hot installation.
+
 ## Usage
 
 - Install the Zygisk or ZN native modules you want through your root manager, then reboot.
