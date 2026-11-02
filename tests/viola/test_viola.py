@@ -213,17 +213,49 @@ class ViolaTests(unittest.TestCase):
             str(ROOT / "tests/viola/exec_daemon.c"), str(shared / "viola.c"),
             str(shared / "vendor/monocypher.c"), str(shared / "vendor/monocypher-ed25519.c"),
             *loader_links, "-o", str(cls.exec_fixture)], check=True)
+        auth = (ROOT / "kernel/core/auth.c").read_text()
+        enum_start = auth.index("enum yz_auth_startup_state {")
+        functions = [auth[enum_start:auth.index("};", enum_start) + 2]]
+        for prefix in ("void yz_auth_runtime_started(",
+                       "static int yz_auth_activate_startup(",
+                       "bool yz_auth_catalog_ready("):
+            start = auth.index(prefix)
+            body = auth.index("\n{", start) + 1
+            depth = 0
+            for end in range(body, len(auth)):
+                depth += (auth[end] == "{") - (auth[end] == "}")
+                if depth == 0:
+                    functions.append(auth[start:end + 1])
+                    break
+        (cls.base / "startup_gate.h").write_text("\n\n".join(functions))
+        cls.runtime_fixture = cls.base / "runtime-guard"
+        subprocess.run([cc, *flags, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I" + str(ROOT), "-I" + str(cls.base),
+            str(ROOT / "tests/viola/runtime_guard.c"), "-o", str(cls.runtime_fixture)], check=True)
+
+    def test_late_load_runtime_generation_and_kernel_activation(self):
+        subprocess.run([str(self.runtime_fixture)], check=True, timeout=3)
+
+    def test_late_load_stops_actual_lkm_syscall_after_runtime_resumes(self):
+        import errno
+        for state in (0, 1, 2):
+            with self.subTest(state=state):
+                result = subprocess.run([str(self.kernel_fixture), str(self.module), str(state)],
+                    capture_output=True, text=True, check=True, timeout=3)
+                self.assertEqual(tuple(map(int, result.stdout.split())),
+                                 (0, 1) if state == 0 else (-errno.EAGAIN, 0))
 
     def test_daemon_exec_preserves_arm32_image_and_requires_authorization(self):
         import errno
         for abi in (1, 2):
-            for stage in (0, 1, 2):
+            for stage in (0, 1, 2, 3, 4, 5):
                 with self.subTest(abi=abi, stage=stage):
                     result = subprocess.run([str(self.exec_fixture), str(self.module), str(abi), str(stage)],
                         capture_output=True, text=True, timeout=3)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    expected = (-errno.ECANCELED, 1, 1, 1) if stage == 0 else (
-                        -errno.EACCES, 1, int(stage == 2), 0)
+                    expected = ((-errno.ECANCELED, 1, 1, 1) if stage in (0, 5) else
+                        (-errno.EAGAIN, 1, int(stage == 4), 0) if stage in (3, 4) else
+                        (-errno.EACCES, 1, int(stage == 2), 0))
                     self.assertEqual(tuple(map(int, result.stdout.split())), expected)
         with tempfile.TemporaryDirectory(dir=self.base) as temporary:
             module = Path(temporary) / "module"

@@ -91,7 +91,7 @@ done
 
 ln -sf ./zygiskd64 "$MODPATH/bin/zygiskd"
 
-chmod 0644 "$MODPATH"/lkm/*.ko "$MODPATH/common.sh"
+chmod 0644 "$MODPATH"/lkm/*.ko "$MODPATH/common.sh" "$MODPATH/late-load-common.sh"
 chmod 0644 "$MODPATH"/lib64/*.so "$MODPATH"/lib/*.so
 chmod 0755 "$MODPATH/bin/zygiskd64" "$MODPATH/bin/zygiskd32" "$MODPATH/bin/yzctl" \
 	"$MODPATH/post-fs-data.sh" "$MODPATH/late-load.sh" \

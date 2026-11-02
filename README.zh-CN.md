@@ -25,7 +25,11 @@ YukiZygisk 是一个独立的、基于内核的 Zygisk 实现，让已 root 的 
 
 ### KernelSU late-load
 
-YukiZygisk 支持 KernelSU 的 [late-load 模式](https://kernelsu.org/guide/module.html#late-load-mode)。先安装并启用模块，再运行 KernelSU 的 late-load 流程。`late-load.sh` 启动经过认证的核心，不会自动重启 Android。**请在 late-load 流程完成后，自行软重启 Android，让 Zygisk 注入生效。** 已经运行的 Zygote 在重启前不会被补注入。WebUI 和模块描述会显示提示，直到系统配置所需的主、副 Zygote 均报告注入成功。内核安全模式下会撤下这条提示，因为软重启无法解除该保护。模块的**操作（Action）**按钮也会显示当前状态和启动日志。重复执行 late-load 阶段会重试经过认证的启动流程，并保留现有守护进程及其日志，启动中断后也可重试。
+YukiZygisk 支持 KernelSU 的 [late-load 模式](https://kernelsu.org/guide/module.html#late-load-mode)。先安装并启用模块，再运行 KernelSU 的 late-load 流程。`late-load.sh` 只记录待激活状态，不加载 YukiZygisk 的 LKM，也不启动注入器。**请在 late-load 完成且系统可操作后，在 KernelSU 中手动选择软重启。** 这次软重启期间，`post-fs-data.sh` 确认 Android 和 Zygote 已停止后才加载经过认证的核心，随后由 KernelSU 重新启动 Android。启动成功后消耗待激活标记；失败或中断会保留标记，供下次到达同一阶段时重试。仅重启 Zygote 或 `system_server`（包括其他模块触发的重启）不会重放 `post-fs-data.sh`，无法激活核心。
+
+即使 LKM 尚未加载，WebUI、模块描述和**操作（Action）**输出也会提示等待激活。系统配置所需的 Zygote 报告注入成功后，提示会消失；内核安全模式下也会撤下提示，因为软重启无法解除该保护。重复执行 `late-load.sh` 或其 `boot-completed.sh` 阶段均不会启动核心。YukiZygisk 不会自动重启 Android。
+
+启动校验会贯穿 LKM 加载和守护进程就绪阶段，并检查同一轮 Android 停止状态。如果 KernelSU 等待脚本超时、提前恢复了 Android，本次激活会中止，保留待激活标记供下一次手动软重启重试；已经加载的 LKM 在激活完成前不允许注入。待激活时仍可保存配置，设置会在激活后生效。
 
 Late-load 不会补注入已经运行的原生服务，ZN 原生目标需要重新执行后才能注入。模块安装和更新仍遵循 root 管理器原有的暂存流程，此功能不启用热安装。
 

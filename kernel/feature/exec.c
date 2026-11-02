@@ -98,13 +98,15 @@ static void __nocfi yz_exec_bprm_committed_creds_impl(yz_bprm_arg_t *bprm)
 
 	((bprm_committed_creds_fn)yz_exec_hook.original)(bprm);
 
+	by_sid = yz_host_is_zygote(current_cred());
+	if (by_sid && yz_exec_is_init_child())
+		yz_auth_runtime_started();
 	if (!yz_auth_catalog_ready())
 		return;
 #ifdef CONFIG_COMPAT
 	compat = is_compat_task();
 #endif
 
-	by_sid = yz_host_is_zygote(current_cred());
 	by_path = yz_exec_is_app_process_path(filename);
 	live_native =
 	    !by_path && yz_config_match_native_target(filename, native_label,

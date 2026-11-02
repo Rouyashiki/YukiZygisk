@@ -19,13 +19,27 @@
 
 namespace yukizygisk::late_load {
 
-// Created by late-load.sh before startup; survives a userspace soft reboot.
+// Created by late-load.sh without starting the core; survives a soft reboot.
 inline constexpr char kStateDirectory[] = "/dev/yukizygisk-late-load";
+inline constexpr char kPendingFile[] = "/dev/yukizygisk-late-load/pending";
 
 struct Status {
   bool active = false;
   bool pending = false;
 };
+
+inline bool active() {
+  struct stat marker{};
+  return lstat(kStateDirectory, &marker) == 0 && S_ISDIR(marker.st_mode) &&
+         marker.st_uid == 0 && (marker.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+inline bool activation_pending() {
+  struct stat marker{};
+  return active() && lstat(kPendingFile, &marker) == 0 &&
+         S_ISREG(marker.st_mode) && marker.st_uid == 0 && marker.st_nlink == 1 &&
+         (marker.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
 
 inline bool injection_pending(const char *zygote_config,
                               const yz_runtime_record *records, size_t count) {
@@ -48,9 +62,7 @@ inline bool injection_pending(const char *zygote_config,
 
 inline Status query(bool safe_mode, const yz_runtime_record *records,
                     size_t count) {
-  struct stat marker{};
-  if (lstat(kStateDirectory, &marker) != 0 || !S_ISDIR(marker.st_mode) ||
-      marker.st_uid != 0 || (marker.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+  if (!active())
     return {};
 
   // Kernel safe mode remains latched across a userspace soft reboot, which
@@ -64,7 +76,8 @@ inline Status query(bool safe_mode, const yz_runtime_record *records,
 #else
   constexpr char zygote_config[] = "";
 #endif
-  return {true, injection_pending(zygote_config, records, count)};
+  return {true, activation_pending() ||
+                    injection_pending(zygote_config, records, count)};
 }
 
 } // namespace yukizygisk::late_load

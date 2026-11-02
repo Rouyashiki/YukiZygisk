@@ -7,6 +7,7 @@
 # Author: Anatdx
 
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -112,6 +113,84 @@ with tempfile.TemporaryDirectory(prefix='yz-host-tests-') as temporary:
         str(root / 'userspace/zygisk/daemon/module_description.cpp'),
         '-Wl,--wrap=lstat', '-o', str(binary))
     run(str(binary))
+    # Run the actual CLI against redirected paths and real or simulated kernel
+    # control. Keep all fixtures in this temp tree, including the /dev markers.
+    include = build / 'include'
+    guard_header = include / 'userspace/zygisk/late_load.hpp'
+    guard_header.parent.mkdir(parents=True)
+    activation = build / 'late-load-state'
+    guard_header.write_text((root / 'userspace/zygisk/late_load.hpp').read_text().replace(
+        '/dev/yukizygisk-late-load', str(activation)))
+    config = build / 'config/yzconfig.json'
+    cli_source = build / 'yzctl-main.cpp'
+    cli_source.write_text((root / 'userspace/yzctl/main.cpp').read_text().replace(
+        '/data/adb/yukizygisk/yzconfig.json', str(config)))
+    cli = build / 'yzctl'
+    run(compiler, '-I' + str(include), *flags, '-pthread',
+        '-I' + str(root / 'userspace/yzctl'), '-I' + str(root / 'userspace/common'),
+        '-I' + str(root / 'userspace/zygisk/daemon'), str(cli_source),
+        str(root / 'userspace/zygisk/tests/config_reload_control.cpp'),
+        *[str(root / name) for name in (
+            'userspace/yzctl/status.cpp', 'userspace/yzctl/host.cpp',
+            'userspace/yzctl/health.cpp', 'userspace/zygisk/endpoint.cpp',
+            'userspace/zygisk/daemon/module_description.cpp')],
+        '-Wl,--wrap=syscall', '-Wl,--wrap=ioctl', '-o', str(cli))
+
+    reload_trace = build / 'reload-events.jsonl'
+
+    def cli_run(*args, code=0, control=None):
+        reload_trace.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment.pop('YZ_TEST_CONTROL', None)
+        if control:
+            environment.update(YZ_TEST_CONTROL=control, YZ_TEST_CONFIG=str(config),
+                               YZ_TEST_RELOAD_TRACE=str(reload_trace))
+        result = subprocess.run([str(cli), *args], text=True, capture_output=True,
+                                timeout=10, env=environment)
+        assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
+        return result
+
+    cli_run('status', '--json', code=1)
+    activation.mkdir(mode=0o700)
+    pending = activation / 'pending'
+    pending.touch(mode=0o600)
+    assert json.loads(cli_run('status', '--json').stdout)['late_load_pending']
+    assert 'activation is deferred' in cli_run('ensure-daemon', code=1).stderr
+    cli_run('reload', code=1)  # An explicit reload must still report absence.
+    assert json.loads(cli_run('config', 'get').stdout)['anonymous_memory']
+    saved = cli_run('config', 'set', 'anonymous_memory', 'false')
+    assert 'applies when late-load activates' in saved.stdout
+    assert not saved.stderr
+    assert not json.loads(cli_run('config', 'get').stdout)['anonymous_memory']
+    # Startup can leave a ready daemon alive without consuming pending. Saving
+    # must notify that daemon, which the next startup can reuse without re-exec.
+    saved = cli_run('config', 'set', 'anonymous_memory', 'true',
+                    'denylist_mode', '2', control='available')
+    assert 'reload signalled' in saved.stdout
+    assert not saved.stderr
+    snapshots = [json.loads(line) for line in reload_trace.read_text().splitlines()]
+    assert len(snapshots) == 1
+    assert snapshots[0]['anonymous_memory'] and snapshots[0]['denylist_mode'] == 2
+    assert pending.is_file()
+    cli_run('config', 'set', 'denylist_mode', 'invalid', code=1, control='available')
+    assert not reload_trace.exists()
+    failed = cli_run('config', 'set', 'anonymous_memory', 'false',
+                     code=1, control='reload-failed')
+    assert 'kernel reload failed' in failed.stderr
+    assert not json.loads(cli_run('config', 'get').stdout)['anonymous_memory']
+    denied = cli_run('config', 'set', 'anonymous_memory', 'true',
+                     code=1, control='denied')
+    assert 'cannot open YukiZygisk kernel control session' in denied.stderr
+    pending.chmod(0o666)
+    cli_run('status', '--json', code=1)
+    cli_run('config', 'set', 'anonymous_memory', 'true', code=1)
+    pending.chmod(0o600)
+    pending.rename(activation / 'active')
+    cli_run('config', 'set', 'anonymous_memory', 'false', control='available')
+    assert not json.loads(reload_trace.read_text())['anonymous_memory']
+    cli_run('config', 'set', 'anonymous_memory', 'false', code=1)
+    cli_run('status', '--json', code=1)
+    print('PASS: pending CLI/config persistence, live-daemon reload, recovery guard and reload errors')
     replay = build / 'crash_protection_test'
     run(compiler, *flags, str(root / 'userspace/zygisk/tests/crash_protection_test.cpp'),
         str(root / 'userspace/zygisk/daemon/crash_monitor.cpp'),

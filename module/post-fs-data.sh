@@ -8,12 +8,23 @@
 # Author: Anatdx
 
 MODDIR="${0%/*}"
-# late-load.sh reuses this startup path before module mounts are applied.
-STAGE="${1:-post-fs-data}"
-case "$STAGE" in
-post-fs-data | late-load) ;;
-*) exit 2 ;;
-esac
+[ "$#" -eq 0 ] || exit 2
+STAGE=post-fs-data
+# shellcheck source=module/late-load-common.sh
+. "$MODDIR/late-load-common.sh"
+for marker in disable remove; do
+	[ ! -e "$MODDIR/$marker" ] && [ ! -L "$MODDIR/$marker" ] || exit 0
+done
+LATE_LOAD=false
+if late_load_mode; then
+	LATE_LOAD=true
+	late_load_lock || exit 1
+	if ! late_load_runtime_stopped; then
+		[ ! -f "$LATE_LOAD_PENDING" ] || late_load_notice
+		echo "post-fs-data: late-load activation deferred until Android is stopped" >&2
+		exit 0
+	fi
+fi
 BASE_DIR="/data/adb/yukizygisk"
 LIB_DIR="$BASE_DIR/lib"
 RUN_DIR="$BASE_DIR/run"
@@ -24,7 +35,7 @@ PREVIOUS_RUNTIME_LOG="$RUNTIME_LOG_DIR/zygiskd64.old.log"
 PREVIOUS_ROLLOVER_LOG="$RUNTIME_LOG_DIR/zygiskd64.1.old.log"
 LOG_FILE="$BASE_DIR/zygiskd.log"
 CONFIG_FILE="$BASE_DIR/yzconfig.json"
-LATE_LOAD_LOGS_PREPARED="/dev/yukizygisk-late-load/logs-prepared"
+LATE_LOAD_LOGS_PREPARED="$LATE_LOAD_STATE_DIR/logs-prepared"
 
 mkdir -p "$BASE_DIR" "$LIB_DIR" "$RUN_DIR" "$RUNTIME_LOG_DIR"
 chmod 0755 "$BASE_DIR" "$LIB_DIR" "$RUN_DIR"
@@ -55,7 +66,7 @@ current_log_safe=true
 rollover_log_safe=true
 # Late-load retries still run the authenticated, idempotent launcher. Rotate
 # logs only before the first attempt so a running daemon keeps its log file.
-if [ "$STAGE" != late-load ] || [ ! -f "$LATE_LOAD_LOGS_PREPARED" ]; then
+if ! $LATE_LOAD || [ ! -f "$LATE_LOAD_LOGS_PREPARED" ]; then
 	previous_log_safe=true
 	previous_rollover_safe=true
 	remove_previous_log "$PREVIOUS_RUNTIME_LOG" || previous_log_safe=false
@@ -94,7 +105,7 @@ done
 touch "$LOG_FILE" 2>/dev/null || true
 # Publish log preparation before launching any daemon, including an attempt
 # whose caller may be interrupted after the daemon has already started.
-if [ "$STAGE" = late-load ]; then
+if $LATE_LOAD; then
 	: >"$LATE_LOAD_LOGS_PREPARED" || exit 1
 fi
 
@@ -129,10 +140,25 @@ fi
 
 log "starting authenticated YukiZygisk core"
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_CONFIG_FILE LD_DEBUG LD_DEBUG_OUTPUT
+set -- launch --module-dir "$MODDIR"
+if $LATE_LOAD; then
+	# Keep the stop condition through hashing, LKM relocation and daemon ready.
+	# KernelSU may stop waiting for this script when its shared deadline expires.
+	set -- "$@" --runtime-guard stopped
+fi
 # The bootstrap shell owns FD 9; the daemon must not inherit its startup lock.
-if ! /system/bin/env -i PATH=/system/bin:/system/xbin "$MODDIR/bin/viola" launch --module-dir "$MODDIR" 9>&- >>"$LOG_FILE" 2>&1; then
+if ! /system/bin/env -i PATH=/system/bin:/system/xbin "$MODDIR/bin/viola" "$@" 9>&- >>"$LOG_FILE" 2>&1; then
 	log "Viola refused startup; see verification error above"
-	set_description startup-failed
+	if $LATE_LOAD && [ -f "$LATE_LOAD_PENDING" ]; then
+		# This script can outlive boot-completed.sh after KernelSU's deadline.
+		# Preserve its activation reminder; the failure details stay in the log.
+		set_description late-load-pending
+	else
+		set_description startup-failed
+	fi
 	exit 1
+fi
+if $LATE_LOAD && [ -f "$LATE_LOAD_PENDING" ]; then
+	mv -f "$LATE_LOAD_PENDING" "$LATE_LOAD_ACTIVE" || exit 1
 fi
 exit 0

@@ -8,6 +8,17 @@
 # Author: Anatdx
 
 MODDIR="${0%/*}"
+# shellcheck source=module/late-load-common.sh
+. "$MODDIR/late-load-common.sh"
+for marker in disable remove; do
+	[ ! -e "$MODDIR/$marker" ] && [ ! -L "$MODDIR/$marker" ] || exit 0
+done
+# KernelSU runs this stage during late-load too, before any manual soft reboot.
+# An intentionally absent LKM is not a health failure or an unload request.
+if [ -f "$LATE_LOAD_PENDING" ]; then
+	late_load_notice
+	exit 0
+fi
 BASE_DIR="/data/adb/yukizygisk"
 LOG_FILE="$BASE_DIR/zygiskd.log"
 

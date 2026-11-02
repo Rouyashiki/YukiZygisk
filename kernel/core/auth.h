@@ -40,6 +40,7 @@ int yz_auth_target_report(u32 pid, u32 generation);
 long yz_auth_ioctl(struct yz_auth_session *session, unsigned int request,
 		   void __user *arg);
 bool yz_auth_catalog_ready(void);
+void yz_auth_runtime_started(void);
 bool yz_auth_injection_allowed(bool early_native, bool compat);
 bool yz_auth_injection_ticket(bool early_native, bool compat,
 			      struct yz_auth_ticket *ticket);

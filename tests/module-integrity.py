@@ -239,7 +239,7 @@ class ModuleIntegrityTests(unittest.TestCase):
         for name in (
             "bin/viola", "lkm/android16-6.12_yukizygisk.ko", "lib64/libzygisk.so",
             "lib/libyukizncore.so", "webroot/index.html", "action.sh", "module.prop",
-            "customize.sh", "late-load.sh", "viola.manifest", "viola.sig",
+            "customize.sh", "late-load.sh", "late-load-common.sh", "viola.manifest", "viola.sig",
         ):
             self.assert_rejected(
                 self.changed_archive({name: self.entries[name] + b"\n# corrupted\n"}), name

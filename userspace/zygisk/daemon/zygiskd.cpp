@@ -24,7 +24,9 @@
 #include "uapi/yukizygisk.h"
 #include "userspace/zygisk/daemon_state.hpp"
 #include "userspace/zygisk/load_policy.hpp"
+#include "userspace/zygisk/late_load.hpp"
 #include "userspace/zygisk/settings.hpp"
+#include "userspace/common/runtime_guard.h"
 #include "viola_build.h"
 
 #include "json.hpp"
@@ -72,6 +74,7 @@ namespace {
 
 constexpr int kZnApiVersion3 = 3;
 constexpr int kZnApiVersion4 = 4;
+yz_runtime_guard g_startup_guard{};
 
 #if defined(YUKIZYGISK_RUNTIME_LOG)
 #define DLOGE(...)                                                             \
@@ -420,6 +423,17 @@ bool reap_compat_for_recovery() {
 }
 
 pid_t spawn_compat_daemon() {
+  auto guard = g_startup_guard;
+  // An interrupted activation may leave daemon64 alive. Guard a later compat
+  // retry too, without imposing the stop requirement on ordinary recovery.
+  int guarded = !guard.enabled && yukizygisk::late_load::activation_pending()
+      ? yz_runtime_guard_capture(&guard, yz_runtime_property) : 0;
+  if (!guarded)
+    guarded = yz_runtime_guard_check(&guard, yz_runtime_property);
+  if (guarded) {
+    errno = -guarded;
+    return -1;
+  }
   std::string module_dir = own_module_dir();
   if (module_dir.empty())
     return -1;
@@ -460,8 +474,12 @@ pid_t spawn_compat_daemon() {
   std::string module_env = "YUKIZYGISK_MODULE_DIR=" + module_dir;
   std::string modules_env = "YUKIZYGISK_MODULES_DIR=" + yzhost::modules_dir();
   std::string config_env = "YUKIZYGISK_CONFIG=" + yzhost::config_path();
+  char guard_text[YZ_RUNTIME_GUARD_TEXT];
+  yz_runtime_guard_format(&guard, guard_text);
+  std::string guard_env = std::string(YZ_RUNTIME_GUARD_ENV "=") + guard_text;
   char *env[] = {const_cast<char *>("PATH=/system/bin:/system/xbin"),
                  module_env.data(), modules_env.data(), config_env.data(),
+                 guard.enabled ? guard_env.data() : nullptr,
                  nullptr};
   const pid_t parent_pid = getpid();
   pid_t pid = fork();
@@ -2783,6 +2801,17 @@ int run_daemon() {
   int ready_fd = consume_ready_fd();
   yzhost::load_env();
 
+  const char *guard_text = getenv(YZ_RUNTIME_GUARD_ENV);
+  int guarded = guard_text ? yz_runtime_guard_parse(&g_startup_guard, guard_text) : 0;
+  unsetenv(YZ_RUNTIME_GUARD_ENV);
+  if (!guarded)
+    guarded = yz_runtime_guard_check(&g_startup_guard, yz_runtime_property);
+  if (guarded) {
+    DLOGE("late-load runtime changed before daemon startup; activation deferred");
+    notify_ready(ready_fd, false);
+    return 1;
+  }
+
   signal(SIGPIPE, SIG_IGN);
 
   // Claim the execution-bound role before exposing any daemon service.
@@ -2891,7 +2920,10 @@ int run_daemon() {
   } else {
     DLOGI("no 32-bit zygote or native target; skipping zygiskd32");
   }
-  if (yzhost::ctl(YZ_IOCTL_DAEMON_READY, nullptr) != 0) {
+  guarded = yz_runtime_guard_check(&g_startup_guard, yz_runtime_property);
+  if (guarded)
+    errno = -guarded;
+  if (guarded || yzhost::ctl(YZ_IOCTL_DAEMON_READY, nullptr) != 0) {
     DLOGE("kernel rejected daemon readiness: %s", strerror(errno));
     stop_compat_daemon(g_compat_pid);
     close(nlfd);
@@ -2900,7 +2932,10 @@ int run_daemon() {
     return 1;
   }
 #else
-  if (yzhost::ctl(YZ_IOCTL_VIOLA_COMPAT_READY, nullptr) != 0) {
+  guarded = yz_runtime_guard_check(&g_startup_guard, yz_runtime_property);
+  if (guarded)
+    errno = -guarded;
+  if (guarded || yzhost::ctl(YZ_IOCTL_VIOLA_COMPAT_READY, nullptr) != 0) {
     DLOGE("kernel rejected compat daemon readiness: %s", strerror(errno));
     close(nlfd);
     close(srv);
@@ -2909,6 +2944,7 @@ int run_daemon() {
   }
 #endif // #if defined(__LP64__)
 
+  g_startup_guard = {};
   g_crash_monitor.start("/data/adb/yukizygisk/diagnostics/current",
                         kRuntimeAbi);
   g_exit_history.start(true);

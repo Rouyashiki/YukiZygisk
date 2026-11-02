@@ -12,6 +12,7 @@
 #include "kernel/uapi/yukizygisk.h"
 #include "module_loader.h"
 #include "recovery.h"
+#include "userspace/common/runtime_guard.h"
 #include "vendor/monocypher-ed25519.h"
 #include "viola.h"
 #include "viola_build.h"
@@ -56,6 +57,18 @@ struct package {
 };
 
 static int64_t monotonic_ms(void);
+static struct yz_runtime_guard startup_guard;
+static yz_runtime_property_reader startup_property = yz_runtime_property;
+
+static int check_startup_runtime(void) {
+  return yz_runtime_guard_check(&startup_guard, startup_property);
+}
+
+static void startup_environment(char *buffer, size_t capacity) {
+  char value[YZ_RUNTIME_GUARD_TEXT];
+  yz_runtime_guard_format(&startup_guard, value);
+  snprintf(buffer, capacity, YZ_RUNTIME_GUARD_ENV "=%s", value);
+}
 
 static int failure(const char *stage, int error) {
   fprintf(stderr, "viola: %s: %s (%d)\n", stage,
@@ -362,6 +375,13 @@ static int verify_package(struct package *package, uint32_t selected_kmi) {
  * rather than in the shared libc syscall trampoline. */
 static long admission_syscall(long number, unsigned long a0, unsigned long a1,
                               unsigned long a2) {
+  /* lkmloader may spend time relocating a fallback image. Check at every
+   * actual loading syscall, after all hashing/copying/relocation work. */
+  if ((number == SYS_init_module || number == SYS_finit_module) &&
+      check_startup_runtime()) {
+    errno = EAGAIN;
+    return -1;
+  }
 #if defined(__aarch64__)
   register unsigned long x0 __asm__("x0") = a0;
   register unsigned long x1 __asm__("x1") = a1;
@@ -480,11 +500,15 @@ static int load_kernel(struct package *package, uint32_t kmi) {
     int ksu = module_present("kernelsu");
     if (ksu < 0)
       result = ksu;
-    else
+    else {
+      char parameters[80];
+      snprintf(parameters, sizeof(parameters),
+               "ksu_module_present=%d defer_until_ready=%d", ksu != 0,
+               startup_guard.enabled != 0);
       result = viola_load_verified_kernel(buffer, (size_t)entry.size,
-                                          ksu ? "ksu_module_present=1" :
-                                                "ksu_module_present=0",
+                                          parameters,
                                           admission_syscall);
+    }
   }
   munmap(buffer, (size_t)entry.size);
   return result;
@@ -592,6 +616,7 @@ static int execute_daemon(struct package *package, int control, int ready,
   struct viola_entry entry;
   char executable[PATH_MAX], control_env[64], ready_env[64], image_env[64];
   char module_env[PATH_MAX + 32];
+  char guard_env[sizeof(YZ_RUNTIME_GUARD_ENV) + YZ_RUNTIME_GUARD_TEXT];
   int result =
       viola_manifest_find(&package->catalog, VIOLA_ROLE_DAEMON, abi, 0, &entry);
   if (result)
@@ -604,6 +629,8 @@ static int execute_daemon(struct package *package, int control, int ready,
     result = -errno;
   if (!result)
     result = hash_fd(fd, &entry);
+  if (!result)
+    result = check_startup_runtime();
   if (!result && ioctl(control, YZ_IOCTL_VIOLA_ARM_EXEC, 0))
     result = -errno;
   if (result) {
@@ -622,15 +649,22 @@ static int execute_daemon(struct package *package, int control, int ready,
            control);
   snprintf(ready_env, sizeof(ready_env), "YUKIZYGISK_READY_FD=%d", ready);
   snprintf(image_env, sizeof(image_env), "YUKIZYGISK_IMAGE_FD=%d", fd);
-  char *environment[] = {"PATH=/system/bin:/system/xbin",
+  char *environment[11] = {"PATH=/system/bin:/system/xbin",
                          control_env,
                          ready_env,
                          module_env,
                          "YUKIZYGISK_CONFIG=" VIOLA_BASE "/yzconfig.json",
                          "YUKIZYGISK_LOG_DIR=" VIOLA_BASE "/log",
                          "YUKIZYGISK_MODULES_DIR=/data/adb/modules",
-                         abi == VIOLA_ABI_ARM32 ? image_env : NULL,
                          NULL};
+  size_t environment_count = 7;
+  if (startup_guard.enabled) {
+    startup_environment(guard_env, sizeof(guard_env));
+    environment[environment_count++] = guard_env;
+  }
+  if (abi == VIOLA_ABI_ARM32)
+    environment[environment_count++] = image_env;
+  environment[environment_count] = NULL;
   char *arguments[] = {executable, NULL};
   if (fcntl(control, F_SETFD, 0) || (ready >= 0 && fcntl(ready, F_SETFD, 0))) {
     close(fd);
@@ -642,6 +676,8 @@ static int execute_daemon(struct package *package, int control, int ready,
    * the kernel retains the frozen image for the entire control session. */
   if (!result && abi == VIOLA_ABI_ARM32 && fcntl(fd, F_SETFD, 0))
     result = -errno;
+  if (!result)
+    result = check_startup_runtime();
   if (!result) {
     syscall(SYS_execveat, fd, "", arguments, environment, AT_EMPTY_PATH);
     result = -errno;
@@ -652,8 +688,8 @@ static int execute_daemon(struct package *package, int control, int ready,
 
 static int launch_worker(struct package *package, int ready, int loaded,
                          uint32_t kmi) {
-  int result = 0;
-  if (!loaded)
+  int result = check_startup_runtime();
+  if (!result && !loaded)
     result = load_kernel(package, kmi);
   if (result)
     return failure("kernel image", result);
@@ -667,6 +703,8 @@ static int launch_worker(struct package *package, int ready, int loaded,
   /* Reserve the kernel launcher before changing any deployed core. */
   if (!result)
     result = deploy_cores(package);
+  if (!result)
+    result = check_startup_runtime();
   struct yz_viola_catalog_cmd catalog = {
       sizeof(catalog),
       YZ_VIOLA_VERSION,
@@ -696,11 +734,16 @@ static int restart_worker(struct package *package, int ready) {
   snprintf(ready_text, sizeof(ready_text), "%d", ready);
   char *arguments[] = {"viola", "launch-worker", "--module-dir",
                         package->directory, "--ready-fd", ready_text, NULL};
-  char *environment[] = {"PATH=/system/bin:/system/xbin", NULL};
+  char guard_env[sizeof(YZ_RUNTIME_GUARD_ENV) + YZ_RUNTIME_GUARD_TEXT];
+  startup_environment(guard_env, sizeof(guard_env));
+  char *environment[] = {"PATH=/system/bin:/system/xbin",
+                         startup_guard.enabled ? guard_env : NULL, NULL};
   if (!result && fcntl(ready, F_SETFD, 0))
     result = -errno;
   if (!result)
     result = close_other_fds(-1, ready, fd);
+  if (!result)
+    result = check_startup_runtime();
   if (!result) {
     syscall(SYS_execveat, fd, "", arguments, environment, AT_EMPTY_PATH);
     result = -errno;
@@ -724,7 +767,9 @@ static int recover_compat_before(int query,
   int requested = 0;
   for (;;) {
     struct yz_viola_status status;
-    int result = read_status(query, &status);
+    int result = check_startup_runtime();
+    if (!result)
+      result = read_status(query, &status);
     if (result)
       return result;
     if (status.epoch != initial->epoch || status.generation != initial->generation ||
@@ -755,6 +800,9 @@ static int recover_compat(int query, const struct yz_viola_status *initial) {
 }
 
 static int launch(struct package *package, int64_t deadline) {
+  int runtime = check_startup_runtime();
+  if (runtime)
+    return runtime;
   struct yz_viola_status status;
   int query = control_open(YZ_PRCTL_CONTROL_OPTION, YZ_PRCTL_CONTROL_MAGIC);
   int loaded = module_present("yukizygisk");
@@ -791,6 +839,9 @@ static int launch(struct package *package, int64_t deadline) {
   if (!kmi)
     return -ENOTSUP;
   result = verify_package_before(package, kmi, deadline);
+  if (result)
+    return result;
+  result = check_startup_runtime();
   if (result)
     return result;
   if (deadline >= 0) {
@@ -1070,10 +1121,11 @@ int main(int argc, char **argv) {
     }
   }
   const char *directory = NULL;
+  const char *guard_text = getenv(YZ_RUNTIME_GUARD_ENV);
   int control = -1, ready = -1, abi = -1;
   if (argc < 4) {
     fputs("usage: viola verify|launch|ensure --module-dir ABSOLUTE_DIRECTORY "
-          "[--abi all|64|32]\n",
+          "[--abi all|64|32] [--runtime-guard stopped]\n",
           stderr);
     return 2;
   }
@@ -1082,6 +1134,8 @@ int main(int argc, char **argv) {
       return 2;
     if (!strcmp(argv[i], "--module-dir") && !directory)
       directory = argv[i + 1];
+    else if (!strcmp(argv[i], "--runtime-guard") && !guard_text)
+      guard_text = argv[i + 1];
     else if (!strcmp(argv[i], "--control-fd") && control < 0) {
       control = parse_fd(argv[i + 1]);
       if (control < 0)
@@ -1107,6 +1161,7 @@ int main(int argc, char **argv) {
   if (!directory ||
       (!verify && !compat && !worker && !ensure && strcmp(argv[1], "launch")) ||
       (!ensure && abi >= 0) ||
+      (guard_text && (verify || ensure)) ||
       (compat && (control < 0 || ready < 0 || control == ready)) ||
       (worker && (control >= 0 || ready < 0)) ||
       (!compat && !worker && (control >= 0 || ready >= 0)))
@@ -1114,6 +1169,17 @@ int main(int argc, char **argv) {
   if (!verify && geteuid() != 0) {
     failure("root required", -EPERM);
     return 1;
+  }
+  if (guard_text) {
+    int guarded = !strcmp(guard_text, "stopped") && !worker && !compat
+        ? yz_runtime_guard_capture(&startup_guard, startup_property)
+        : yz_runtime_guard_parse(&startup_guard, guard_text);
+    if (!guarded)
+      guarded = check_startup_runtime();
+    if (guarded) {
+      failure("late-load runtime no longer stopped; activation deferred", guarded);
+      return 1;
+    }
   }
   struct package *package = calloc(1, sizeof(*package));
   if (!package)
@@ -1155,7 +1221,9 @@ int main(int argc, char **argv) {
     close(package->dirfd);
   free(package);
   if (result)
-    failure(argv[1], result);
+    failure(startup_guard.enabled && result == -EAGAIN
+                ? "late-load activation deferred: runtime changed"
+                : argv[1], result);
   else
     printf("viola: %s succeeded\n", argv[1]);
   return result ? (ensure ? (result == -EUCLEAN ? 3 : 2) : 1) : 0;

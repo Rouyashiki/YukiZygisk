@@ -147,7 +147,7 @@ function metric(label, value) {
 function statusPresentation() {
   if (!state.statusReady) return { tone: "", icon: "loader-circle", title: t("common.loading"), description: "" };
   if (state.status.safe_mode) return { tone: "warning", icon: "shield-alert", title: t("status.safeMode"), description: t("status.safeModeDesc") };
-  if (state.status.available && state.status.late_load_pending) return { tone: "warning", icon: "circle-alert", title: t("status.lateLoad"), description: t("status.lateLoadPending") };
+  if (state.status.late_load_pending) return { tone: "warning", icon: "circle-alert", title: t("status.lateLoad"), description: t("status.lateLoadPending") };
   if (state.status.available && state.status.kernel_alive) return { tone: "success", icon: "shield-check", title: t("status.running"), description: state.status.abi };
   return { tone: "danger", icon: "circle-alert", title: t("status.unavailable"), description: state.status.error || t("status.unavailableDesc") };
 }
@@ -174,7 +174,7 @@ function renderStatus() {
       </dl></section>
       <section class="section">${sectionHeader(t("status.runtimeInfo"))}<dl class="info-list">
         ${infoItem(t("status.rootImpl"), rootImplLabel())}
-        ${infoItem(t("status.startupMode"), t(state.statusReady && state.status.available ? (state.status.late_load ? "status.lateLoad" : "status.normalBoot") : "common.unknown"))}
+        ${infoItem(t("status.startupMode"), t(state.statusReady && (state.status.available || state.status.late_load) ? (state.status.late_load ? "status.lateLoad" : "status.normalBoot") : "common.unknown"))}
         ${infoItem(t("common.abi"), state.status.abi)}
       </dl></section>
     </div>`;
@@ -468,7 +468,7 @@ async function flushConfig() {
     try {
       runtimeRevision += 1;
       confirmedConfig = { ...await api.saveConfig(snapshot) };
-      state.savePhase = "saved";
+      state.savePhase = state.status.late_load_pending ? "savedPending" : "saved";
       for (const key of Object.keys(DEFAULT_CONFIG)) if (fieldRevisions[key] === revisions[key]) state.config[key] = confirmedConfig[key];
     } catch (error) {
       // yzctl can persist the file before runtime reload fails. Read disk before reconciling.

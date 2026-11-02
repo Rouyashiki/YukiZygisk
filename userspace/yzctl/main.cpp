@@ -10,6 +10,7 @@
 #include "host.hpp"
 #include "status.hpp"
 #include "userspace/zygisk/daemon/module_description.hpp"
+#include "userspace/zygisk/late_load.hpp"
 #include "userspace/zygisk/settings.hpp"
 
 #include "uapi/yukizygisk.h"
@@ -29,7 +30,7 @@ void usage(FILE *stream) {
           "  yzctl status [--json] [--modules-dir DIR] [--config FILE]\n"
           "  yzctl reload\n"
           "  yzctl ensure-daemon [--abi 32|64|all]\n"
-          "  yzctl description {starting|startup-failed|kernel-unavailable} "
+          "  yzctl description {starting|startup-failed|kernel-unavailable|late-load-pending} "
           "--module-dir DIR\n"
           "  yzctl config get\n"
           "  yzctl config set KEY VALUE [KEY VALUE ...]\n");
@@ -81,6 +82,17 @@ int status_command(int argc, char **argv) {
   yzctl::Host host;
   std::string error;
   if (!host.open(&error)) {
+    if (errno == ENODEV && yukizygisk::late_load::activation_pending()) {
+      if (json)
+        puts("{\"kernel_alive\":false,\"late_load\":true,"
+             "\"late_load_pending\":true}");
+      else
+        puts("YukiZygisk status\n"
+             "  Late-load: core activation deferred.\n"
+             "  After late-load finishes, manually "
+             "soft-reboot from KernelSU to activate injection.");
+      return 0;
+    }
     fprintf(stderr, "yzctl: %s\n", error.c_str());
     return 1;
   }
@@ -112,7 +124,7 @@ int status_command(int argc, char **argv) {
   return 0;
 }
 
-int reload_command(int argc) {
+int reload_command(int argc, bool allow_deferred = false) {
   if (argc != 2) {
     fprintf(stderr, "yzctl: reload takes no options\n");
     return 2;
@@ -121,6 +133,13 @@ int reload_command(int argc) {
   yzctl::Host host;
   std::string error;
   if (!host.open(&error)) {
+    // Pending can survive an interrupted launch with a ready daemon. Only an
+    // absent core may defer a saved configuration; a live one needs reload.
+    if (allow_deferred && errno == ENODEV &&
+        yukizygisk::late_load::activation_pending()) {
+      puts("YukiZygisk configuration saved; applies when late-load activates");
+      return 0;
+    }
     fprintf(stderr, "yzctl: %s\n", error.c_str());
     return 1;
   }
@@ -143,6 +162,11 @@ int ensure_daemon_command(int argc, char **argv) {
   }
   if (geteuid() != 0) {
     fprintf(stderr, "yzctl: ensure-daemon requires root\n");
+    return 1;
+  }
+  if (yukizygisk::late_load::activation_pending()) {
+    fprintf(stderr, "yzctl: late-load activation is deferred; "
+                    "soft-reboot from KernelSU after late-load finishes\n");
     return 1;
   }
   char path[] = "/data/adb/modules/yukizygisk/bin/viola";
@@ -172,6 +196,9 @@ int description_command(int argc, char **argv) {
     state = "startup❌ | daemon❔ kernel❔";
   else if (strcmp(argv[2], "kernel-unavailable") == 0)
     state = "status❌ | daemon❔ kernel❔";
+  else if (strcmp(argv[2], "late-load-pending") == 0)
+    state = "late-load⚠️ 请在 KernelSU 中手动软重启激活 / "
+            "soft-reboot from KernelSU to activate | daemon⏳ kernel⏳";
   if (state == nullptr || strcmp(argv[3], "--module-dir") != 0 ||
       argv[4][0] == '\0' || argc != 5) {
     usage(stderr);
@@ -207,7 +234,7 @@ int config_command(int argc, char **argv) {
     fprintf(stderr, "yzctl: configuration save failed: %s\n", strerror(errno));
     return 1;
   }
-  return reload_command(2);
+  return reload_command(2, true);
 }
 
 } // namespace

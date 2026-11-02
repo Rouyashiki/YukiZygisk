@@ -17,6 +17,7 @@
 #include <linux/jiffies.h>
 #include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
 #include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
@@ -86,6 +87,15 @@ static bool yz_auth_exit_registered;
 static bool yz_auth_exec_registered;
 static bool yz_auth_enabled;
 static bool yz_auth_initial_claimed;
+static bool yz_auth_defer_until_ready;
+module_param_named(defer_until_ready, yz_auth_defer_until_ready, bool, 0400);
+MODULE_PARM_DESC(defer_until_ready, "Hold late-load injection until guarded daemon readiness");
+enum yz_auth_startup_state {
+	YZ_AUTH_STARTUP_WAITING,
+	YZ_AUTH_STARTUP_ACTIVE,
+	YZ_AUTH_STARTUP_RESUMED,
+};
+static atomic_t yz_auth_startup = ATOMIC_INIT(YZ_AUTH_STARTUP_WAITING);
 static void *yz_auth_manifest;
 static struct viola_manifest_view yz_auth_catalog;
 static u64 yz_auth_epoch;
@@ -579,6 +589,11 @@ struct yz_auth_session *yz_auth_open(bool launcher)
 		goto fail;
 	}
 	if (launcher) {
+		/* Only an unfinished activation is reset for a new authenticated
+		 * attempt. Ordinary recovery after activation keeps its semantics. */
+		if (yz_auth_defer_until_ready &&
+		    atomic_read(&yz_auth_startup) != YZ_AUTH_STARTUP_ACTIVE)
+			atomic_set(&yz_auth_startup, YZ_AUTH_STARTUP_WAITING);
 		yz_auth_initial_claimed = true;
 		yz_auth_main_history = YZ_VIOLA_STARTING;
 		rcu_assign_pointer(yz_auth_main, s);
@@ -1103,6 +1118,24 @@ static int yz_auth_recover(struct yz_auth_session *s,
 	return 0;
 }
 
+void yz_auth_runtime_started(void)
+{
+	/* Linearize Zygote exec against activation, including the final gap
+	 * between the userspace property check and DAEMON_READY. */
+	if (yz_auth_defer_until_ready)
+		atomic_cmpxchg(&yz_auth_startup, YZ_AUTH_STARTUP_WAITING,
+			       YZ_AUTH_STARTUP_RESUMED);
+}
+
+static int yz_auth_activate_startup(void)
+{
+	if (!yz_auth_defer_until_ready)
+		return 0;
+	return atomic_cmpxchg(&yz_auth_startup, YZ_AUTH_STARTUP_WAITING,
+			      YZ_AUTH_STARTUP_ACTIVE) == YZ_AUTH_STARTUP_RESUMED
+		? -EAGAIN : 0;
+}
+
 long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request,
 		   void __user *arg)
 {
@@ -1212,7 +1245,9 @@ long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request,
 		    (!compat || compat->parent_generation != s->generation ||
 		     (yz_auth_alive(compat) && compat->ready))) {
 			WRITE_ONCE(s->ready, true);
-			ret = 0;
+			ret = yz_auth_activate_startup();
+			if (ret)
+				WRITE_ONCE(s->ready, false);
 		}
 		break;
 	case YZ_IOCTL_VIOLA_COMPAT_READY:
@@ -1235,7 +1270,9 @@ out:
 
 bool yz_auth_catalog_ready(void)
 {
-	return READ_ONCE(yz_auth_enabled) && smp_load_acquire(&yz_auth_manifest);
+	return READ_ONCE(yz_auth_enabled) && smp_load_acquire(&yz_auth_manifest) &&
+	       (!yz_auth_defer_until_ready ||
+		atomic_read_acquire(&yz_auth_startup) == YZ_AUTH_STARTUP_ACTIVE);
 }
 
 bool yz_auth_injection_allowed(bool early_native, bool compat)

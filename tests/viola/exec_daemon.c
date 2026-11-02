@@ -17,6 +17,15 @@
 static int pin_calls, arm_calls, exec_calls, fail_stage;
 static unsigned expected_abi;
 static int pinned_fd = -1;
+static int runtime_resumed;
+
+static int fixture_property(const char *name, char *value, uint32_t *serial) {
+  *serial = runtime_resumed ? 2 : 1;
+  strcpy(value, !strcmp(name, "ro.zygote") ? "zygote64_32" :
+                !strcmp(name, "sys.boot_completed") ? "0" :
+                runtime_resumed ? "running" : "stopped");
+  return 0;
+}
 
 int fixture_ioctl(int fd, unsigned long request, ...) {
   (void)fd;
@@ -33,6 +42,7 @@ int fixture_ioctl(int fd, unsigned long request, ...) {
   assert(request == YZ_IOCTL_VIOLA_ARM_EXEC);
   ++arm_calls;
   if (fail_stage == 2) { errno = EACCES; return -1; }
+  if (fail_stage == 4) runtime_resumed = 1;
   return 0;
 }
 
@@ -50,14 +60,23 @@ long fixture_syscall(long number, ...) {
   assert(arm_calls == 1);
   assert(!!(fcntl(fd, F_GETFD) & FD_CLOEXEC) == (expected_abi == VIOLA_ABI_ARM64));
   int found_image = 0;
+  int found_guard = 0;
   const char prefix[] = "YUKIZYGISK_IMAGE_FD=";
   for (; *env; ++env) {
+    if (!strncmp(*env, YZ_RUNTIME_GUARD_ENV "=", sizeof(YZ_RUNTIME_GUARD_ENV))) {
+      struct yz_runtime_guard inherited;
+      assert(yz_runtime_guard_parse(&inherited,
+                                    *env + sizeof(YZ_RUNTIME_GUARD_ENV)) == 0);
+      assert(yz_runtime_guard_check(&inherited, fixture_property) == 0);
+      ++found_guard;
+    }
     if (!strncmp(*env, prefix, sizeof(prefix) - 1)) {
       assert(atoi(*env + sizeof(prefix) - 1) == fd);
       ++found_image;
     }
   }
   assert(found_image == (expected_abi == VIOLA_ABI_ARM32));
+  assert(found_guard == (fail_stage >= 3));
   ++exec_calls;
   errno = ECANCELED;
   return -1;
@@ -68,6 +87,11 @@ int main(int argc, char **argv) {
   struct package package = {.dirfd = -1};
   expected_abi = (unsigned)atoi(argv[2]);
   fail_stage = atoi(argv[3]);
+  if (fail_stage >= 3) {
+    startup_property = fixture_property;
+    assert(yz_runtime_guard_capture(&startup_guard, startup_property) == 0);
+    runtime_resumed = fail_stage == 3;
+  }
   int pipefd[2];
   assert(pipe2(pipefd, O_CLOEXEC) == 0);
   int result = load_package(&package, argv[1]);
