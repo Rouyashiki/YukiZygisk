@@ -55,12 +55,13 @@ target_compile_options(yukiplt PRIVATE -fexceptions -fno-stack-protector
     -fno-c++-static-destructors -ffunction-sections -fdata-sections)
 set_source_files_properties(src/core.cpp src/hook.cpp src/hyos_runtime.cpp
     src/yukizncore.cpp src/process_maps.cpp src/linker_runtime.cpp
-    src/native_bionic.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
+    src/native_bionic.cpp src/exit_cleanup.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
 
 add_library(zygisk SHARED
     ../endpoint.cpp
     ${YUKIZYGISK_CXX_SLIM}
     src/core.cpp
+    src/exit_cleanup.cpp
     src/core_bindings.cpp
     src/plt_lifecycle.cpp
     src/process_maps.cpp
