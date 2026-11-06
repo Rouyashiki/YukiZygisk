@@ -1189,7 +1189,7 @@ int main(int argc, char **argv) {
   if (!result && verify)
     result = verify_package(package, 0);
   else if (!result && compat) {
-    struct yz_viola_status status;
+    struct yz_viola_status status = {0};
     if (admission_syscall(SYS_ioctl, control, YZ_IOCTL_VIOLA_CLAIM, 0))
       result = -errno;
     else
