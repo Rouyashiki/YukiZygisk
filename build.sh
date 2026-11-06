@@ -411,10 +411,11 @@ build_daemon() {
 build_payloads() {
 	local lib
 	rm -f "$OUT_DIR/libzygisk.so" "$OUT_DIR/libyukilinker.so" \
+		"$OUT_DIR/libyukilinker32.so" "$OUT_DIR/libyukilinker64.so" \
 		"$OUT_DIR/libyukizncore.so"
 	if [[ "$SKIP_PAYLOADS" == true ]]; then
-		for lib in libzygisk64.so libzygisk32.so libyukilinker64.so \
-			libyukilinker32.so libyukizncore64.so libyukizncore32.so; do
+		for lib in libzygisk64.so libzygisk32.so libyloader64.so \
+			libyloader32.so libyukizncore64.so libyukizncore32.so; do
 			[[ -f "$OUT_DIR/$lib" ]] ||
 				die "--skip-payloads requested but build/out/$lib is missing"
 		done
@@ -448,8 +449,8 @@ build_payloads() {
 		fi
 		info "Build runtime payloads ($target_abi, $ANDROID_PLATFORM)"
 		cmake "${cmake_args[@]}"
-		cmake --build "$subdir" --target zygisk yukilinker yukizncore
-		for lib in libzygisk libyukilinker libyukizncore; do
+		cmake --build "$subdir" --target zygisk yukilinker_bootstrap yukizncore
+		for lib in libzygisk libyloader libyukizncore; do
 			src="$subdir/userspace/zygisk/core/$lib$suffix.so"
 			output="$lib$suffix.so"
 			[[ -f "$src" ]] || die "runtime payload output missing: $src"
@@ -556,10 +557,10 @@ stage_payloads() {
 	local source destination payload
 	local payloads=(
 		"libzygisk64.so:lib64/libzygisk.so"
-		"libyukilinker64.so:lib64/libyukilinker.so"
+		"libyloader64.so:lib64/libyloader.so"
 		"libyukizncore64.so:lib64/libyukizncore.so"
 		"libzygisk32.so:lib/libzygisk.so"
-		"libyukilinker32.so:lib/libyukilinker.so"
+		"libyloader32.so:lib/libyloader.so"
 		"libyukizncore32.so:lib/libyukizncore.so"
 	)
 	for payload in "${payloads[@]}"; do

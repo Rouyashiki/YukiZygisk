@@ -8,6 +8,7 @@
  */
 
 #include "hyos_runtime.hpp"
+#include "linker_runtime.hpp"
 #include "plt_lifecycle.hpp"
 #include <yukiplt.hpp>
 
@@ -61,6 +62,7 @@ static_assert(sizeof(ZnHyosAppSpecializeArgs) == 3 * sizeof(void *));
 struct RegisteredModule {
   ZygiskNextHyosModule module;
   const NativeModuleBinding *binding;
+  const linker::Library *library;
 };
 
 std::vector<RegisteredModule> g_modules;
@@ -80,6 +82,7 @@ OpenControlSessionFn g_open_control_session = nullptr;
 ReportCallbackFn g_report_callback = nullptr;
 void (*g_recover_plt)() = nullptr;
 const NativeModuleBinding *g_registering_binding = nullptr;
+const linker::Library *g_registering_library = nullptr;
 int g_child_control_session = -1;
 std::atomic_flag g_child_control_lock = ATOMIC_FLAG_INIT;
 std::atomic_flag g_fork_lock = ATOMIC_FLAG_INIT;
@@ -165,6 +168,11 @@ void dispatch_specialized(const char *se_info, const char *package_name) {
   for (const auto &entry : g_modules) {
     if (!plt_lifecycle::dispatch_allowed())
       return;
+    if (entry.library == nullptr)
+      continue;
+    linker::Execution execution(*entry.library);
+    if (!execution)
+      continue;
     entry.module.onAppSpecialized(&args);
     if (!plt_lifecycle::dispatch_allowed())
       return;
@@ -225,7 +233,7 @@ int register_module(const void *module_pointer) {
       module->onAppSpecialized == nullptr)
     return ZN_FAILED;
 
-  g_modules.push_back({*module, g_registering_binding});
+  g_modules.push_back({*module, g_registering_binding, g_registering_library});
   return ZN_SUCCESS;
 }
 
@@ -269,6 +277,8 @@ bool initialize(OpenControlSessionFn open_control_session,
   g_recover_plt = recover_plt;
   g_registering_binding = nullptr;
 
+  g_registering_library = nullptr;
+
   yukizygisk::plt_lifecycle::Operation operation;
   if (!operation)
     return false;
@@ -298,6 +308,20 @@ bool initialize(OpenControlSessionFn open_control_session,
 }
 
 bool available() { return g_available; }
+
+bool release_idle_storage() {
+  if (!g_modules.empty() || g_hook_handle.valid() || g_recovery)
+    return false;
+  g_registration_open = false;
+  g_hooks_ready = false;
+  g_open_control_session = nullptr;
+  g_report_callback = nullptr;
+  g_recover_plt = nullptr;
+  end_module_registration();
+  std::vector<RegisteredModule>().swap(g_modules);
+  g_target_image = {};
+  return true;
+}
 
 const ZygiskNextRuntime *runtime() {
   return g_available ? &g_runtime : nullptr;
@@ -396,10 +420,15 @@ void invalidate_child_control_session() {
   g_child_ready = false;
 }
 
-void begin_module_registration(const NativeModuleBinding *binding) {
+void begin_module_registration(const NativeModuleBinding *binding,
+                               const linker::Library *library) {
   g_registering_binding = binding;
+  g_registering_library = library;
 }
 
-void end_module_registration() { g_registering_binding = nullptr; }
+void end_module_registration() {
+  g_registering_binding = nullptr;
+  g_registering_library = nullptr;
+}
 
 } // namespace yukizygisk::hyos

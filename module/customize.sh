@@ -83,9 +83,9 @@ fi
 [ -f "$MODPATH/bin/zygiskd32" ] || abort "! Missing bin/zygiskd32"
 [ -f "$MODPATH/bin/yzctl" ] || abort "! Missing bin/yzctl"
 for lib in \
-	"$MODPATH/lib64/libzygisk.so" "$MODPATH/lib64/libyukilinker.so" \
+	"$MODPATH/lib64/libzygisk.so" "$MODPATH/lib64/libyloader.so" \
 	"$MODPATH/lib64/libyukizncore.so" "$MODPATH/lib/libzygisk.so" \
-	"$MODPATH/lib/libyukilinker.so" "$MODPATH/lib/libyukizncore.so"; do
+	"$MODPATH/lib/libyloader.so" "$MODPATH/lib/libyukizncore.so"; do
 	[ -f "$lib" ] || abort "! Missing ${lib#"$MODPATH/"}"
 done
 

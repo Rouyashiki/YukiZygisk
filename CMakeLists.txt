@@ -14,6 +14,8 @@ project(YukiZygisk VERSION 0.3.0 LANGUAGES C CXX ASM)
 file(REMOVE
   "${CMAKE_SOURCE_DIR}/build/out/libzygisk.so"
   "${CMAKE_SOURCE_DIR}/build/out/libyukilinker.so"
+  "${CMAKE_SOURCE_DIR}/build/out/libyukilinker32.so"
+  "${CMAKE_SOURCE_DIR}/build/out/libyukilinker64.so"
   "${CMAKE_SOURCE_DIR}/build/out/libyukizncore.so")
 
 option(YZ_BUILD_ZYGISKD "Build the standalone YukiZygisk daemon" ON)
@@ -46,7 +48,7 @@ endif()
 if(YZ_BUILD_RUNTIME)
   add_subdirectory(userspace/zygisk/core)
   yz_viola_identity(zygisk 6)
-  yz_viola_identity(yukilinker 5)
+  yz_viola_identity(yukilinker_bootstrap 5)
   yz_viola_identity(yukizncore 7)
 endif()
 if(YZ_BUILD_ZYGISKD)

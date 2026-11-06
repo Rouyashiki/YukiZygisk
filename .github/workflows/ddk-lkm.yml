@@ -46,6 +46,22 @@ env:
   VIOLA_NDK_VERSION: "29.0.14206865"
 
 jobs:
+  verify-native-stub:
+    name: Verify generated native injection images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: ndk;30.0.16248370
+      - run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          python3 userspace/zygisk/inject/generate.py --ndk "$sdk_root/ndk/30.0.16248370"
+
   prepare-viola:
     name: Prepare standalone Viola build context
     if: inputs.viola_context_artifact == ''
@@ -101,9 +117,10 @@ jobs:
 
   build-lkm:
     name: Build ${{ inputs.kmi }}_yukizygisk.ko
-    needs: prepare-viola
+    needs: [prepare-viola, verify-native-stub]
     if: >-
       !cancelled() &&
+      needs.verify-native-stub.result == 'success' &&
       (needs.prepare-viola.result == 'success' ||
        (needs.prepare-viola.result == 'skipped' && inputs.viola_context_artifact != ''))
     runs-on: ubuntu-latest

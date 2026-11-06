@@ -440,7 +440,7 @@ int viola_entry_path(const struct viola_entry *entry, char *out, size_t capacity
 		name = "bin/yzctl";
 		break;
 	case VIOLA_ROLE_LOADER:
-		name = "libyukilinker.so";
+		name = "libyloader.so";
 		break;
 	case VIOLA_ROLE_CORE:
 		name = "libzygisk.so";

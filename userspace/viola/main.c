@@ -537,7 +537,7 @@ static int deploy_cores(struct package *package) {
     for (unsigned role = VIOLA_ROLE_LOADER; role <= VIOLA_ROLE_NATIVE; ++role) {
       struct viola_entry entry;
       char target[64], temporary[96];
-      const char *base = role == VIOLA_ROLE_LOADER ? "libyukilinker"
+      const char *base = role == VIOLA_ROLE_LOADER ? "libyloader"
                          : role == VIOLA_ROLE_CORE ? "libzygisk"
                                                    : "libyukizncore";
       result = viola_manifest_find(&package->catalog, role, abi, 0, &entry);

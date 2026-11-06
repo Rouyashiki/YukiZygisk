@@ -49,8 +49,10 @@ Retirement restores hooks, checks quiescence, consumes recovery handles,
 unsubscribes the fork dispatcher, releases registry and loader ownership,
 and drains private runtime state before the existing assembly self-unmap tail.
 The Core remains resident if a required condition cannot be proved. The final
-ELF must retain the expected two NDK CRT finalizers, private runtime bindings,
-and only libc, libdl and libm dependencies. Exceptions stay within the Core.
+ELF must retain the validated NDK CRT and SDK finalizer sequence, private
+runtime bindings, and only libc, libdl and libm dependencies. Exceptions stay
+within the Core. See [YukiLinker integration](YUKILINKER.md) for module leases
+and the native bootstrap contract.
 
 Standalone endpoint authentication, module paths, logging and mount cleanup
 remain owned by this repository. Native companion index and availability are

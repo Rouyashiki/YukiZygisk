@@ -62,6 +62,7 @@ void child_atfork() {
 #include "module_plt_types.inc"
 struct Module {
   int id = 0;
+  yukizygisk::linker::Library library;
   std::vector<ModulePltRequest> plt_pending;
   std::vector<std::unique_ptr<ModulePltGroup>> plt_groups;
   bool plt_registration_failed = false;

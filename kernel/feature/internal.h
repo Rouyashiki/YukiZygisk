@@ -18,8 +18,8 @@
 struct mm_struct;
 struct yz_file_load_policy;
 
-#define YZ_LOADER_NAME64 "libyukilinker64.so"
-#define YZ_LOADER_NAME32 "libyukilinker32.so"
+#define YZ_LOADER_NAME64 "libyloader64.so"
+#define YZ_LOADER_NAME32 "libyloader32.so"
 #define YZ_CORE_NAME64 "libzygisk64.so"
 #define YZ_CORE_NAME32 "libzygisk32.so"
 #define YZ_NATIVE_CORE_NAME64 "libyukizncore64.so"

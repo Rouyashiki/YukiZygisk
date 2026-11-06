@@ -61,12 +61,17 @@ Third-party components
     Its source and LICENSE are pinned in the submodule
     userspace/zygisk/third_party/yukiplt.
     Source: https://github.com/Rouyashiki/YukiPLT/tree/f8988f3730cc93ba8121d0e0a3873f320dda7497
+  - YukiLinker is distributed under Apache-2.0.
+    Copyright 2026 Rouyashiki <https://rouyashiki.org>.
+    Its source, LICENSE and NOTICE are pinned in the submodule
+    userspace/zygisk/third_party/yukilinker.
+    Source: https://github.com/Rouyashiki/YukiLinker/tree/a479258e5eaa4574187c5e99d86974c9ecc366ce
   - XZ Embedded is by Lasse Collin and Igor Pavlov and has been placed in the
     public domain by its authors.
   - The AArch64 TLSDESC resolver assembly includes work from the Android Open
     Source Project under its original BSD license. Copyright (c) 2019 The
     Android Open Source Project. The complete notice is retained in
-    userspace/zygisk/core/src/yukilinker_tlsdesc.S.
+    userspace/zygisk/third_party/yukilinker/src/arch/arm64/tlsdesc.S.
   - The WebUI bridge and static frontend structure are adapted from
     KOWX712/ksu-webui-demo under the MIT License. Copyright (c) 2025 KOWX712.
     The license is retained in webui/LICENSE in the source tree; generated

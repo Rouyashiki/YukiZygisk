@@ -17,9 +17,11 @@ def build_archive(root, build, compiler, flags, export_lifecycle=False):
     vendor = root / 'userspace/zygisk/third_party/yukiplt'
     common = [*compiler, '-std=c++17', '-O1', '-g', '-fPIC', '-fexceptions',
               '-pthread', '-DYUKIPLT_STATIC=1', *flags,
-              '-I' + str(core), '-I' + str(vendor / 'include')]
+              '-I' + str(core), '-I' + str(vendor / 'include'),
+              '-I' + str(vendor.parent / 'yukilinker/include')]
     sources = [*sorted((vendor / 'src').glob('*.cpp')), core / 'plt_lifecycle.cpp',
-               core / 'process_maps.cpp', core / 'core_bindings.cpp']
+               core / 'process_maps.cpp', core / 'core_bindings.cpp',
+               root / 'userspace/zygisk/tests/linker_runtime_stub.cpp']
     objects = [build / (source.stem + '.o') for source in sources]
     def compile_one(pair):
         source, output = pair
@@ -38,6 +40,7 @@ def build_backend(root, build, compiler, flags):
 #include <algorithm>
 #include <memory>
 #include "plt_lifecycle.hpp"
+#include "linker_runtime.hpp"
 namespace yukizygisk::hyos { bool original_output_allowed(void **) { return true; } }
 constexpr int kSuccess = 0, kFailed = 1;
 #define LOGI(...) ((void)0)
@@ -117,8 +120,9 @@ def main():
                     ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'], [])
         if args.qemu:
             for arch, target in [('aarch64', 'aarch64-linux-gnu'), ('arm', 'arm-linux-gnueabihf')]:
+                namespace = ['unshare', '-Urpf', '--mount-proc'] if arch == 'arm' else []
                 build_tests(root, Path(temporary) / arch, [target + '-g++'], [],
-                            ['qemu-' + arch, '-L', '/usr/' + target])
+                            [*namespace, 'qemu-' + arch, '-L', '/usr/' + target])
 
 
 if __name__ == '__main__':

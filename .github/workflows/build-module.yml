@@ -200,8 +200,8 @@ jobs:
             build/out/yzctl
             build/out/libzygisk64.so
             build/out/libzygisk32.so
-            build/out/libyukilinker64.so
-            build/out/libyukilinker32.so
+            build/out/libyloader64.so
+            build/out/libyloader32.so
             build/out/libyukizncore64.so
             build/out/libyukizncore32.so
           if-no-files-found: error

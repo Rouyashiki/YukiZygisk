@@ -27,7 +27,7 @@ KMIS = ["none", "android12-5.10", "android13-5.10", "android13-5.15",
         "android14-5.15", "android14-6.1", "android15-6.6", "android16-6.12", "android17-6.18"]
 PATHS = {(1, 1, 0): "bin/viola", (3, 1, 0): "bin/zygiskd64",
          (3, 2, 0): "bin/zygiskd32", (4, 1, 0): "bin/yzctl"}
-for _role, _name in [(5, "libyukilinker.so"), (6, "libzygisk.so"), (7, "libyukizncore.so")]:
+for _role, _name in [(5, "libyloader.so"), (6, "libzygisk.so"), (7, "libyukizncore.so")]:
     PATHS[(_role, 1, 0)] = "lib64/" + _name
     PATHS[(_role, 2, 0)] = "lib/" + _name
 for _kmi in range(1, len(KMIS)):

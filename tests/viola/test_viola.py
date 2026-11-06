@@ -490,6 +490,18 @@ class ViolaTests(unittest.TestCase):
                     path.unlink()
                     path.write_bytes(saved)
 
+    def test_launcher_requires_sdk_loader_paths_for_both_abis(self):
+        for directory in ("lib64", "lib"):
+            with self.subTest(abi=directory):
+                current = self.module / directory / "libyloader.so"
+                legacy = self.module / directory / "libyukilinker.so"
+                current.rename(legacy)
+                try:
+                    self.assertNotEqual(self.launcher_verify().returncode, 0)
+                finally:
+                    legacy.rename(current)
+                self.assertEqual(self.launcher_verify().returncode, 0)
+
     def test_launcher_cleans_inherited_but_rejects_explicit_loader_controls(self):
         with patch.dict(os.environ, {"LD_LIBRARY_PATH": str(self.module / "lib64")}):
             result = self.launcher_verify()
