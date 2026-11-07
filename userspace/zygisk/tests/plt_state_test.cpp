@@ -325,13 +325,33 @@ int main(int argc, char **argv) {
   g_modules.resize(2);
   g_cur = &g_modules[0];
   g_plt_callback_tid.store(gettid());
-  api_plt_hook_register_byname("libplt_target\\.so$", "fixture_value",
-                               reinterpret_cast<void *>(other_replacement),
-                               nullptr);
-  CHECK(!g_cur->plt_registration_failed && g_cur->plt_pending.size() == 1);
-  CHECK(api_plt_hook_commit() && fixture.call() == 42);
-  CHECK(yukiplt::unhook(g_cur->plt_groups.back()->handle).ok());
-  g_cur->plt_groups.clear();
+  {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    CHECK(fd >= 0);
+    void *header = mmap(nullptr, page, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(header != MAP_FAILED && close(fd) == 0);
+    const auto maps = yukizygisk::MapInfo::Scan();
+    CHECK(std::count_if(maps.begin(), maps.end(), [&](const auto &map) {
+            return map.dev == fixture.map.dev &&
+                   map.inode == fixture.map.inode && map.offset == 0 &&
+                   (map.perms & PROT_READ);
+          }) >= 2);
+    api_plt_hook_register_byname("libplt_target\\.so$", "fixture_value",
+                                 reinterpret_cast<void *>(other_replacement),
+                                 nullptr);
+    CHECK(!g_cur->plt_registration_failed && g_cur->plt_pending.size() == 1);
+    CHECK(api_plt_hook_commit() && fixture.call() == 42);
+    CHECK(yukiplt::unhook(g_cur->plt_groups.back()->handle).ok());
+    g_cur->plt_groups.clear();
+    for (int i = 0; i < 2; ++i)
+      api_plt_hook_register_byname("libplt_target\\.so$", "fixture_value",
+                                   reinterpret_cast<void *>(other_replacement),
+                                   nullptr);
+    CHECK(!g_cur->plt_registration_failed && g_cur->plt_pending.size() == 2);
+    CHECK(!api_plt_hook_commit() && fixture.call() == 17);
+    CHECK(munmap(header, page) == 0);
+  }
   api_plt_hook_register(fixture.map.dev, fixture.map.inode, nullptr,
                         reinterpret_cast<void *>(other_replacement), nullptr);
   CHECK(!api_plt_hook_commit() && api_plt_hook_commit());
