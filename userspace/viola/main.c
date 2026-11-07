@@ -586,6 +586,20 @@ static int deploy_cores(struct package *package) {
         goto out;
     }
   }
+  if (fsync(directory)) {
+    result = -errno;
+    goto out;
+  }
+  /* Retire the previous loader names only after both ABIs are deployed. */
+  static const char *const legacy_loaders[] = {"libyukilinker32.so",
+                                               "libyukilinker64.so"};
+  for (size_t i = 0; i < sizeof(legacy_loaders) / sizeof(legacy_loaders[0]);
+       ++i) {
+    if (unlinkat(directory, legacy_loaders[i], 0) && errno != ENOENT) {
+      result = -errno;
+      goto out;
+    }
+  }
   if (fsync(directory))
     result = -errno;
 out:

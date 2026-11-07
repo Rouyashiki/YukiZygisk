@@ -213,6 +213,12 @@ class ViolaTests(unittest.TestCase):
             str(ROOT / "tests/viola/exec_daemon.c"), str(shared / "viola.c"),
             str(shared / "vendor/monocypher.c"), str(shared / "vendor/monocypher-ed25519.c"),
             *loader_links, "-o", str(cls.exec_fixture)], check=True)
+        cls.deploy_fixture = cls.base / "viola-deploy-cores"
+        subprocess.run([cc, *flags, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I" + str(ROOT), "-I" + str(shared), "-I" + str(cls.context_dir),
+            str(ROOT / "tests/viola/deploy_cores.c"), str(shared / "viola.c"),
+            str(shared / "vendor/monocypher.c"), str(shared / "vendor/monocypher-ed25519.c"),
+            *loader_links, "-o", str(cls.deploy_fixture)], check=True)
         auth = (ROOT / "kernel/core/auth.c").read_text()
         enum_start = auth.index("enum yz_auth_startup_state {")
         functions = [auth[enum_start:auth.index("};", enum_start) + 2]]
@@ -501,6 +507,55 @@ class ViolaTests(unittest.TestCase):
                 finally:
                     legacy.rename(current)
                 self.assertEqual(self.launcher_verify().returncode, 0)
+
+    def test_deployment_retires_only_legacy_loaders_and_can_repeat(self):
+        with tempfile.TemporaryDirectory(dir=self.base) as temporary:
+            root = Path(temporary)
+            library = root / "data/adb/yukizygisk/lib"
+            library.mkdir(parents=True)
+            legacy = [library / f"libyukilinker{abi}.so" for abi in (32, 64)]
+            for path in legacy:
+                path.write_bytes(b"old loader")
+            unrelated = library / "keep.so"
+            unrelated.write_bytes(b"unrelated")
+            for attempt in range(3):
+                if attempt == 1:
+                    legacy[0].symlink_to(unrelated)
+                result = subprocess.run([str(self.deploy_fixture), str(self.module), str(root)],
+                    capture_output=True, text=True, check=True, timeout=3)
+                self.assertEqual(int(result.stdout), 0, result.stderr)
+                for path in legacy:
+                    self.assertFalse(os.path.lexists(path))
+                self.assertEqual(unrelated.read_bytes(), b"unrelated")
+                for abi, directory in ((32, "lib"), (64, "lib64")):
+                    for name in ("libyloader", "libzygisk", "libyukizncore"):
+                        self.assertEqual((library / f"{name}{abi}.so").read_bytes(),
+                                         (self.module / directory / f"{name}.so").read_bytes())
+
+    def test_failed_deployment_preserves_legacy_loaders_until_retry(self):
+        with tempfile.TemporaryDirectory(dir=self.base) as temporary:
+            root = Path(temporary)
+            module = root / "module"
+            shutil.copytree(self.module, module)
+            library = root / "data/adb/yukizygisk/lib"
+            library.mkdir(parents=True)
+            legacy = [library / f"libyukilinker{abi}.so" for abi in (32, 64)]
+            for path in legacy:
+                path.write_bytes(b"old loader")
+            last_payload = module / "lib/libyukizncore.so"
+            original = last_payload.read_bytes()
+            last_payload.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+            result = subprocess.run([str(self.deploy_fixture), str(module), str(root)],
+                capture_output=True, text=True, check=True, timeout=3)
+            self.assertNotEqual(int(result.stdout), 0)
+            for path in legacy:
+                self.assertEqual(path.read_bytes(), b"old loader")
+            last_payload.write_bytes(original)
+            result = subprocess.run([str(self.deploy_fixture), str(module), str(root)],
+                capture_output=True, text=True, check=True, timeout=3)
+            self.assertEqual(int(result.stdout), 0, result.stderr)
+            for path in legacy:
+                self.assertFalse(path.exists())
 
     def test_launcher_cleans_inherited_but_rejects_explicit_loader_controls(self):
         with patch.dict(os.environ, {"LD_LIBRARY_PATH": str(self.module / "lib64")}):
