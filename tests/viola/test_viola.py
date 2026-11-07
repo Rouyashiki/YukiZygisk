@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # YukiZygisk - Production Viola verifier and signing-tool regression tests
 # License: Apache-2.0
-# Author: Anatdx
+# Author: Rouyashiki Developers
 """Run with Python, a host C compiler, GPG and tools/requirements-viola.txt.
 
 All private keys are disposable keys generated in a temporary GNUPGHOME.

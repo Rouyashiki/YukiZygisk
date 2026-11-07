@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 # YukiZygisk late-load activation state. Sourced by module boot scripts.
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 # /dev survives an Android soft reboot, but is cleared by a kernel reboot.
 LATE_LOAD_STATE_DIR="/dev/yukizygisk-late-load"

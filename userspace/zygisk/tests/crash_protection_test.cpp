@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #include "userspace/zygisk/daemon/crash_monitor.hpp"
 #include "userspace/zygisk/settings.hpp"

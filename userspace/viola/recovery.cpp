@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #include "recovery.h"
 #include "userspace/zygisk/daemon_health_client.hpp"

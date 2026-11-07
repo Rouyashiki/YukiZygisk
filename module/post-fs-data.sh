@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 MODDIR="${0%/*}"
 [ "$#" -eq 0 ] || exit 2

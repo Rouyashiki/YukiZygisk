@@ -6,7 +6,7 @@
  *
  * License: GPL-2.0-only
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #ifndef _YUKIZYGISK_HOST_MOUNT_H
 #define _YUKIZYGISK_HOST_MOUNT_H

@@ -5,6 +5,6 @@
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #include "../../shared/viola/viola.c"

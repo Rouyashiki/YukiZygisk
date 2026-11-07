@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 rm -f /data/adb/service.d/.yz_cleanup.sh
 

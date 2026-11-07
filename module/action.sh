@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 MODDIR="${0%/*}"
 LOG_FILE="/data/adb/yukizygisk/zygiskd.log"

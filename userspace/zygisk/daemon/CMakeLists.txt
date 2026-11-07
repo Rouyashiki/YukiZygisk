@@ -4,7 +4,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
   set(ZYGISKD_TARGET zygiskd64)

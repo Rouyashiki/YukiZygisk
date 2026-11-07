@@ -4,7 +4,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 add_executable(yzctl
   ${PROJECT_SOURCE_DIR}/userspace/common/cxx_slim.cpp

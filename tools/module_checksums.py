@@ -3,7 +3,7 @@
 #
 # YukiZygisk - Installation package SHA-256 integrity metadata.
 # License: Apache-2.0
-# Author: Anatdx
+# Author: Rouyashiki Developers
 """Generate corruption checks for a final module directory, without signing it."""
 
 import argparse

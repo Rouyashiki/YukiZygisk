@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # YukiZygisk - Compile actual kernel execution predicates with boundary mocks.
 # License: Apache-2.0
-# Author: Anatdx
+# Author: Rouyashiki Developers
 import os
 from pathlib import Path
 import subprocess

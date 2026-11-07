@@ -6,7 +6,7 @@
  *
  * License: GPL-2.0-only
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 
 #include <linux/cred.h>

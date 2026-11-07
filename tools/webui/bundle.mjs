@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 
 import { build } from 'esbuild';
@@ -40,7 +40,7 @@ for (const element of svg.svg) {
   if (element.symbol) element[':@']['@_id'] = `yz-icon-${element[':@']['@_id']}`;
 }
 
-const notice = '/* YukiZygisk WebUI. Derived from KOWX712/ksu-webui-demo and Kagami. Authors: KOWX712 and Anatdx. */';
+const notice = '/* YukiZygisk WebUI. Derived from KOWX712/ksu-webui-demo and Kagami. Authors: KOWX712 and Rouyashiki Developers. */';
 const result = await build({
   absWorkingDir: source,
   entryPoints: ['index.js', 'styles.css'],

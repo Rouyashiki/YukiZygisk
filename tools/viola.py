@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # YukiZygisk - Viola public trust preparation and signed core packaging
 # License: Apache-2.0
-# Author: Anatdx
+# Author: Rouyashiki Developers
 """Build-time tooling. Never exports private keys; official signing is explicit."""
 import argparse
 import base64
@@ -335,7 +335,7 @@ def generated_header(context):
              " * YukiZygisk - Generated public Viola build configuration", " *",
              " * License: Author's work under Apache-2.0; when used as a kernel module",
              " * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.",
-             " *", " * Author: Anatdx", " */",
+             " *", " * Author: Rouyashiki Developers", " */",
              "#ifndef YUKIZYGISK_VIOLA_BUILD_H", "#define YUKIZYGISK_VIOLA_BUILD_H"]
     for macro, key in [("RELEASE_ID", "release_id"), ("TRUST_ID", "trust_id"),
                        ("PUBLIC_KEY", "public_key"), ("PRIMARY_PUBLIC_KEY", "primary_public_key"),
@@ -567,7 +567,7 @@ def loader(args):
             " * YukiZygisk - Generated public Viola loader identity\n *\n"
             " * License: Author's work under Apache-2.0; when used as a kernel module\n"
             " * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.\n"
-            " *\n * Author: Anatdx\n */\n"
+            " *\n * Author: Rouyashiki Developers\n */\n"
             "#ifndef YUKIZYGISK_VIOLA_LOADER_H\n#define YUKIZYGISK_VIOLA_LOADER_H\n"
             f"#define VIOLA_LOADER_SHA512_BYTES {initializer(digest)}\n"
             f'#define VIOLA_LOADER_SHA512_HEX "{digest.hex()}"\n#endif\n')

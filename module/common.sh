@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 yz_detect_kmi() {
 	yz_release="${1:-$(uname -r 2>/dev/null)}"

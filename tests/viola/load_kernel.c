@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #define syscall fixture_syscall
 #define main viola_program_main

@@ -6,7 +6,7 @@
  *
  * License: MIT
  *
- * Authors: KOWX712 and Anatdx
+ * Authors: KOWX712 and Rouyashiki Developers
  */
 
 let callbackCounter = 0;

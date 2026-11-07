@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #include "module_loader.h"
 #include "third_party/lkmloader/src/loader.hpp"

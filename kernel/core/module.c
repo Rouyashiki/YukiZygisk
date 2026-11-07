@@ -5,7 +5,7 @@
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 
 #include <linux/init.h>
@@ -300,5 +300,5 @@ module_init(yukizygisk_init);
 module_exit(yukizygisk_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Anatdx");
+MODULE_AUTHOR("Rouyashiki Developers");
 MODULE_DESCRIPTION("Standalone YukiZygisk kernel LKM");

@@ -6,7 +6,7 @@
  *
  * License: GPL-2.0-only
  *
- * Author: KernelSU contributors, Linux kernel contributors and Anatdx
+ * Author: KernelSU contributors, Linux kernel contributors and Rouyashiki Developers
  */
 
 #include <linux/err.h>

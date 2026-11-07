@@ -3,7 +3,7 @@
  * YukiZygisk - Material WebUI and asynchronous runtime controls.
  * Derived from KOWX712/ksu-webui-demo and Kagami's static WebUI.
  * License: MIT
- * Authors: KOWX712 and Anatdx
+ * Authors: KOWX712 and Rouyashiki Developers
  */
 import "./assets/material.js";
 import { DEFAULT_CONFIG, DEFAULT_STATUS, PATHS, api, getRuntimeMode } from "./api.js";
@@ -37,7 +37,7 @@ const state = {
   status: { ...DEFAULT_STATUS },
   config: { ...DEFAULT_CONFIG },
   system: { model: "\u2014", android: "\u2014", kernel: "\u2014", selinux: "\u2014" },
-  meta: { name: "YukiZygisk", version: "dev", author: "Anatdx" },
+  meta: { name: "YukiZygisk", version: "dev", author: "Rouyashiki Developers" },
   statusReady: false,
   configReady: false,
   configError: "",

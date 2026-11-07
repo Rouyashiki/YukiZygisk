@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 MODULE_DIR="/data/adb/modules/yukizygisk"
 UPDATE_DIR="/data/adb/modules_update/yukizygisk"

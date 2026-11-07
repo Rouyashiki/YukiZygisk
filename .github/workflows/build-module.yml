@@ -4,7 +4,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 name: Build YukiZygisk module
 
@@ -378,7 +378,7 @@ jobs:
       queue: max
       cancel-in-progress: false
     env:
-      UPDATE_URL: https://ci.yukizygisk.anatdx.com/update.json
+      UPDATE_URL: https://yukizygiskupdates.rouyashiki.org/update.json
       UPDATE_USER_AGENT: YukiZygisk-CI/1.0 (+${{ github.server_url }}/${{ github.repository }})
       VERSION: ${{ needs.release.outputs.version }}
       VERSION_CODE: ${{ needs.release.outputs.version_code }}

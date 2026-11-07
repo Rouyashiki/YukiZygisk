@@ -5,10 +5,10 @@
 # Adapted from RikkaApps/Riru-ModuleTemplate, template/magisk_module/verify.sh
 # at 98a1203492fe56258fa15e06d5239333f3b342d0.
 # Copyright (c) 2020 Rikka
-# Copyright (c) 2026 Anatdx
+# Copyright (c) 2026 Rouyashiki <https://rouyashiki.org> and contributors
 # License: MIT (full terms are retained in the source copy at
 # module/LICENSE-ModuleTemplate; generated packages do not carry legal files).
-# Author: Rikka and Anatdx
+# Author: Rikka and Rouyashiki Developers
 
 abort_verify() {
 	ui_print "! $1"

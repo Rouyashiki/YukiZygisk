@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 """Run real module scripts with stub Android commands and host flock in a temp tree."""
 

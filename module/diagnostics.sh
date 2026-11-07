@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 YZ_STATE_DIR="${YZ_STATE_DIR:-/data/adb/yukizygisk}"
 YZ_DIAGNOSTICS_DIR="$YZ_STATE_DIR/diagnostics"

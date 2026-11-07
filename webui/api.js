@@ -3,7 +3,7 @@
  * YukiZygisk - WebUI control and telemetry adapter.
  * Derived from KOWX712/ksu-webui-demo and Kagami's static WebUI.
  * License: MIT
- * Authors: KOWX712 and Anatdx
+ * Authors: KOWX712 and Rouyashiki Developers
  */
 
 import { exec, hasKernelSU } from "./assets/kernelsu.js";
@@ -112,7 +112,7 @@ function parseModuleProp(text) {
     name: "YukiZygisk",
     version: "dev",
     versionCode: "",
-    author: "Anatdx",
+    author: "Rouyashiki Developers",
     description: "",
   };
   for (const line of String(text || "").split(/\r?\n/)) {
@@ -210,9 +210,9 @@ const mockApi = {
     return {
       id: "yukizygisk",
       name: "YukiZygisk",
-      version: "v0.3.0-10075",
+      version: "v0.4.0-10075",
       versionCode: "10075",
-      author: "Anatdx",
+      author: "Rouyashiki Developers",
     };
   },
 };

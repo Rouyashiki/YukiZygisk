@@ -4,7 +4,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 cmake_minimum_required(VERSION 3.24)
 project(zygisk_core VERSION 1.0.0 LANGUAGES C CXX ASM)

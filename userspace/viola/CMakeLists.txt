@@ -2,7 +2,7 @@
 #
 # YukiZygisk - Viola verifier and launcher.
 # License: Apache-2.0
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 set(VIOLA_SHARED "${CMAKE_SOURCE_DIR}/shared/viola")
 add_library(viola_crypto STATIC

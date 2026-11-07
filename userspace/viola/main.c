@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #define _GNU_SOURCE
 #include "kernel/uapi/viola.h"

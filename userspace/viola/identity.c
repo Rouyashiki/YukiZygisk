@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #include "viola_identity.h"
 VIOLA_EMBED_IDENTITY(VIOLA_IMAGE_ROLE, VIOLA_IMAGE_ABI, 0);

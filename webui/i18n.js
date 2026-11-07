@@ -3,7 +3,7 @@
  * YukiZygisk - WebUI translations.
  * Derived from Kagami's static WebUI localization structure.
  * License: MIT
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 
 export const LANGUAGE_OPTIONS = [
@@ -157,7 +157,7 @@ export const translations = {
     "about.dependencies": "Dependencies",
     "about.project": "Project",
     "about.credits": "Thanks",
-    "about.creditsBody": "Created by Anatdx. Thanks to KernelSU and the MIT-licensed KOWX712/ksu-webui-demo WebUI bridge.",
+    "about.creditsBody": "Created by Rouyashiki Developers. Thanks to KernelSU and the MIT-licensed KOWX712/ksu-webui-demo WebUI bridge.",
   },
   "zh-CN": {
     "app.subtitle": "内核级 Zygisk",
@@ -299,6 +299,6 @@ export const translations = {
     "about.dependencies": "依赖",
     "about.project": "项目",
     "about.credits": "感谢名单",
-    "about.creditsBody": "项目由 Anatdx 创建。感谢 KernelSU，以及基于 MIT 许可的 KOWX712/ksu-webui-demo WebUI 桥接实现。",
+    "about.creditsBody": "项目由 Rouyashiki Developers 创建。感谢 KernelSU，以及基于 MIT 许可的 KOWX712/ksu-webui-demo WebUI 桥接实现。",
   },
 };

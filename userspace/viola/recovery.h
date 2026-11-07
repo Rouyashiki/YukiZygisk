@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #ifndef YUKIZYGISK_VIOLA_RECOVERY_H
 #define YUKIZYGISK_VIOLA_RECOVERY_H

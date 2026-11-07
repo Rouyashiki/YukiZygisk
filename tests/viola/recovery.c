@@ -4,7 +4,7 @@
  *
  * License: Apache-2.0
  *
- * Author: Anatdx
+ * Author: Rouyashiki Developers
  */
 #define ioctl fixture_ioctl
 #define clock_gettime fixture_clock_gettime

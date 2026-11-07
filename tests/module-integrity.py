@@ -5,7 +5,7 @@
 #
 # License: Apache-2.0
 #
-# Author: Anatdx
+# Author: Rouyashiki Developers
 
 """Exercise the real install hook with dash and BusyBox ash, without Android.
 

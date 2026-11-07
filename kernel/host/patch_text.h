@@ -6,7 +6,7 @@
  *
  * License: GPL-2.0-only
  *
- * Author: bmax121 and Anatdx
+ * Author: bmax121 and Rouyashiki Developers
  */
 #ifndef _YUKIZYGISK_HOST_PATCH_TEXT_H
 #define _YUKIZYGISK_HOST_PATCH_TEXT_H

@@ -6,7 +6,7 @@
  *
  * License: GPL-2.0-only
  *
- * Author: KernelSU contributors and Anatdx
+ * Author: KernelSU contributors and Rouyashiki Developers
  */
 #ifndef _YUKIZYGISK_HOST_POLICY_BASE_H
 #define _YUKIZYGISK_HOST_POLICY_BASE_H
