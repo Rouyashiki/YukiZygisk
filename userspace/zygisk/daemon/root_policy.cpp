@@ -283,24 +283,35 @@ public:
     return true;
   }
 
-  bool manager_appid(uint32_t *appid) {
+  bool registered_manager_appid(uint32_t *appid) {
     if (!initialize())
       return false;
     uint32_t uid = 0;
     if (method_ == Method::Ioctl) {
       KsuGetManagerUidCmd cmd{};
       if (ioctl(fd_, kKsuIoctlGetManagerUid, &cmd) == 0) {
-        *appid = cmd.uid % 100000U;
-        return true;
+        uid = cmd.uid;
+      } else {
+        return false;
       }
     } else {
       uint32_t result = 0;
       (void)prctl(kKsuOption, kKsuCmdGetManagerUid, &uid, 0, &result);
-      if (result == static_cast<uint32_t>(kKsuOption)) {
-        *appid = uid % 100000U;
-        return true;
-      }
+      if (result != static_cast<uint32_t>(kKsuOption))
+        return false;
     }
+    const uint32_t id = uid % 100000U;
+    if (id < 10000U || id > 19999U)
+      return false;
+    *appid = id;
+    return true;
+  }
+
+  bool manager_appid(uint32_t *appid) {
+    if (!initialize())
+      return false;
+    if (registered_manager_appid(appid))
+      return true;
 
     static const char *const paths[] = {
         "/data/user_de/0/me.weishu.kernelsu",
@@ -552,6 +563,18 @@ bool setup(int control_fd, const yz_root_status_cmd &status, bool publish_cache)
 }
 
 bool active() { return g.enabled; }
+
+bool uid_is_manager(uint32_t uid) {
+  if (g.owner != YZ_ROOT_OWNER_UAPI_KERNELSU)
+    return false;
+  const uint32_t appid = uid % 100000U;
+  if (appid < 10000U || appid > 19999U)
+    return false;
+  uint32_t manager = 0;
+  // Directory ownership is only a denylist fallback, not proof that an
+  // installed manager is the one registered with the active root backend.
+  return g.ksu.registered_manager_appid(&manager) && appid == manager;
+}
 
 bool refresh(bool force) {
   if (!g.enabled)

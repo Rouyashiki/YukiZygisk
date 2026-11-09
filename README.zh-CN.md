@@ -40,6 +40,8 @@ Late-load 不会补注入已经运行的原生服务，ZN 原生目标需要重�
 - 点击模块的**操作（Action）**按钮，查看当前状态和最近的启动日志。
 - 更新、停用或卸载 YukiZygisk，都在 root 管理器中操作，完成后重启生效。
 
+对于通过 `ZYGISK_ENABLED` 检测 Zygisk 的 KernelSU 系管理器，YukiZygisk 会在其进程完成 specialize 后设置 `ZYGISK_ENABLED=1`，通过 KernelSU 注册的管理器 UID 识别目标，不依赖包名。无需手动 `export`；此兼容不会设置全局 shell 变量，也不会改变其他模块的脚本环境。
+
 遇到问题时，请[提交 Issue](https://github.com/Rouyashiki/YukiZygisk/issues)，附上机型、Android 与内核版本、root 方案、复现步骤，以及操作按钮显示的输出。
 
 ## 许可证

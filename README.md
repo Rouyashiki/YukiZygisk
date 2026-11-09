@@ -40,6 +40,8 @@ Late-load does not inject into already running native services. ZN native target
 - Use the module's **Action** button to view its current status and recent startup logs.
 - Update, disable or uninstall YukiZygisk through your root manager, then reboot to apply the change.
 
+KernelSU-family managers that check `ZYGISK_ENABLED` receive `ZYGISK_ENABLED=1` in their own process after YukiZygisk specializes it. The manager is identified through KernelSU's registered manager UID, not its package name. No manual `export` is needed; this does not set a global shell variable or change other modules' script environments.
+
 If something goes wrong, [open an issue](https://github.com/Rouyashiki/YukiZygisk/issues) with your device model, Android and kernel versions, root implementation, steps to reproduce and the output from the Action button.
 
 ## License

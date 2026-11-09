@@ -12,6 +12,9 @@
 
 namespace zygiskd {
 
+// Internal GetProcessFlags bit; never expose it through the module API.
+inline constexpr uint32_t kProcessIsManager = 1u << 31;
+
 /* One-byte request protocol. */
 enum class Request : uint8_t {
   GetProcessFlags = 1,

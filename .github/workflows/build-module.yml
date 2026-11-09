@@ -181,6 +181,7 @@ jobs:
           ./tests/module-kmi.sh
           python3 tests/module-integrity.py
           python3 tests/module-late-load.py
+          python3 userspace/zygisk/tests/run_manager_environment_tests.py
 
       - name: Build daemon, control client, and runtime payloads
         run: |

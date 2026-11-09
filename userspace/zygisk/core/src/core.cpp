@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -113,6 +114,7 @@ int zd_module_dir(int id);
 int zd_connect_companion(int id);
 uint32_t zd_get_flags(int uid);
 int g_app_uid = -1; // uid of the process currently being specialized
+int g_manager_uid = -1; // manager identified before dropping privileges
 bool g_module_policy_armed = false;
 uint32_t g_monitor_zygote_pid = 0;
 uint32_t g_monitor_zygote_generation = 0;
@@ -508,7 +510,9 @@ int api_get_module_dir(void * /*impl*/) {
   return fd;
 }
 
-uint32_t api_get_flags(void * /*impl*/) { return zd_get_flags(g_app_uid); }
+uint32_t api_get_flags(void * /*impl*/) {
+  return zd_get_flags(g_app_uid) & ~zygiskd::kProcessIsManager;
+}
 
 bool RegisterModuleImpl(CoreApiTable *tbl, module_abi *abi) {
   long v = abi == nullptr ? 0 : abi->api_version;
@@ -1134,6 +1138,12 @@ void run_app_post_impl(JNIEnv *env, const zygisk::AppSpecializeArgs *args) {
   g_cur = nullptr;
   if (!yukizygisk::plt_lifecycle::dispatch_allowed())
     return;
+  // Managers check their own libc environment. A boot-script export cannot
+  // reach them. Publish only in the specialized manager child, never zygote.
+  if (g_manager_uid >= 0 && args->uid == g_manager_uid &&
+      getuid() == static_cast<uid_t>(g_manager_uid) &&
+      setenv("ZYGISK_ENABLED", "1", 1) != 0)
+    LOGE("failed to publish ZYGISK_ENABLED for manager uid=%d", g_manager_uid);
   unload_requested_modules(env);
   if (yukizygisk::plt_lifecycle::dispatch_allowed())
     yz_drop_runtime_header_pages();
@@ -1398,6 +1408,7 @@ int zygisk_inject_decision(int uid) {
   g_app_uid = uid;
   zd_load_config();
   uint32_t flags = zd_get_flags(uid);
+  g_manager_uid = (flags & zygiskd::kProcessIsManager) ? uid : -1;
   int dec = 0;
   if (flags & zygisk::PROCESS_ON_DENYLIST) {
     if (g_yz_config.denylist_mode == 1)

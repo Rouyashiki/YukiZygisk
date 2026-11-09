@@ -1563,7 +1563,7 @@ bool send_native_companion_connection(int client, uint32_t idx,
 yz_config g_yz_config = yukizygisk::config::defaults;
 
 uint32_t query_flags(uint32_t uid) {
-  uint32_t flags = 0;
+  uint32_t flags = yzpolicy::uid_is_manager(uid) ? zygiskd::kProcessIsManager : 0;
   if (g_yz_config.denylist_mode != 0 && yzhost::uid_should_umount(uid))
     flags |= 1u << 1;
   return flags;
