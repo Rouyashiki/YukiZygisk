@@ -18,6 +18,7 @@
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
+#include <linux/version.h>
 
 #include "core/bootstrap.h"
 #include "core/control.h"
@@ -93,6 +94,10 @@ static int yz_bootstrap_prctl_pre(struct kprobe *kp, struct pt_regs *regs)
 		sysregs = &copied;
 	}
 	option = sysregs->regs[0];
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+	if (yz_bootstrap_abi == YZ_PRCTL_ABI_ARM64_WRAPPER)
+		option = sysregs->orig_x0;
+#endif
 	magic = sysregs->regs[1];
 	out_fd = sysregs->regs[2];
 	if ((u32)option == YZ_PRCTL_VIOLA_OPTION &&
