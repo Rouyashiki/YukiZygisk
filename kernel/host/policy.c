@@ -27,6 +27,7 @@
 #include "ss/avtab.h"
 #include "ss/policydb.h"
 #include "ss/services.h"
+#include "policydb_cleanup.h"
 #include "ss/sidtab.h"
 #include "ss/symtab.h"
 #include "xfrm.h"
@@ -663,6 +664,8 @@ static struct selinux_policy *yz_policy_dup(struct selinux_policy *old_policy)
 	return policy;
 
 out_free_policy:
+	if (policydb_read_needs_destroy(&policy->policydb))
+		yz_call_policydb_destroy(&policy->policydb);
 	kfree(policy);
 out_free_data:
 	vfree(data);

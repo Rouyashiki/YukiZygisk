@@ -432,6 +432,7 @@ int yz_runtime_query(struct yz_runtime_record *entries, u32 capacity,
 	    YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT |
 	    YZ_RUNTIME_CAP_INJECTION_STATE | YZ_RUNTIME_CAP_EXIT_HISTORY |
 	    YZ_RUNTIME_CAP_HEALTH | YZ_RUNTIME_CAP_NATIVE_LIBC_BOOTSTRAP_V1 |
+	    YZ_RUNTIME_CAP_ZYGOTE_MODULE_OUTCOMES |
 	    (yz_endpoint_supported() ? YZ_RUNTIME_CAP_ENDPOINT_STATE : 0);
 	return 0;
 }
@@ -470,6 +471,7 @@ int yz_runtime_report(const struct yz_runtime_report_cmd *report)
 	char module_id[YZ_NATIVE_MODULE_ID_MAX];
 	u64 start_boottime;
 	u8 state;
+	u32 outcomes = 0;
 
 	if (!report || !report->pid || !report->generation ||
 	    (report->kind != YZ_RUNTIME_KIND_ZYGOTE &&
@@ -559,6 +561,21 @@ int yz_runtime_report(const struct yz_runtime_report_cmd *report)
 			spin_unlock_irqrestore(&yz_runtime_lock, irqflags);
 			return -ENOSPC;
 		}
+		if (report->kind == YZ_RUNTIME_KIND_ZYGOTE) {
+			if (module->record.pid == base->record.pid &&
+			    module->record.kind == base->record.kind &&
+			    module->record.abi == base->record.abi &&
+			    module->record.generation ==
+				base->record.generation &&
+			    module->start_boottime == base->start_boottime &&
+			    !strcmp(module->record.module_id, module_id))
+				outcomes = module->record.flags &
+					   YZ_RUNTIME_F_MODULE_OUTCOMES;
+			if (state == YZ_RUNTIME_STATE_INJECTED)
+				outcomes |= YZ_RUNTIME_F_MODULE_SUCCESS;
+			else if (state == YZ_RUNTIME_STATE_FAILED)
+				outcomes |= YZ_RUNTIME_F_MODULE_FAILURE;
+		}
 		/* Preserve failed child loads for this Zygote generation. */
 		if (report->kind == YZ_RUNTIME_KIND_ZYGOTE &&
 		    module->record.generation == base->record.generation &&
@@ -569,6 +586,8 @@ int yz_runtime_report(const struct yz_runtime_report_cmd *report)
 			state = module->record.state;
 		if (module->record.generation != base->record.generation ||
 		    module->record.state != state ||
+		    (module->record.flags & YZ_RUNTIME_F_MODULE_OUTCOMES) !=
+			outcomes ||
 		    strcmp(module->record.module_id, module_id) ||
 		    module->start_boottime != base->start_boottime) {
 			struct yz_runtime_record record = base->record;
@@ -576,7 +595,9 @@ int yz_runtime_report(const struct yz_runtime_report_cmd *report)
 			yz_copy_name(record.module_id, sizeof(record.module_id),
 				     module_id);
 			record.state = state;
-			record.flags &= ~YZ_RUNTIME_F_INJECTION_STATE_MASK;
+			record.flags &= ~(YZ_RUNTIME_F_INJECTION_STATE_MASK |
+					  YZ_RUNTIME_F_MODULE_OUTCOMES);
+			record.flags |= outcomes;
 			hash_del(&module->pid_node);
 			memset(module, 0, sizeof(*module));
 			module->record = record;

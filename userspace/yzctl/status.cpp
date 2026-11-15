@@ -768,6 +768,10 @@ bool query_status(Host &host, const StatusOptions &options,
   output += (runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT) != 0
                 ? "true"
                 : "false";
+  output += ",\"zygisk_module_outcomes\":";
+  output += (runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_OUTCOMES)
+                ? "true"
+                : "false";
   output += ",\"zygote_crashes\":" + std::to_string(runtime.zygote_crashes);
   output += ",\"safe_mode_zygote\":";
   append_json_string(&output, runtime.safe_mode_zygote.empty()
@@ -802,6 +806,13 @@ bool query_status(Host &host, const StatusOptions &options,
     append_json_string(&output, injection_state_name(runtime, record));
     output += ",\"process_state\":";
     append_json_string(&output, process_state_name(record.state));
+    if ((runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_OUTCOMES) &&
+        record.kind == YZ_RUNTIME_KIND_ZYGOTE && record.module_id[0]) {
+      output += ",\"load_success_seen\":";
+      output += (record.flags & YZ_RUNTIME_F_MODULE_SUCCESS) ? "true" : "false";
+      output += ",\"load_failure_seen\":";
+      output += (record.flags & YZ_RUNTIME_F_MODULE_FAILURE) ? "true" : "false";
+    }
     output += '}';
   }
   output += "],\"recent\":[],\"zygotes\":[";

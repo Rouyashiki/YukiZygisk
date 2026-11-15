@@ -97,7 +97,7 @@ function normalizeStatus(value = {}) {
     late_load: value.late_load === true,
     late_load_pending: value.late_load === true && value.late_load_pending === true,
   };
-  for (const key of ["recent", "zygotes", "zygote_monitor", "modules", "native_modules", "native_injections", "suspended_modules"]) {
+  for (const key of ["runtime", "recent", "zygotes", "zygote_monitor", "modules", "native_modules", "native_injections", "suspended_modules"]) {
     if (!Array.isArray(status[key]))
       status[key] = [];
   }

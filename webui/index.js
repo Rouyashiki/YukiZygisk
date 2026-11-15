@@ -6,6 +6,7 @@
  * Authors: KOWX712 and Rouyashiki Developers
  */
 import "./assets/material.js";
+import { zygiskOutcome, zygiskRecords } from "./zygisk_outcomes.js";
 import { DEFAULT_CONFIG, DEFAULT_STATUS, PATHS, api, getRuntimeMode } from "./api.js";
 import { enableEdgeToEdge, setFullScreen } from "./assets/kernelsu.js";
 import { LANGUAGE_OPTIONS, getNavigatorLanguage, translations } from "./i18n.js";
@@ -119,7 +120,7 @@ function policySourceLabel() {
   return t(keys[state.status.root_policy_source] || "common.unknown");
 }
 function stateBadge(value) {
-  const tones = { loaded: "success", injected: "success", failed: "danger", crashed: "danger", suspended: "warning" };
+  const tones = { loaded: "success", injected: "success", failed: "danger", crashed: "danger", suspended: "warning", partial: "warning", load_success: "success", load_failed: "danger", load_legacy_failure: "warning" };
   return `<span class="badge ${tones[value] || "muted"}">${escapeHtml(t(`state.${value}`, value || t("common.unknown")))}</span>`;
 }
 function processLifetime(items) {
@@ -219,7 +220,7 @@ function renderModules() {
   if (!native) {
     rows = state.status.modules.map((module, index) => {
       const id = typeof module === "string" ? module : module.id;
-      return moduleRow({ title: typeof module === "object" ? module.name || id : id, subtitle: "Zygisk API", symbol: "boxes", value: (state.status.suspended_modules || []).includes(id) ? "suspended" : "discovered", type: "zygisk", index, note: evidenceNote(id) });
+      return moduleRow({ title: typeof module === "object" ? module.name || id : id, subtitle: "Zygisk API", symbol: "boxes", value: (state.status.suspended_modules || []).includes(id) ? "suspended" : zygiskOutcome(state.status, id), type: "zygisk", index, note: evidenceNote(id) });
     });
   } else if (state.nativeView === "module") {
     rows = nativeGroups().map((group, index) => moduleRow({ title: group.id, subtitle: t("status.nativeProcessCount", "", { count: new Set(group.records.map((record) => `${record.pid}\u0000${record.process}`)).size }), symbol: "layers", value: combinedNativeState([...group.scopes, ...group.records]), type: "native", index, note: evidenceNote(group.id) }));
@@ -519,7 +520,7 @@ function openDetail(type, index, { updateHistory = true } = {}) {
     const id = typeof module === "string" ? module : module.id;
     detail.id = id;
     title = typeof module === "object" ? module.name || id : id;
-    body = `<dl class="info-list">${infoItem("ID", id)}${infoItem(t("common.abi"), state.status.abi)}</dl>${stateBadge(state.status.suspended_modules.includes(id) ? "suspended" : "discovered")}${crashEvidence(id)}`;
+    body = `<dl class="info-list">${infoItem("ID", id)}${infoItem(t("common.abi"), state.status.abi)}</dl>${stateBadge(state.status.suspended_modules.includes(id) ? "suspended" : zygiskOutcome(state.status, id))}${zygiskRecords(state.status, id).map((record) => `<p>${escapeHtml(record.abi)} · Zygote ${escapeHtml(record.pid)} · ${stateBadge(zygiskOutcome({ ...state.status, runtime: [record] }, id))}</p>`).join("")}${crashEvidence(id)}`;
   } else if (type === "native") {
     const group = nativeGroups()[index];
     if (!group) return;
