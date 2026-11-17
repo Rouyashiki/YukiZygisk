@@ -121,7 +121,7 @@ bool yz_valid_kernel_addr(unsigned long addr)
 static int yz_find_kernel_symbol_exact_cb(void *data, unsigned long addr)
 {
 	*(unsigned long *)data = addr;
-	return 0;
+	return 1;
 }
 
 static unsigned long yz_lookup_via_kprobe(const char *name)
