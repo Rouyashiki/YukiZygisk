@@ -29,6 +29,7 @@
 #include <linux/vmalloc.h>
 
 #include "core/auth.h"
+#include "feature/fixed_policy.h"
 #include "core/bootstrap.h"
 #include "core/control.h"
 #include "core/patch_transaction.h"
@@ -629,6 +630,24 @@ static long yukizygisk_ioctl_dispatch(struct file *file,
 		return yz_ioctl_set_policy_cache(uarg);
 	case YZ_IOCTL_GET_ZYGOTE_VARIANTS:
 		return yz_ioctl_get_zygote_variants(uarg);
+	case YZ_IOCTL_GET_FIXED_POLICY: {
+		struct yz_fixed_policy_status status;
+
+		yz_fixed_policy_status(&status);
+		return copy_to_user(uarg, &status, sizeof(status)) ? -EFAULT
+								   : 0;
+	}
+	case YZ_IOCTL_VALIDATE_FIXED_POLICY: {
+		struct yz_fixed_policy_config *config;
+		int ret;
+
+		config = memdup_user(uarg, sizeof(*config));
+		if (IS_ERR(config))
+			return PTR_ERR(config);
+		ret = yz_fixed_policy_validate(config);
+		kfree(config);
+		return ret;
+	}
 	case YZ_IOCTL_PREPARE_RUNTIME_POLICY:
 		return yz_host_prepare_runtime_policy();
 	case YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY:

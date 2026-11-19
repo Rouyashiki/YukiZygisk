@@ -578,6 +578,11 @@ struct yz_runtime_report_cmd {
 #define YZ_IOCTL_REPORT_RUNTIME _IOC(_IOC_WRITE, YZ_IOCTL_MAGIC, 69, 0)
 #define YZ_IOCTL_DAEMON_READY _IOC(_IOC_NONE, YZ_IOCTL_MAGIC, 70, 0)
 
+#include "fixed_policy.h"
+#define YZ_IOCTL_GET_FIXED_POLICY _IOC(_IOC_READ, YZ_IOCTL_MAGIC, 95, 0)
+#define YZ_IOCTL_VALIDATE_FIXED_POLICY                                         \
+	_IOW(YZ_IOCTL_MAGIC, 96, struct yz_fixed_policy_config)
+
 enum yz_memory_type {
 	/* Zero preserves anonymous loading with older daemons. */
 	YZ_MEMORY_ANONYMOUS = 0,

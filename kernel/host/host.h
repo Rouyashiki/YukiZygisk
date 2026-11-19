@@ -66,6 +66,8 @@ int yz_host_file_load_policy_allow_execmem_current(
 int yz_host_file_load_policy_allow_execmem_cred(
 	const struct cred *cred, struct yz_file_load_policy *state);
 int yz_host_file_load_policy_restore(const struct yz_file_load_policy *state);
+bool yz_host_handles_app_mounts(void);
+bool yz_host_check_app_mounts(bool bind, bool socket_route);
 int yz_host_umount_pid(pid_t pid);
 
 #endif /* _YUKIZYGISK_HOST_H */

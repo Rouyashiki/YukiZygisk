@@ -19,9 +19,8 @@ done
 [ "$#" -eq 0 ] || exit 2
 late_load_lock || exit 1
 # This stage must never load the LKM or launch Viola: the root loader and
-# Android runtime may still be recovering. Repeating it only keeps the marker.
+# Android runtime may still be recovering.
 if [ -f "$LATE_LOAD_PENDING" ]; then
 	late_load_notice || exit 1
-	echo "late-load: activation deferred; after late-load finishes, manually soft-reboot from KernelSU"
 fi
 exit 0

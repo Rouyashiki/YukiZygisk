@@ -38,6 +38,7 @@
 .tmp_versions/
 Module.symvers
 modules.order
+/kernel/feature/policy/rules.h
 
 # Local build artifacts
 build/

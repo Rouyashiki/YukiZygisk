@@ -8,6 +8,7 @@
  */
 
 #include "host.hpp"
+#include "policy.hpp"
 #include "status.hpp"
 #include "userspace/zygisk/daemon/module_description.hpp"
 #include "userspace/zygisk/late_load.hpp"
@@ -54,6 +55,44 @@ bool option_value(int argc, char **argv, int *index, const char *name,
   return false;
 }
 
+void print_policy_reboot_notice() {
+  if (yukizygisk::fixed_policy::reboot_required())
+    puts("  SELinux: previously loaded fixed rules may still apply. "
+         "Fully reboot to clear them.");
+}
+
+int unavailable_status(bool json_output, bool deferred,
+                       const std::string &error) {
+  const std::string policy_error = yukizygisk::late_load::policy_error();
+  const bool waiting = deferred && policy_error.empty();
+  const auto &failure = deferred ? policy_error : error;
+  if (json_output) {
+    auto status = json::Value::object();
+    status["kernel_alive"] = false;
+    status["late_load"] = deferred || yukizygisk::late_load::active();
+    status["late_load_pending"] = deferred;
+    status["policy"] = yukizygisk::fixed_policy::status_json({}, false);
+    if (!policy_error.empty())
+      status["late_load_error"] = policy_error;
+    if (!waiting)
+      status["error"] = failure;
+    puts(json::dump(status).c_str());
+  } else {
+    if (!policy_error.empty())
+      printf("YukiZygisk status\n  Late-load: %s\n", policy_error.c_str());
+    if (waiting)
+      puts("YukiZygisk status\n"
+           "  Late-load: core activation deferred.\n"
+           "  After late-load finishes, manually "
+           "soft-reboot from KernelSU to activate injection.");
+    print_policy_reboot_notice();
+  }
+  if (waiting)
+    return 0;
+  fprintf(stderr, "yzctl: %s\n", failure.c_str());
+  return 1;
+}
+
 int status_command(int argc, char **argv) {
   yzctl::StatusOptions options;
   bool json = false;
@@ -82,26 +121,14 @@ int status_command(int argc, char **argv) {
   yzctl::Host host;
   std::string error;
   if (!host.open(&error)) {
-    if (errno == ENODEV && yukizygisk::late_load::activation_pending()) {
-      if (json)
-        puts("{\"kernel_alive\":false,\"late_load\":true,"
-             "\"late_load_pending\":true}");
-      else
-        puts("YukiZygisk status\n"
-             "  Late-load: core activation deferred.\n"
-             "  After late-load finishes, manually "
-             "soft-reboot from KernelSU to activate injection.");
-      return 0;
-    }
-    fprintf(stderr, "yzctl: %s\n", error.c_str());
-    return 1;
+    const bool deferred =
+        errno == ENODEV && yukizygisk::late_load::activation_pending();
+    return unavailable_status(json, deferred, error);
   }
 
   yzctl::StatusDocument status;
-  if (!yzctl::query_status(host, options, &status, &error)) {
-    fprintf(stderr, "yzctl: %s\n", error.c_str());
-    return 1;
-  }
+  if (!yzctl::query_status(host, options, &status, &error))
+    return unavailable_status(json, false, error);
 
   if (json) {
     puts(status.json.c_str());
@@ -118,8 +145,22 @@ int status_command(int argc, char **argv) {
            status.abi.c_str(), status.root_impl.c_str(),
            status.safe_mode ? "active" : "inactive", status.injected,
            status.zygotes, status.zygisk_modules, status.native_modules);
-    if (status.late_load_pending)
-      puts("  Late-load mode: please soft-reboot Android to complete injection.");
+    std::string policy_error;
+    if (status.policy_supported && status.policy.error) {
+      policy_error = yukizygisk::fixed_policy::error_message(status.policy);
+      puts(policy_error.c_str());
+      if (status.late_load_pending)
+        puts("  Late-load activation is pending until the policy error is "
+             "resolved.");
+    } else {
+      if (status.policy_supported && status.policy.missing_av)
+        puts(yukizygisk::fixed_policy::denial_message(status.policy).c_str());
+      if (status.late_load_pending && status.late_load_error.empty())
+        puts("  Late-load mode: please soft-reboot Android to complete injection.");
+    }
+    if (!status.late_load_error.empty() && status.late_load_error != policy_error)
+      printf("  Late-load: %s\n", status.late_load_error.c_str());
+    print_policy_reboot_notice();
   }
   return 0;
 }
@@ -137,7 +178,7 @@ int reload_command(int argc, bool allow_deferred = false) {
     // absent core may defer a saved configuration; a live one needs reload.
     if (allow_deferred && errno == ENODEV &&
         yukizygisk::late_load::activation_pending()) {
-      puts("YukiZygisk configuration saved; applies when late-load activates");
+      puts("Runtime configuration saved. It applies when late-load activates.");
       return 0;
     }
     fprintf(stderr, "yzctl: %s\n", error.c_str());
@@ -165,6 +206,11 @@ int ensure_daemon_command(int argc, char **argv) {
     return 1;
   }
   if (yukizygisk::late_load::activation_pending()) {
+    const auto reason = yukizygisk::late_load::policy_error();
+    if (!reason.empty()) {
+      fprintf(stderr, "%s\n", reason.c_str());
+      return 1;
+    }
     fprintf(stderr, "yzctl: late-load activation is deferred; "
                     "soft-reboot from KernelSU after late-load finishes\n");
     return 1;
@@ -189,17 +235,21 @@ int description_command(int argc, char **argv) {
     usage(stderr);
     return 2;
   }
-  const char *state = nullptr;
+  std::string state;
   if (strcmp(argv[2], "starting") == 0)
     state = "daemon⏳ kernel⏳";
-  else if (strcmp(argv[2], "startup-failed") == 0)
-    state = "startup❌ | daemon❔ kernel❔";
-  else if (strcmp(argv[2], "kernel-unavailable") == 0)
+  else if (strcmp(argv[2], "startup-failed") == 0) {
+    state = "startup❌";
+    const auto reason = yukizygisk::late_load::policy_error();
+    if (!reason.empty())
+      state += " " + reason;
+    state += " | daemon❔ kernel❔";
+  } else if (strcmp(argv[2], "kernel-unavailable") == 0)
     state = "status❌ | daemon❔ kernel❔";
   else if (strcmp(argv[2], "late-load-pending") == 0)
     state = "late-load⚠️ 请在 KernelSU 中手动软重启激活 / "
             "soft-reboot from KernelSU to activate | daemon⏳ kernel⏳";
-  if (state == nullptr || strcmp(argv[3], "--module-dir") != 0 ||
+  if (state.empty() || strcmp(argv[3], "--module-dir") != 0 ||
       argv[4][0] == '\0' || argc != 5) {
     usage(stderr);
     return 2;
@@ -212,15 +262,16 @@ int description_command(int argc, char **argv) {
 }
 
 int config_command(int argc, char **argv) {
-  constexpr char path[] = "/data/adb/yukizygisk/yzconfig.json";
+  const auto *path = yzctl::policy::kConfig;
   if (argc == 3 && strcmp(argv[2], "get") == 0) {
     json::Value root;
-    if (!yukizygisk::settings::read(path, &root)) {
+    std::string original;
+    if (!yukizygisk::settings::read(path, &root, &original)) {
       fprintf(stderr, "yzctl: configuration read failed: %s\n",
               strerror(errno));
       return 1;
     }
-    puts(json::dump(root).c_str());
+    puts(json::dump_object_members(root, original).c_str());
     return 0;
   }
   if (argc < 5 || strcmp(argv[2], "set") != 0 || argc % 2 != 1) {
@@ -230,11 +281,32 @@ int config_command(int argc, char **argv) {
     return 2;
   }
   const std::vector<std::string> pairs(argv + 3, argv + argc);
-  if (!yukizygisk::settings::update(path, pairs)) {
-    fprintf(stderr, "yzctl: configuration save failed: %s\n", strerror(errno));
+  bool policy_changed = false;
+  for (size_t i = 0; i < pairs.size(); i += 2)
+    policy_changed |= pairs[i] == "fixed_sepolicy";
+  yzctl::policy::PreparedRules rules;
+  const auto prepare = [&](const json::Value &config) {
+    return !policy_changed || rules.prepare(config);
+  };
+  const auto save = [&](const std::string &document,
+                        const std::string &original) {
+    if (!policy_changed)
+      return yukizygisk::settings::detail::write_text_atomic(path, document);
+    return rules.save(original, &document);
+  };
+  const auto apply_runtime = [](bool pending) {
+    return !pending || reload_command(2, true) == 0;
+  };
+  if (!yukizygisk::settings::update(path, pairs, save, apply_runtime,
+                                    prepare)) {
+    fprintf(stderr, "yzctl: configuration update failed: %s\n",
+            strerror(errno));
     return 1;
   }
-  return reload_command(2, true);
+  if (policy_changed)
+    puts("YukiZygisk configuration saved. A soft reboot may load new grants. "
+         "Fully reboot to switch modes or revoke old grants.");
+  return 0;
 }
 
 } // namespace
@@ -252,6 +324,29 @@ int main(int argc, char **argv) {
     return reload_command(argc);
   if (strcmp(argv[1], "description") == 0)
     return description_command(argc, argv);
+  if (strcmp(argv[1], "policy-install") == 0 && (argc == 3 || argc == 4))
+    return yzctl::policy::publish(argv[2], argc == 4 ? argv[3] : nullptr);
+  if (strcmp(argv[1], "policy-refresh") == 0 && argc == 2)
+    return yzctl::policy::publish(nullptr);
+  if (strcmp(argv[1], "policy-launch-failed") == 0 && argc == 2) {
+    if (yzctl::policy::record_launch_policy_error())
+      return 0;
+    fprintf(stderr, "yzctl: cannot record the launch policy error: %s\n",
+            strerror(errno));
+    return 1;
+  }
+  if (strcmp(argv[1], "policy-boot") == 0) {
+    if (argc != 2) {
+      usage(stderr);
+      return 2;
+    }
+    if (!yzctl::policy::prepare_boot()) {
+      fprintf(stderr, "yzctl: boot policy preparation failed: %s\n",
+              strerror(errno));
+      return 1;
+    }
+    return 0;
+  }
   if (strcmp(argv[1], "config") == 0)
     return config_command(argc, argv);
   if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||

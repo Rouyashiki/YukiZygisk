@@ -20,8 +20,8 @@ if { [ "${KSU:-}" = true ] || [ -d /data/adb/ksu ]; } &&
 	abort "! KernelSU and APatch installation state coexist; remove one before installing"
 fi
 case "${KSU:-false}:${APATCH:-false}" in
-true:false) YZ_BIN_DIR=/data/adb/ksu/bin ;;
-false:true) YZ_BIN_DIR=/data/adb/ap/bin ;;
+true:false) YZ_BIN_DIR=/data/adb/ksu/bin; YZ_PROVIDER=ksu ;;
+false:true) YZ_BIN_DIR=/data/adb/ap/bin; YZ_PROVIDER=apatch ;;
 *) abort "! Install from KernelSU/YukiSU or APatch only" ;;
 esac
 
@@ -99,8 +99,16 @@ chmod 0755 "$MODPATH/bin/zygiskd64" "$MODPATH/bin/zygiskd32" "$MODPATH/bin/yzctl
 	"$MODPATH/cleanup.sh" "$MODPATH/uninstall.sh"
 
 BASE_DIR="/data/adb/yukizygisk"
-mkdir -p "$BASE_DIR/lib"
-chmod 0755 "$BASE_DIR" "$BASE_DIR/lib"
+if [ -L "$BASE_DIR" ] || ! mkdir -p "$BASE_DIR" || [ ! -O "$BASE_DIR" ]; then
+	abort "! Unsafe module data directory"
+fi
+if [ -L "$BASE_DIR/lib" ] || ! mkdir -p "$BASE_DIR/lib" ||
+	! chmod 0755 "$BASE_DIR" "$BASE_DIR/lib"; then
+	abort "! Cannot secure the module data directory"
+fi
+
+/system/bin/env -i PATH=/system/bin:/system/xbin "$MODPATH/bin/yzctl" policy-install "$YZ_PROVIDER" "$MODPATH" ||
+	abort "! Cannot prepare the module SELinux rules"
 
 if [ ! -f "$MODPATH/module.prop" ] || [ -L "$MODPATH/module.prop" ]; then
 	abort "! Missing regular module description"

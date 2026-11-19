@@ -13,6 +13,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/lsm_hooks.h>
+#include <linux/memfd.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/overflow.h>
@@ -34,6 +35,10 @@
 #include "ss/symtab.h"
 #include "xfrm.h"
 
+#include "feature/fixed_policy.h"
+#include <linux/magic.h>
+#include "flask.h"
+#include "host/host.h"
 #include "host/inode.h"
 #include "host/policy_base.h"
 #include "host/policy.h"
@@ -78,6 +83,9 @@ static u32 yz_sized_seqno;
 static u32 yz_sized_nel;
 static u32 yz_sized_types;
 static typeof(&unregister_blocking_lsm_notifier) yz_unregister_policy_notifier;
+static typeof(&security_compute_av_user) yz_fp_compute_fn;
+static typeof(&security_context_to_sid) yz_fp_context_fn;
+static typeof(&memfd_fcntl) yz_memfd_fcntl;
 static struct lsm_blob_sizes *yz_selinux_blob_sizes;
 static typeof(&policydb_write) yz_policydb_write;
 static typeof(&policydb_read) yz_policydb_read;
@@ -472,6 +480,7 @@ static int yz_policy_allow_all_sources(
 		.tgt_type = target_type,
 	};
 	u32 av;
+	u32 self_av;
 	u32 src_type;
 
 	cls = yz_call_symtab_search(&db->p_classes, spec->name);
@@ -481,21 +490,27 @@ static int yz_policy_allow_all_sources(
 	av = yz_policy_required_av(cls, spec->perms, spec->perm_count);
 	if (!av)
 		return spec->optional ? 0 : -ENOENT;
+	/* Do not pollute concrete daemon->daemon socket reply perms during
+	 * temporary runtime setup; domain self-socket rules compile concrete. */
+	self_av = !strcmp(spec->name, "unix_stream_socket")
+		      ? yz_policy_perm_mask(cls, "connectto")
+		      : av;
 	key.tclass = (u16)cls->value;
 
 	for (src_type = 1; src_type <= db->p_types.nprim; src_type++) {
 		const char *name = yz_policy_type_name_by_value(db, src_type);
 		struct type_datum *type;
+		u32 grant = src_type == target_type ? self_av : av;
 		int ret;
 
-		if (!name)
+		if (!name || !grant)
 			continue;
 		type = yz_call_symtab_search(&db->p_types, name);
 		if (!type || type->attribute)
 			continue;
 
 		key.src_type = src_type;
-		ret = yz_policy_apply_av(db, &key, av, true);
+		ret = yz_policy_apply_av(db, &key, grant, true);
 		if (ret)
 			return ret;
 	}
@@ -533,6 +548,10 @@ static int yz_policy_allow_named(
 	return yz_policy_apply_av(db, &key, av, true);
 }
 
+/* Written by the authenticated runtime before its policy is prepared. */
+static u32 yz_mount_daemon_sid;
+static bool yz_mount_identity_changed;
+
 int yz_host_policy_prepare_runtime_current(void)
 {
 	struct selinux_policy *policy;
@@ -544,6 +563,10 @@ int yz_host_policy_prepare_runtime_current(void)
 	size_t i;
 	int ret;
 
+	if (yz_fixed_policy_active())
+		return yz_fixed_policy_live_error(current_cred(), NULL);
+	if (!yz_fixed_policy_ready())
+		return -EACCES;
 	ret = yz_policy_base_lock();
 	if (ret)
 		return ret;
@@ -569,6 +592,10 @@ int yz_host_policy_prepare_runtime_current(void)
 		goto out_unlock;
 	}
 	target_type = target_context->type;
+	if (!yz_mount_daemon_sid)
+		WRITE_ONCE(yz_mount_daemon_sid, sid);
+	else if (yz_mount_daemon_sid != sid)
+		WRITE_ONCE(yz_mount_identity_changed, true);
 	yz_policy_copy_type_name(target_name, sizeof(target_name),
 				 &policy->policydb, target_type);
 
@@ -1144,11 +1171,15 @@ yz_policy_base_get_execmem_key(const struct cred *cred,
 	return 0;
 }
 
+static void yz_fixed_cache_invalidate(void);
+
 static int yz_policy_changed(struct notifier_block *nb, unsigned long event,
 			     void *data)
 {
-	if (event == LSM_POLICY_CHANGE)
+	if (event == LSM_POLICY_CHANGE) {
 		WRITE_ONCE(yz_sized_policy, NULL);
+		yz_fixed_cache_invalidate();
+	}
 	return NOTIFY_DONE;
 }
 
@@ -1174,11 +1205,18 @@ static YZ_LEGACY_INDIRECT_CALL void yz_policy_cache_exit(void)
 		yz_unregister_policy_notifier = NULL;
 	}
 	WRITE_ONCE(yz_sized_policy, NULL);
+	yz_fixed_cache_invalidate();
 }
 
 int yz_host_policy_init(void)
 {
 	int ret;
+
+	yz_fp_compute_fn =
+	    (void *)yz_lookup_callable_quiet("security_compute_av_user");
+	yz_fp_context_fn =
+	    (void *)yz_lookup_callable_quiet("security_context_to_sid");
+	yz_memfd_fcntl = (void *)yz_lookup_callable_quiet("memfd_fcntl");
 
 	yz_selinux_state =
 		(void *)yz_lookup_name_quiet("selinux_state");
@@ -1228,6 +1266,9 @@ void yz_host_policy_exit(void)
 	yz_policy_cache_exit();
 	yz_policy_temp_reset();
 
+	yz_fp_compute_fn = NULL;
+	yz_fp_context_fn = NULL;
+	yz_memfd_fcntl = NULL;
 	yz_selinux_state = NULL;
 	yz_selinux_blob_sizes = NULL;
 	yz_policydb_write = NULL;
@@ -1240,6 +1281,8 @@ void yz_host_policy_exit(void)
 	yz_sized_seqno = 0;
 	yz_sized_nel = 0;
 	yz_sized_types = 0;
+	yz_mount_daemon_sid = 0;
+	yz_mount_identity_changed = false;
 	yz_avtab_destroy = NULL;
 	yz_sidtab_search_entry = NULL;
 	yz_avc_ss_reset = NULL;
@@ -1247,15 +1290,24 @@ void yz_host_policy_exit(void)
 	yz_selinux_status_update_policyload = NULL;
 }
 
+static bool yz_policy_sid_has_type(struct selinux_policy *policy, u32 sid,
+				   const char *type_name)
+{
+	struct context *ctx = yz_policy_sidtab_search(policy->sidtab, sid);
+	const char *name;
+
+	if (!ctx)
+		return false;
+	name = yz_policy_type_name_by_value(&policy->policydb, ctx->type);
+	return name && !strcmp(name, type_name);
+}
+
 bool yz_host_policy_cred_has_type(const struct cred *cred,
 				  const char *type_name)
 {
 	struct selinux_policy *policy;
-	struct context *ctx;
-	struct policydb *db;
-	const char *name;
 	u32 sid;
-	bool match = false;
+	bool match;
 
 	if (!type_name || !yz_policy_base_ready())
 		return false;
@@ -1266,18 +1318,271 @@ bool yz_host_policy_cred_has_type(const struct cred *cred,
 
 	rcu_read_lock();
 	policy = rcu_dereference(yz_selinux_state->policy);
-	if (!policy)
-		goto out_unlock;
-
-	ctx = yz_policy_sidtab_search(policy->sidtab, sid);
-	if (!ctx)
-		goto out_unlock;
-
-	db = &policy->policydb;
-	name = yz_policy_type_name_by_value(db, ctx->type);
-	match = name && !strcmp(name, type_name);
-
-out_unlock:
+	match = policy && yz_policy_sid_has_type(policy, sid, type_name);
 	rcu_read_unlock();
 	return match;
 }
+
+static YZ_LEGACY_INDIRECT_CALL void
+yz_fp_compute(u32 source, u32 target, u16 cls, struct av_decision *decision)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	yz_fp_compute_fn(source, target, cls, decision);
+#else
+	yz_fp_compute_fn(yz_selinux_state, source, target, cls, decision);
+#endif
+}
+static YZ_LEGACY_INDIRECT_CALL int
+yz_fp_context_sid(const char *context, u32 len, u32 *sid, gfp_t flags)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	return yz_fp_context_fn(context, len, sid, flags);
+#else
+	return yz_fp_context_fn(yz_selinux_state, context, len, sid, flags);
+#endif
+}
+#define yz_fp_search yz_call_symtab_search
+#define yz_fp_state yz_selinux_state
+#define yz_fp_cred_sid yz_policy_cred_sid
+#define yz_fp_sidtab_search yz_policy_sidtab_search
+#define yz_fp_inode yz_selinux_inode
+static int yz_fp_has_rule(struct policydb *db, const char *source,
+			  const char *target, const char *class_name,
+			  const char *permission)
+{
+	struct type_datum *src = yz_fp_search(&db->p_types, source);
+	struct type_datum *tgt = yz_fp_search(&db->p_types, target);
+	struct class_datum *cls = yz_fp_search(&db->p_classes, class_name);
+	u32 required;
+
+	if (!src || !tgt || !cls)
+		return -ENOENT;
+	required = yz_policy_perm_mask(cls, permission);
+	return required &&
+		       (yz_policy_direct_allowed_av_locked(
+			    db, &(struct yz_policy_key){.src_type = src->value,
+							.tgt_type = tgt->value,
+							.tclass = cls->value}) &
+			required) == required
+		   ? 0
+		   : -EACCES;
+}
+
+#include "feature/policy/database.h"
+#include "feature/policy/mount_route.h"
+
+static bool yz_fixed_socket_route(struct selinux_policy *policy, u32 daemon_sid)
+{
+	struct context *ctx;
+
+	if (!daemon_sid || READ_ONCE(yz_mount_identity_changed) ||
+	    READ_ONCE(yz_mount_daemon_sid) != daemon_sid)
+		return false;
+	ctx = yz_policy_sidtab_search(policy->sidtab, daemon_sid);
+	return ctx && yz_mount_host_allows_app_connect(&policy->policydb,
+						       ctx->type);
+}
+
+static bool yz_fixed_mount_route_locked(struct selinux_policy *policy,
+					u32 daemon_sid, bool bind)
+{
+	bool socket_route = yz_fixed_socket_route(policy, daemon_sid);
+
+	return yz_host_check_app_mounts(bind, socket_route) || socket_route;
+}
+
+static const struct yz_fixed_policy_config *yz_bound_config;
+static char yz_bound_daemon[YZ_FIXED_NAME_MAX];
+static u32 yz_bound_sid;
+static DEFINE_SPINLOCK(yz_fixed_cache_lock);
+static u64 yz_fixed_cache_epoch;
+static struct {
+	struct selinux_policy *policy;
+	u32 generation;
+	bool socket_route;
+	struct yz_fixed_policy_status rules;
+} yz_fixed_cache;
+
+static void yz_fixed_cache_invalidate(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&yz_fixed_cache_lock, flags);
+	yz_fixed_cache.policy = NULL;
+	yz_fixed_cache_epoch++;
+	spin_unlock_irqrestore(&yz_fixed_cache_lock, flags);
+}
+
+static int yz_fixed_live_error(struct selinux_policy *policy,
+			       const struct cred *cred,
+			       struct yz_fixed_policy_status *detail)
+{
+	struct yz_fixed_policy_status checked = {};
+	unsigned long flags;
+	bool socket_route;
+	u64 epoch;
+	u32 generation;
+	int ret;
+
+	if (!policy)
+		return -EAGAIN;
+	if (cred && !yz_policy_sid_has_type(policy, yz_policy_cred_sid(cred),
+					    yz_bound_daemon))
+		return -EACCES;
+	generation = READ_ONCE(policy->latest_granting);
+	spin_lock_irqsave(&yz_fixed_cache_lock, flags);
+	if (yz_fixed_cache.policy == policy &&
+	    yz_fixed_cache.generation == generation) {
+		ret = yz_fixed_cache.rules.error;
+		socket_route = yz_fixed_cache.socket_route;
+		if (detail && ret)
+			*detail = yz_fixed_cache.rules;
+		spin_unlock_irqrestore(&yz_fixed_cache_lock, flags);
+		goto route;
+	}
+	epoch = yz_fixed_cache_epoch;
+	spin_unlock_irqrestore(&yz_fixed_cache_lock, flags);
+
+	ret = -EACCES;
+	if (yz_policy_sid_has_type(policy, yz_bound_sid, yz_bound_daemon))
+		ret = yz_fixed_verify_rules(&policy->policydb, yz_bound_config,
+					    yz_bound_daemon, &checked);
+	socket_route =
+	    !ret &&
+	    (yz_unregister_policy_notifier || !yz_host_handles_app_mounts()) &&
+	    yz_fixed_socket_route(policy, yz_bound_sid);
+	checked.error = ret;
+	if (detail && ret)
+		*detail = checked;
+
+	/* Older hosts replace policies without advancing latest_granting.
+	 * An AVC reset also invalidates checks begun before the notification. */
+	spin_lock_irqsave(&yz_fixed_cache_lock, flags);
+	if (yz_unregister_policy_notifier && epoch == yz_fixed_cache_epoch &&
+	    rcu_access_pointer(yz_selinux_state->policy) == policy) {
+		yz_fixed_cache.policy = policy;
+		yz_fixed_cache.generation = generation;
+		yz_fixed_cache.socket_route = socket_route;
+		yz_fixed_cache.rules = checked;
+	}
+	spin_unlock_irqrestore(&yz_fixed_cache_lock, flags);
+route:
+	if (!ret && !yz_host_handles_app_mounts() &&
+	    (!socket_route || READ_ONCE(yz_mount_identity_changed)))
+		ret = -ENETUNREACH;
+	return ret;
+}
+
+int yz_fixed_policy_live_error(const struct cred *cred,
+			       struct yz_fixed_policy_status *detail)
+{
+	int ret;
+
+	rcu_read_lock();
+	ret = yz_fixed_live_error(rcu_dereference(yz_selinux_state->policy),
+				  cred, detail);
+	rcu_read_unlock();
+	return ret;
+}
+
+static int yz_fixed_capabilities(void)
+{
+	if (!yz_fp_compute_fn || !yz_fp_context_fn || !yz_memfd_fcntl)
+		return -EOPNOTSUPP;
+	return yz_fixed_inode_layout();
+}
+
+int yz_fixed_policy_validate(const struct yz_fixed_policy_config *config)
+{
+	struct selinux_policy *policy;
+	int ret;
+
+	if (config->version != YZ_FIXED_POLICY_VERSION ||
+	    config->enabled != 1 || config->reserved ||
+	    config->count > YZ_FIXED_DOMAIN_MAX)
+		return -EINVAL;
+	ret = yz_fixed_capabilities();
+	if (ret)
+		return ret;
+	ret = yz_policy_base_lock();
+	if (ret)
+		return ret;
+	policy = rcu_dereference_protected(
+	    yz_selinux_state->policy,
+	    lockdep_is_held(&yz_selinux_state->policy_mutex));
+	if (!policy || !smp_load_acquire(&yz_selinux_state->initialized))
+		ret = -EAGAIN;
+	else if (!yz_fixed_mount_route_locked(policy, yz_mount_daemon_sid,
+					      false))
+		ret = -ENETUNREACH;
+	else
+		ret = yz_fixed_verify_rules(&policy->policydb, config, NULL,
+					    NULL);
+	yz_policy_base_unlock();
+	return ret;
+}
+
+int yz_fixed_policy_verify(const struct yz_fixed_policy_config *config,
+			   const struct cred *cred,
+			   struct yz_fixed_policy_status *detail)
+{
+	char bound_name[YZ_FIXED_NAME_MAX];
+	struct selinux_policy *policy;
+	const char *daemon_name;
+	struct context *context;
+	u32 sid;
+	int ret;
+
+	ret = yz_fixed_capabilities();
+	if (ret)
+		return ret;
+	ret = yz_policy_base_lock();
+	if (ret)
+		return ret;
+	if (!smp_load_acquire(&yz_selinux_state->initialized)) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	policy = rcu_dereference_protected(yz_selinux_state->policy,
+		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	if (!policy) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	sid = yz_policy_cred_sid(cred);
+	context = yz_policy_sidtab_search(policy->sidtab, sid);
+	if (!context) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	daemon_name =
+	    yz_policy_type_name_by_value(&policy->policydb, context->type);
+	if (!daemon_name) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	if (strscpy(bound_name, daemon_name, sizeof(bound_name)) < 0) {
+		ret = -ENAMETOOLONG;
+		goto unlock;
+	}
+	ret = yz_fixed_verify_rules(&policy->policydb, config, bound_name,
+				    detail);
+	if (ret)
+		goto unlock;
+	if (!yz_mount_daemon_sid)
+		WRITE_ONCE(yz_mount_daemon_sid, sid);
+	else if (yz_mount_daemon_sid != sid)
+		WRITE_ONCE(yz_mount_identity_changed, true);
+	if (!yz_fixed_mount_route_locked(policy, sid, true)) {
+		ret = -ENETUNREACH;
+		goto unlock;
+	}
+	strscpy(yz_bound_daemon, bound_name, sizeof(yz_bound_daemon));
+	yz_bound_config = config;
+	yz_bound_sid = sid;
+unlock:
+	yz_policy_base_unlock();
+	return ret;
+}
+
+#include "feature/policy/access.h"

@@ -48,7 +48,7 @@ static YZ_LEGACY_INDIRECT_CALL int yz_btf_field(const char *structure,
 	if (IS_ERR_OR_NULL(btf)) {
 		pr_err("BTF: vmlinux metadata unavailable (%ld)\n",
 		       btf ? PTR_ERR(btf) : -ENOENT);
-		return btf ? PTR_ERR(btf) : -ENOENT;
+		return PTR_ERR_OR_ZERO(btf) ?: -ENOENT;
 	}
 
 	pr_info("BTF: looking up struct %s\n", structure);
@@ -160,6 +160,43 @@ int yz_selinux_inode_init(const struct lsm_blob_sizes *blob_sizes)
 fail:
 	pr_err("yukizygisk: SELinux inode layout unavailable (%d)\n", ret);
 	return ret;
+}
+
+#if defined(CONFIG_DEBUG_INFO_BTF)
+#define YZ_BTF_CALL YZ_LEGACY_INDIRECT_CALL
+#include "feature/policy/inode_layout.h"
+#undef YZ_BTF_CALL
+#endif
+
+YZ_LEGACY_INDIRECT_CALL int yz_fixed_inode_layout(void)
+{
+#if defined(CONFIG_DEBUG_INFO_BTF)
+	typeof(&bpf_get_btf_vmlinux) get =
+	    (void *)yz_lookup_callable_quiet("bpf_get_btf_vmlinux");
+	typeof(&btf_find_by_name_kind) find =
+	    (void *)yz_lookup_callable_quiet("btf_find_by_name_kind");
+	typeof(&btf_type_by_id) by_id =
+	    (void *)yz_lookup_callable_quiet("btf_type_by_id");
+	typeof(&btf_name_by_offset) name =
+	    (void *)yz_lookup_callable_quiet("btf_name_by_offset");
+	typeof(&btf_type_skip_modifiers) resolve =
+	    (void *)yz_lookup_callable_quiet("btf_type_skip_modifiers");
+	const struct btf *btf;
+	s32 id;
+
+	if (!get || !find || !by_id || !name || !resolve)
+		return -EOPNOTSUPP;
+
+	btf = get();
+	if (IS_ERR_OR_NULL(btf))
+		return -EOPNOTSUPP;
+	id = find(btf, "inode_security_struct", BTF_KIND_STRUCT);
+	if (id < 0 || !yz_fixed_inode_btf(btf, by_id(btf, id), name, resolve))
+		return -EOPNOTSUPP;
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
 struct inode_security_struct *yz_selinux_inode(const struct inode *inode)

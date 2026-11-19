@@ -9,9 +9,11 @@
 #pragma once
 
 #include "uapi/yukizygisk.h"
+#include "userspace/zygisk/crash_evidence.hpp"
 
 #include <cstddef>
 #include <cstring>
+#include <string>
 #include <sys/stat.h>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -22,10 +24,15 @@ namespace yukizygisk::late_load {
 // Created by late-load.sh without starting the core; survives a soft reboot.
 inline constexpr char kStateDirectory[] = "/dev/yukizygisk-late-load";
 inline constexpr char kPendingFile[] = "/dev/yukizygisk-late-load/pending";
+inline constexpr char kPolicyErrorFile[] =
+    "/dev/yukizygisk-late-load/policy-error";
+inline constexpr char kLaunchPolicyErrorFile[] =
+    "/dev/yukizygisk-late-load/launch-policy-error";
 
 struct Status {
   bool active = false;
   bool pending = false;
+  std::string error;
 };
 
 inline bool active() {
@@ -39,6 +46,19 @@ inline bool activation_pending() {
   return active() && lstat(kPendingFile, &marker) == 0 &&
          S_ISREG(marker.st_mode) && marker.st_uid == 0 && marker.st_nlink == 1 &&
          (marker.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+inline std::string policy_error() {
+  if (!active())
+    return {};
+  std::string reason;
+  if (crash::read_bounded(kPolicyErrorFile, 4096, &reason,
+                          crash::FileSource::RootPrivate) ||
+      (activation_pending() &&
+       crash::read_bounded(kLaunchPolicyErrorFile, 4096, &reason,
+                           crash::FileSource::RootPrivate)))
+    return std::string(crash::trim(reason));
+  return {};
 }
 
 inline bool injection_pending(const char *zygote_config,
@@ -68,7 +88,7 @@ inline Status query(bool safe_mode, const yz_runtime_record *records,
   // Kernel safe mode remains latched across a userspace soft reboot, which
   // cannot complete injection while that protection is active.
   if (safe_mode)
-    return {true, false};
+    return {true, false, {}};
 
 #if defined(__ANDROID__)
   char zygote_config[PROP_VALUE_MAX]{};
@@ -77,7 +97,8 @@ inline Status query(bool safe_mode, const yz_runtime_record *records,
   constexpr char zygote_config[] = "";
 #endif
   return {true, activation_pending() ||
-                    injection_pending(zygote_config, records, count)};
+                    injection_pending(zygote_config, records, count),
+          policy_error()};
 }
 
 } // namespace yukizygisk::late_load

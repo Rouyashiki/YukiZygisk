@@ -6,6 +6,7 @@ struct inode_security_struct;
 struct lsm_blob_sizes;
 
 int yz_selinux_inode_init(const struct lsm_blob_sizes *blob_sizes);
+int yz_fixed_inode_layout(void);
 struct inode_security_struct *yz_selinux_inode(const struct inode *inode);
 
 #endif

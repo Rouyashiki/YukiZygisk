@@ -14,6 +14,7 @@
 #include <linux/string.h>
 
 #include "host/policy.h"
+#include "feature/fixed_policy.h"
 #include "host/policy_base.h"
 #include "host/policy_temp.h"
 
@@ -278,6 +279,10 @@ static int yz_host_policy_allow_file(struct file *file, const struct cred *cred,
 	char tgt_name[YZ_POLICY_TYPE_NAME_MAX];
 	int ret;
 
+	if (yz_fixed_policy_active())
+		return yz_fixed_policy_check(
+		    file, cred,
+		    tmpfs_access == YZ_POLICY_FILE_RECEIVE || include_dir);
 	if (!file || !cred || !state)
 		return -EINVAL;
 	memset(state, 0, sizeof(*state));
@@ -380,6 +385,8 @@ yz_host_policy_allow_execmem(const struct cred *cred,
 	char src_name[YZ_POLICY_TYPE_NAME_MAX];
 	int ret;
 
+	if (yz_fixed_policy_active())
+		return yz_fixed_policy_check_execmem(cred);
 	if (!cred || !state)
 		return -EINVAL;
 

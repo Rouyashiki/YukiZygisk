@@ -731,6 +731,7 @@ bool query_status(Host &host, const StatusOptions &options,
       runtime.safe_mode, runtime.records.data(), runtime.records.size());
   document->late_load = late_load.active;
   document->late_load_pending = late_load.pending;
+  document->late_load_error = late_load.error;
   document->injected = injected_base_count(runtime);
   document->zygotes = static_cast<size_t>(std::count_if(
       runtime.records.begin(), runtime.records.end(), [](const auto &record) {
@@ -741,7 +742,14 @@ bool query_status(Host &host, const StatusOptions &options,
   document->zygisk_modules = zygisk_modules.size();
   document->native_modules = native_modules.size();
 
-  std::string output = "{\"kernel_alive\":true,\"abi\":";
+  document->policy = {};
+  document->policy_supported =
+      host.call(YZ_IOCTL_GET_FIXED_POLICY, &document->policy) == 0 &&
+      document->policy.version == YZ_FIXED_POLICY_VERSION;
+  std::string output = "{\"policy\":" +
+                       json::dump(yukizygisk::fixed_policy::status_json(
+                           document->policy, document->policy_supported)) +
+                       ",\"kernel_alive\":true,\"abi\":";
   append_json_string(&output, document->abi);
   output += ",\"generation\":" + std::to_string(runtime.generation);
   output += ",\"root_impl\":";
@@ -764,6 +772,10 @@ bool query_status(Host &host, const StatusOptions &options,
   output += document->late_load ? "true" : "false";
   output += ",\"late_load_pending\":";
   output += document->late_load_pending ? "true" : "false";
+  if (!document->late_load_error.empty()) {
+    output += ",\"late_load_error\":";
+    append_json_string(&output, document->late_load_error);
+  }
   output += ",\"zygisk_module_monitor\":";
   output += (runtime.capabilities & YZ_RUNTIME_CAP_ZYGOTE_MODULE_REPORT) != 0
                 ? "true"

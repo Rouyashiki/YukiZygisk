@@ -43,6 +43,7 @@
 #include <viola_loader.h>
 #include "feature/api.h"
 #include "core/auth.h"
+#include "feature/fixed_policy.h"
 #include "core/control.h"
 #include "host/runtime.h"
 #include "uapi/viola.h"
@@ -639,7 +640,8 @@ static bool yz_auth_is_owner(const struct yz_auth_session *s, bool check_mm)
 
 static bool yz_auth_query_request(unsigned int request)
 {
-	return request == YZ_IOCTL_GET_SAFEMODE ||
+	return request == YZ_IOCTL_GET_FIXED_POLICY ||
+	       request == YZ_IOCTL_GET_SAFEMODE ||
 	       request == YZ_IOCTL_GET_ROOT_STATUS ||
 	       request == YZ_IOCTL_GET_RUNTIME ||
 	       request == YZ_IOCTL_GET_EXIT_HISTORY_FD ||
@@ -667,7 +669,9 @@ int yz_auth_begin(struct yz_auth_session *s, unsigned int request,
 		goto fail;
 	if (yz_auth_query_request(request))
 		return 0;
-	if (s->role == YZ_VIOLA_ADMIN && request == YZ_IOCTL_RELOAD)
+	if (s->role == YZ_VIOLA_ADMIN &&
+	    (request == YZ_IOCTL_RELOAD ||
+	     request == YZ_IOCTL_VALIDATE_FIXED_POLICY))
 		return 0;
 	if (s->role != YZ_VIOLA_DAEMON64 && s->role != YZ_VIOLA_DAEMON32)
 		goto fail;
@@ -851,9 +855,12 @@ static int yz_auth_catalog_install(void __user *arg)
 		    memcmp(yz_auth_manifest, data, view.size))
 			ret = -EKEYREJECTED;
 	} else if (!ret) {
-		yz_auth_catalog = view;
-		smp_store_release(&yz_auth_manifest, data);
-		data = NULL;
+		ret = yz_fixed_policy_latch();
+		if (!ret) {
+			yz_auth_catalog = view;
+			smp_store_release(&yz_auth_manifest, data);
+			data = NULL;
+		}
 	}
 	kfree(data);
 	return ret;
@@ -905,6 +912,12 @@ static int yz_auth_claim(struct yz_auth_session *s)
 		if (s->role == YZ_VIOLA_DELEGATED32 &&
 		    yz_auth_check_mappings(exe, true))
 			goto out;
+		if (s->role != YZ_VIOLA_DELEGATED32) {
+			ret = yz_fixed_policy_bind_daemon(
+			    current_cred(), s->role == YZ_VIOLA_ARMED64);
+			if (ret)
+				goto out;
+		}
 		old_mm = s->mm;
 		mmgrab(current->mm);
 		WRITE_ONCE(s->mm, current->mm);
@@ -1280,7 +1293,7 @@ bool yz_auth_injection_allowed(bool early_native, bool compat)
 	struct yz_auth_session *s;
 	bool allowed = false;
 
-	if (!yz_auth_catalog_ready())
+	if (!yz_auth_catalog_ready() || !yz_fixed_policy_ready())
 		return false;
 	if (early_native)
 		return true;
@@ -1298,7 +1311,7 @@ bool yz_auth_injection_ticket(bool early_native, bool compat,
 	struct yz_auth_session *s;
 	bool allowed = false;
 
-	if (!yz_auth_catalog_ready())
+	if (!yz_auth_catalog_ready() || !yz_fixed_policy_ready())
 		return false;
 	ticket->epoch = yz_auth_epoch;
 	ticket->generation = 0;
@@ -1319,7 +1332,8 @@ bool yz_auth_injection_ticket_alive(const struct yz_auth_ticket *ticket)
 	struct yz_auth_session *s;
 	bool alive = false;
 
-	if (!yz_auth_catalog_ready() || ticket->epoch != yz_auth_epoch)
+	if (!yz_auth_catalog_ready() || ticket->epoch != yz_auth_epoch ||
+	    !yz_fixed_policy_ready())
 		return false;
 	if (!ticket->generation)
 		return true; /* Independently authenticated early-native image path. */

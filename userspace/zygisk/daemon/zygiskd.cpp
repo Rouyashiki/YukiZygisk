@@ -2252,6 +2252,14 @@ void handle_client(int client) {
             g_modules[idx].name.c_str(), cr.pid, ret, policy_errno,
             strerror(policy_errno));
       if (!policy_armed) {
+        yz_fixed_policy_status policy{};
+        if (policy_errno == EACCES &&
+            yzhost::ctl(YZ_IOCTL_GET_FIXED_POLICY, &policy) == 0 &&
+            policy.active)
+          DLOGE("getModuleDir: fixed SELinux policy denied the directory for "
+                "module=%s pid=%d; check module labels or select temporary "
+                "mode and perform a full reboot",
+                g_modules[idx].name.c_str(), cr.pid);
         close(fd);
         fd = -1;
       }

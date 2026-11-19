@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
@@ -25,6 +26,7 @@
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 
+#include "host/host.h"
 #include "host/root_impl.h"
 #include "host/runtime.h"
 #include "uapi/yukizygisk.h"
@@ -785,6 +787,77 @@ YZ_INDIRECT_CALL int yz_host_uid_should_umount(uid_t uid,
 	}
 }
 
+static unsigned long yz_umount_switch;
+static struct module *yz_umount_owner;
+
+bool yz_host_handles_app_mounts(void)
+{
+	unsigned long addr;
+	u8 value;
+	bool enabled;
+
+	rcu_read_lock();
+	addr = smp_load_acquire(&yz_umount_switch);
+	enabled = addr && yz_kernel_read_nofault(&value, addr, sizeof(value)) &&
+		  value == 1;
+	rcu_read_unlock();
+	return enabled;
+}
+
+/* Called under policy_mutex. Only a bound policy retains a host LKM reference.
+ */
+YZ_LEGACY_INDIRECT_CALL bool yz_host_check_app_mounts(bool bind,
+						      bool socket_route)
+{
+	typeof(&__module_address) module_at;
+	struct module *owner = NULL;
+	unsigned long addr, handler, data, end, text, etext;
+	bool readable, enabled;
+	u8 value;
+
+	if (READ_ONCE(yz_umount_switch))
+		return yz_host_handles_app_mounts();
+	if (READ_ONCE(yz_root_owner) != YZ_ROOT_OWNER_KERNELSU)
+		return false;
+	handler = yz_lookup_callable_quiet("ksu_handle_umount");
+	addr = yz_lookup_name_quiet("ksu_kernel_umount_enabled");
+	if (!yz_valid_kernel_addr(handler) || !yz_valid_kernel_addr(addr))
+		return false;
+	data = yz_lookup_name_quiet("_sdata");
+	end = yz_lookup_name_quiet("_end");
+	text = yz_lookup_name_quiet("_stext");
+	etext = yz_lookup_name_quiet("_etext");
+	if (!(data && data <= addr && addr < end && text && text <= handler &&
+	      handler < etext)) {
+		module_at =
+		    (void *)yz_lookup_callable_quiet("__module_address");
+		if (!module_at)
+			return false;
+		preempt_disable();
+		owner = module_at(addr);
+		if (!owner || module_at(handler) != owner ||
+		    !try_module_get(owner))
+			owner = NULL;
+		preempt_enable();
+		if (!owner)
+			return false;
+		if (yz_lookup_name_quiet("ksu_kernel_umount_enabled") != addr ||
+		    yz_lookup_callable_quiet("ksu_handle_umount") != handler) {
+			module_put(owner);
+			return false;
+		}
+	}
+	readable = yz_kernel_read_nofault(&value, addr, sizeof(value));
+	enabled = readable && value == 1;
+	if (bind && readable && (enabled || socket_route)) {
+		yz_umount_owner = owner;
+		smp_store_release(&yz_umount_switch, addr);
+	} else if (owner) {
+		module_put(owner);
+	}
+	return enabled;
+}
+
 const char *yz_host_root_name(void)
 {
 	switch (READ_ONCE(yz_root_owner)) {
@@ -816,6 +889,12 @@ u32 yz_host_root_flags(void)
 
 void yz_host_root_exit(void)
 {
+	smp_store_release(&yz_umount_switch, 0UL);
+	if (yz_umount_owner) {
+		synchronize_rcu();
+		module_put(yz_umount_owner);
+		yz_umount_owner = NULL;
+	}
 	yz_root_policy_allowed = false;
 	yz_root_policy_fallback = false;
 	yz_root_owner = YZ_ROOT_OWNER_NONE;

@@ -233,7 +233,9 @@ std::string render(const yz_viola_status &viola,
   else if (zygote_failed)
     state = "zygote❌ | ";
   const auto late_load = yukizygisk::late_load::query(safe_mode, records, count);
-  if (late_load.pending)
+  if (!late_load.error.empty())
+    state += "late-load❌ 策略失败 / " + late_load.error + " | ";
+  else if (late_load.pending)
     state += "late-load⚠️ 请软重启完成注入 / soft reboot required | ";
   else if (late_load.active)
     state += "late-load | ";

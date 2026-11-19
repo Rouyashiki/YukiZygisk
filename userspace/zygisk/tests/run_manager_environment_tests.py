@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='yz-manager-env-') as temporary:
     # modules. Only Android hooks and the root driver's syscalls are stubbed.
     (build / 'manager_functions.inc').write_text('\n'.join([
         function(daemon, 'uint32_t query_flags(uint32_t uid)'),
-        'uint32_t zd_get_flags(int uid) { return query_flags(uid); }',
+        function(core, 'uint32_t zygisk_snapshot_process_flags(int uid)'),
         function(core, 'uint32_t api_get_flags(void *'),
         function(core, 'int zygisk_inject_decision(int uid)'),
         function(core, 'void run_app_post_impl(JNIEnv *env,'),

@@ -23,6 +23,7 @@
 #include "userspace/zygisk/daemon/zygiskd.hpp"
 #include "zygisk.hpp"
 
+#include "uapi/fixed_policy.h"
 #include "uapi/yukizygisk.h"
 
 #include <android/dlext.h>
@@ -38,6 +39,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/un.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -112,8 +114,7 @@ int g_loading_id = -1;       // zygiskd index of the module being loaded
 // zygiskd-backed helpers.
 int zd_module_dir(int id);
 int zd_connect_companion(int id);
-uint32_t zd_get_flags(int uid);
-int g_app_uid = -1; // uid of the process currently being specialized
+std::atomic<uint64_t> g_process_flags{0};
 int g_manager_uid = -1; // manager identified before dropping privileges
 bool g_module_policy_armed = false;
 uint32_t g_monitor_zygote_pid = 0;
@@ -511,7 +512,10 @@ int api_get_module_dir(void * /*impl*/) {
 }
 
 uint32_t api_get_flags(void * /*impl*/) {
-  return zd_get_flags(g_app_uid) & ~zygiskd::kProcessIsManager;
+  const uint64_t snapshot = g_process_flags.load(std::memory_order_acquire);
+  return (snapshot >> 32) == static_cast<uint32_t>(getpid())
+             ? static_cast<uint32_t>(snapshot)
+             : 0;
 }
 
 bool RegisterModuleImpl(CoreApiTable *tbl, module_abi *abi) {
@@ -644,31 +648,57 @@ int zd_connect_companion(int id) {
   return zd_request_fd(ZdRequest::ConnectCompanion, static_cast<uint32_t>(id));
 }
 
-uint32_t zd_get_flags(int uid) {
+bool zd_get_flags(int uid, uint32_t *flags) {
   int sock = connect_zygiskd();
   if (sock < 0)
-    return 0;
+    return false;
   auto r = static_cast<uint8_t>(ZdRequest::GetProcessFlags);
   auto u = static_cast<uint32_t>(uid);
-  if (write(sock, &r, 1) != 1 ||
-      write(sock, &u, sizeof(u)) != static_cast<ssize_t>(sizeof(u))) {
-    close(sock);
-    return 0;
-  }
-  uint32_t flags = 0;
-  read_all(sock, &flags, sizeof(flags));
+  const bool ok = write_all(sock, &r, sizeof(r)) &&
+                  write_all(sock, &u, sizeof(u)) &&
+                  read_all(sock, flags, sizeof(*flags));
   close(sock);
-  return flags;
+  return ok;
 }
 
 using module_entry_fn = void (*)(api_table *, JNIEnv *);
 constexpr char kSystemModuleName[] = "libzygiskmodule.so";
 
-/* Copy a daemon-staged image into a zygote-owned executable memfd. */
-int make_app_memfd(int src_fd) {
+/* Fixed-policy images must retain their private inode label. */
+int prepare_module_image(int src_fd) {
   struct stat st{};
   if (fstat(src_fd, &st) != 0 || st.st_size <= 0)
     return -1;
+  const ssize_t length =
+      TEMP_FAILURE_RETRY(fgetxattr(src_fd, "security.selinux", nullptr, 0));
+  if (length < 0 && errno != EOPNOTSUPP && errno != ENODATA)
+    return -1;
+  constexpr ssize_t label_length = sizeof(YZ_FIXED_FILE_CONTEXT) - 1;
+  if (length == label_length || length == label_length + 1) {
+    char context[sizeof(YZ_FIXED_FILE_CONTEXT)]{};
+    const ssize_t actual = TEMP_FAILURE_RETRY(
+        fgetxattr(src_fd, "security.selinux", context, sizeof(context)));
+    if (actual < 0)
+      return -1;
+    if (actual != length) {
+      errno = EAGAIN;
+      return -1;
+    }
+    if ((length == label_length || context[label_length] == '\0') &&
+        memcmp(context, YZ_FIXED_FILE_CONTEXT, label_length) == 0) {
+      const int flags = fcntl(src_fd, F_GETFL);
+      const int seals = fcntl(src_fd, F_GET_SEALS);
+      if (flags < 0 || seals < 0)
+        return -1;
+      constexpr int required =
+          F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL;
+      if ((flags & O_ACCMODE) != O_RDONLY || (seals & required) != required) {
+        errno = EPERM;
+        return -1;
+      }
+      return fcntl(src_fd, F_DUPFD_CLOEXEC, 0);
+    }
+  }
   size_t sz = static_cast<size_t>(st.st_size);
   void *src = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, src_fd, 0);
   if (src == MAP_FAILED)
@@ -921,7 +951,7 @@ void load_modules_impl(JNIEnv *env) {
 
     Module &m = g_modules.emplace_back();
     m.id = static_cast<int>(i);
-    int mfd = make_app_memfd(lib_fd);
+    int mfd = prepare_module_image(lib_fd);
     close(lib_fd);
     int directory = zd_module_dir(m.id);
     int libraries = directory >= 0 ? openat(directory, "zygisk",
@@ -1088,7 +1118,9 @@ void run_app_pre_impl(zygisk::AppSpecializeArgs *args) {
     LOGE("app pre-specialize barrier: errno=%d", external.error());
     return;
   }
-  g_app_uid = args->uid;
+  if ((g_process_flags.load(std::memory_order_acquire) >> 32) !=
+      static_cast<uint32_t>(getpid()))
+    zygisk_snapshot_process_flags(args->uid);
   AppSpecializeArgs_v1 v1args(args);
   for (auto &m : g_modules)
     if (m.abi != nullptr && m.abi->preAppSpecialize != nullptr) {
@@ -1106,8 +1138,10 @@ void run_app_pre_impl(zygisk::AppSpecializeArgs *args) {
 /* denylist_mode=2 mount cleanup. */
 static void yz_revert_self_mounts() {
   int s = connect_zygiskd();
-  if (s < 0)
+  if (s < 0) {
+    LOGE("revert-mount: cannot request daemon cleanup: %s", strerror(errno));
     return;
+  }
   uint8_t req = static_cast<uint8_t>(ZdRequest::RevertMount);
   uint8_t ack = 0;
   if (write(s, &req, 1) == 1 && read_all(s, &ack, 1) && ack)
@@ -1156,7 +1190,9 @@ void run_server_pre_impl(zygisk::ServerSpecializeArgs *args) {
     LOGE("server pre-specialize barrier: errno=%d", external.error());
     return;
   }
-  g_app_uid = args->uid;
+  if ((g_process_flags.load(std::memory_order_acquire) >> 32) !=
+      static_cast<uint32_t>(getpid()))
+    zygisk_snapshot_process_flags(args->uid);
   LOGI("run_server_pre: uid=%d, %zu module(s)", args->uid, g_modules.size());
   for (auto &m : g_modules) {
     LOGI("  module %d: preServer=%p postServer=%p", m.id,
@@ -1403,11 +1439,22 @@ zygisk_finalize_loader_tango(uint32_t /*got*/, uint32_t /*original*/,
   zygisk_finalize_loader(0, 0);
 }
 
+uint32_t zygisk_snapshot_process_flags(int uid) {
+  uint32_t flags = 0;
+  if (!zd_get_flags(uid, &flags)) {
+    g_process_flags.store(0, std::memory_order_release);
+    return 0;
+  }
+  const uint64_t owner = static_cast<uint32_t>(getpid());
+  g_process_flags.store((owner << 32) | (flags & ~zygiskd::kProcessIsManager),
+                        std::memory_order_release);
+  return flags;
+}
+
 /* 0=inject, 1=inject+umount, 2=skip+umount. */
 int zygisk_inject_decision(int uid) {
-  g_app_uid = uid;
   zd_load_config();
-  uint32_t flags = zd_get_flags(uid);
+  const uint32_t flags = zygisk_snapshot_process_flags(uid);
   g_manager_uid = (flags & zygiskd::kProcessIsManager) ? uid : -1;
   int dec = 0;
   if (flags & zygisk::PROCESS_ON_DENYLIST) {

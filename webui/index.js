@@ -7,6 +7,7 @@
  */
 import "./assets/material.js";
 import { zygiskOutcome, zygiskRecords } from "./zygisk_outcomes.js";
+import { configSavePhase, policyModeText, statusPresentation } from "./status.js";
 import { DEFAULT_CONFIG, DEFAULT_STATUS, PATHS, api, getRuntimeMode } from "./api.js";
 import { enableEdgeToEdge, setFullScreen } from "./assets/kernelsu.js";
 import { LANGUAGE_OPTIONS, getNavigatorLanguage, translations } from "./i18n.js";
@@ -145,15 +146,8 @@ function infoItem(label, value, code = false) {
 function metric(label, value) {
   return `<div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
 }
-function statusPresentation() {
-  if (!state.statusReady) return { tone: "", icon: "loader-circle", title: t("common.loading"), description: "" };
-  if (state.status.safe_mode) return { tone: "warning", icon: "shield-alert", title: t("status.safeMode"), description: t("status.safeModeDesc") };
-  if (state.status.late_load_pending) return { tone: "warning", icon: "circle-alert", title: t("status.lateLoad"), description: t("status.lateLoadPending") };
-  if (state.status.available && state.status.kernel_alive) return { tone: "success", icon: "shield-check", title: t("status.running"), description: state.status.abi };
-  return { tone: "danger", icon: "circle-alert", title: t("status.unavailable"), description: state.status.error || t("status.unavailableDesc") };
-}
 function renderStatus() {
-  const presentation = statusPresentation();
+  const presentation = statusPresentation(state.status, state.statusReady, t);
   const zygotes = state.status.zygote_monitor || [];
   return `${!state.statusReady ? '<div class="loading-line" role="progressbar" aria-label="Loading"></div>' : ""}
     <div class="runtime-overview ${presentation.tone}" role="status">
@@ -238,12 +232,20 @@ function switchRow(key, id, symbol, title, description) {
 function denylistControls() {
   return `<div id="denylist-mode" class="segmented connected-choice" data-config="denylist_mode" role="radiogroup" aria-labelledby="denylist-label">${["Off", "Skip", "Revert"].map((name, value) => `<button data-denylist-mode="${value}" role="radio" aria-checked="${state.config.denylist_mode === value}" aria-pressed="${state.config.denylist_mode === value}" aria-label="${escapeHtml(t(`settings.denylist${name}`))}" title="${escapeHtml(t(`settings.denylist${name}`))}" ${!state.configReady ? "disabled" : ""}><span class="segment-check">${icon("check")}</span><span class="segment-label">${escapeHtml(t(`settings.denylist${name}Short`))}</span>${ripple(!state.configReady)}</button>`).join("")}</div>`;
 }
+function updatePolicyMode() {
+  const policyMode = document.getElementById("policy-mode-state");
+  if (policyMode) policyMode.textContent = policyModeText(state, t);
+}
 function renderSettings() {
   return `<div class="config-error" id="config-error" ${!state.configError ? "hidden" : ""}><span>${escapeHtml(t("settings.loadFailed"))}</span><md-text-button data-action="retry-config">${escapeHtml(t("common.retry"))}</md-text-button></div>
     <section class="settings-group">${sectionHeader(t("settings.runtime"), '<span id="save-status" class="save-status" role="status"></span>')}
       <div class="setting-list">${switchRow("anonymous_memory", "setting-anonymous-memory", "memory-stick", t("settings.anonymousMemory"), t("settings.anonymousMemoryDesc"))}
       ${switchRow("yukilinker", "setting-yukilinker", "link", t("settings.yukilinker"), t("settings.yukilinkerDesc"))}
       ${switchRow("crash_protection", "setting-crash-protection", "shield-check", t("settings.crashProtection"), t("settings.crashProtectionDesc"))}</div>
+    </section>
+    <section class="settings-group"><h2>${escapeHtml(t("settings.fixedPolicy"))}</h2>
+      <div class="setting-list">${switchRow("fixed_sepolicy", "setting-fixed-policy", "shield-check", t("settings.fixedPolicy"), t("settings.fixedPolicyDesc"))}
+      <div class="setting-row"><div class="row-copy"><small id="policy-mode-state">${escapeHtml(policyModeText(state, t))}</small></div></div></div>
     </section>
     <section class="settings-group"><h2>${escapeHtml(t("settings.hiding"))}</h2>
       <div class="setting-list"><div class="setting-row choice-row" data-setting="denylist_mode"><span class="setting-icon">${icon("shield-alert")}</span><div class="row-copy"><strong id="denylist-label">${escapeHtml(t("settings.denylistMode"))}</strong><small id="denylist-description">${escapeHtml(t("settings.denylistDesc", "", { root: rootImplLabel() }))}</small></div><div class="choice-field">${denylistControls()}</div></div>
@@ -307,6 +309,7 @@ function updateTelemetryViews() {
   if (description) description.textContent = t("settings.denylistDesc", "", { root: rootImplLabel() });
   const owner = document.getElementById("policy-owner");
   if (owner) owner.textContent = rootImplLabel();
+  updatePolicyMode();
   document.getElementById("page-version").textContent = state.meta.version;
   restoreDetailFromHistory();
 }
@@ -317,6 +320,8 @@ function updateChrome() {
   }
 }
 function updateConfigControls() {
+  updatePolicyMode();
+
   for (const control of document.querySelectorAll("[data-config]")) {
     const key = control.dataset.config;
     control.disabled = !state.configReady;
@@ -460,16 +465,18 @@ async function flushConfig() {
   clearTimeout(saveTimer);
   if (state.saving || !pendingKeys.size) return;
   state.saving = true;
+  const savedChanges = {};
   while (pendingKeys.size) {
-    const snapshot = { ...state.config };
     const revisions = { ...fieldRevisions };
     savingKeys = new Set(pendingKeys);
+    const changes = Object.fromEntries([...savingKeys].map((key) => [key, state.config[key]]));
     pendingKeys.clear();
     updateConfigControls();
     try {
       runtimeRevision += 1;
-      confirmedConfig = { ...await api.saveConfig(snapshot) };
-      state.savePhase = state.status.late_load_pending ? "savedPending" : "saved";
+      confirmedConfig = { ...await api.saveConfig(changes) };
+      Object.assign(savedChanges, changes);
+      state.savePhase = configSavePhase(savedChanges, state.status.late_load_pending);
       for (const key of Object.keys(DEFAULT_CONFIG)) if (fieldRevisions[key] === revisions[key]) state.config[key] = confirmedConfig[key];
     } catch (error) {
       // yzctl can persist the file before runtime reload fails. Read disk before reconciling.

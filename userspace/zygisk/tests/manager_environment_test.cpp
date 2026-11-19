@@ -119,11 +119,19 @@ void zd_load_config() {}
 static std::vector<Module> g_modules; // No installed Zygisk modules.
 static std::atomic<int> g_plt_callback_tid{0};
 static Module *g_cur = nullptr;
-static int g_app_uid = -1;
+static std::atomic<uint64_t> g_process_flags{0};
 static int g_manager_uid = -1;
 static yz_config g_yz_config{};
 static uid_t specialized_uid = 0;
 static uid_t fixture_getuid() { return specialized_uid; }
+static bool flags_available = true;
+uint32_t query_flags(uint32_t uid);
+static bool zd_get_flags(int uid, uint32_t *flags) {
+  if (!flags_available)
+    return false;
+  *flags = query_flags(uid);
+  return true;
+}
 #define getuid fixture_getuid
 #define LOGE(...) ((void)0)
 #define LOGI(...) ((void)0)
@@ -134,6 +142,7 @@ static void specialize(int requested_uid, int final_uid, bool expected) {
   const pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {
+    assert(api_get_flags(nullptr) == 0); // Ignore the parent's snapshot.
     assert(zygisk_inject_decision(requested_uid) == 0);
     assert(getenv("ZYGISK_ENABLED") == nullptr);
     specialized_uid = final_uid;
@@ -173,11 +182,10 @@ int main() {
     specialize(99000, 99000, false);
     specialize(10420, 10421, false); // A module changed the target UID.
     specialize(10420, 0, false);     // Not specialized yet.
-    g_app_uid = 10420;
     g_yz_config.denylist_mode = 2;
     assert(query_flags(10420) == (zygiskd::kProcessIsManager | 2));
-    assert(api_get_flags(nullptr) == 2); // Private bit never enters the API.
     assert(zygisk_inject_decision(10420) == 1);
+    assert(api_get_flags(nullptr) == 2); // Private bit never enters the API.
     g_yz_config.denylist_mode = 1;
     assert(zygisk_inject_decision(10420) == 2);
     g_yz_config.denylist_mode = 0;
@@ -185,6 +193,11 @@ int main() {
     manager_uid = 10421; // Do not retain a stale registered manager.
     specialize(10420, 10420, false);
     specialize(10421, 10421, true);
+    flags_available = false;
+    assert(api_get_flags(nullptr) == 2); // Reads use the captured flags.
+    assert(zygisk_snapshot_process_flags(10420) == 0);
+    assert(api_get_flags(nullptr) == 0);
+    flags_available = true;
     for (uint32_t invalid : {0U, 9999U, 20000U, UINT32_MAX}) {
       manager_uid = invalid;
       assert(!yzpolicy::uid_is_manager(10420));

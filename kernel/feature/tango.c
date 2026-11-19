@@ -505,12 +505,12 @@ static int yz_tango_mprotect_impl(struct vm_area_struct *vma,
 	struct yz_tango_work *work;
 	int ret = original(vma, reqprot, prot);
 
-	if (ret || !yz_tango_active() || !current->mm ||
+	if (ret || !current->mm ||
 	    current->pid != current->tgid || !(vma->vm_flags & VM_WRITE) ||
 	    vma->vm_flags & VM_SHARED || prot != PROT_READ ||
 	    vma->vm_start > U32_MAX ||
 	    !yz_tango_leaf(vma->vm_file, "app_process32") ||
-	    !yz_tango_is_process())
+	    !yz_tango_is_process() || !yz_tango_active())
 		return ret;
 	pr_info("yukizygisk: Tango guest RELRO pid=%d range=%lx-%lx\n",
 		current->tgid, vma->vm_start, vma->vm_end);

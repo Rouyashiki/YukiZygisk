@@ -101,6 +101,24 @@ fi
 exit 0
 ''')
         self.write_command(self.module / "bin/yzctl", r'''
+[ "$1" != policy-launch-failed ] || {
+    [ ! -f "$fixture/kernel-policy-error" ] ||
+        cp "$fixture/kernel-policy-error" "$fixture/dev/yukizygisk-late-load/launch-policy-error"
+    exit $?
+}
+[ "$1" != policy-refresh ] || {
+    [ -f "$fixture/daemon.ready" ] || exit 1
+    echo refresh >> "$fixture/policy-refreshes"
+    exit 0
+}
+[ "$1" != policy-boot ] || {
+    echo scan >> "$fixture/policy-scans"
+    [ ! -e "$fixture/policy-boot.fail" ] || exit 1
+    config="$fixture/data/adb/yukizygisk/yzconfig.json"
+    mkdir -p "${config%/*}"
+    [ -e "$config" ] || (umask 077 && echo '{}' > "$config")
+    exit 0
+}
 [ "$1" != description ] || {
     printf '%s\n' "$2" > "$fixture/description"
     exit 0
@@ -249,6 +267,7 @@ exit 99
         self.stop_runtime()
         self.run_stage("post-fs-data.sh")
         self.assertEqual(self.trace(), ["viola launch"])
+        self.assertEqual((self.root / "policy-refreshes").read_text().splitlines(), ["refresh"])
         self.assertFalse((self.state / "pending").exists())
         self.assertTrue((self.state / "active").is_file())
         self.start_runtime()
@@ -273,6 +292,7 @@ exit 99
         # KSU's shared deadline leaves this script alive, then starts Android.
         self.start_runtime()
         self.run_stage("boot-completed.sh")
+        self.assertEqual((self.root / "description").read_text().strip(), "starting")
         pause.unlink()
         stdout, stderr = process.communicate(timeout=15)
         self.assertEqual(process.returncode, 1, stdout + stderr)
@@ -309,8 +329,44 @@ exit 99
         (self.root / "proc-modules").write_text("yukizygisk 123 0 - Live 0\n")
         (self.root / "status.fail").touch()
         self.run_stage("boot-completed.sh")
+        lock = self.state / "startup.lock"
+        lock.unlink()
+        os.mkfifo(lock)
+        self.run_stage("boot-completed.sh")
         self.assertEqual(self.trace(), [])
         self.assertFalse((self.root / "status-queries").exists())
+
+    def test_policy_failure_preserves_first_pending_until_success(self) -> None:
+        failure = self.root / "policy-boot.fail"
+        failure.touch()
+        self.run_stage("late-load.sh", expected=1)
+        self.assertEqual((self.root / "description").read_text().strip(), "startup-failed")
+        # The real yzctl records the failure for later stages.
+        error = self.state / "policy-error"
+        error.write_text("boot policy preparation failed: Operation not permitted")
+        self.run_stage("boot-completed.sh")
+        self.assertTrue((self.state / "pending").is_file())
+        self.assertFalse((self.root / "status-queries").exists())
+        self.assertEqual((self.root / "description").read_text().strip(), "startup-failed")
+        failure.unlink()
+        error.unlink()
+        self.stop_runtime()
+        self.run_stage("post-fs-data.sh")
+        self.assertTrue((self.state / "active").is_file())
+        failure.touch()
+        self.run_stage("late-load.sh", expected=1)
+        self.assertFalse((self.state / "pending").exists())
+
+    def test_normal_boot_does_not_chmod_existing_config_before_validation(self) -> None:
+        self.environment.pop("KSU_LATE_LOAD")
+        self.base.mkdir(parents=True)
+        config = self.base / "yzconfig.json"
+        config.write_text('{"fixed_sepolicy":true}')
+        config.chmod(0o664)
+        (self.root / "policy-boot.fail").touch()
+        self.run_stage("post-fs-data.sh", expected=1)
+        self.assertEqual(config.stat().st_mode & 0o777, 0o664)
+        self.assertEqual(self.start_count(), 0)
 
     def test_launch_failure_does_not_restart_and_allows_startup_retry(self) -> None:
         failure = self.root / "launch.fail"
@@ -328,6 +384,24 @@ exit 99
         self.run_stage("post-fs-data.sh")
         self.assertEqual(self.trace(), ["viola launch", "viola launch"])
         self.assertFalse((self.state / "pending").exists())
+
+    def test_launch_policy_error_survives_boot_stages_until_activation(self) -> None:
+        self.run_stage("late-load.sh")
+        self.stop_runtime()
+        failure = self.root / "launch.fail"
+        failure.touch()
+        (self.root / "kernel-policy-error").write_text("Fixed SELinux policy failed (error -13)")
+        self.run_stage("post-fs-data.sh", expected=1)
+        description = self.root / "description"
+        self.assertEqual(description.read_text().strip(), "startup-failed")
+        for stage in ("boot-completed.sh", "late-load.sh"):
+            self.assertNotIn("soft-reboot", self.run_stage(stage).stdout)
+            self.assertEqual(description.read_text().strip(), "startup-failed")
+        failure.unlink()
+        self.run_stage("post-fs-data.sh")
+        self.assertTrue((self.state / "active").is_file())
+        self.assertFalse((self.state / "launch-policy-error").exists())
+        self.assert_no_restart()
 
     def test_missing_verifier_reports_failure_without_claiming_readiness(self) -> None:
         (self.module / "bin/viola").unlink()
@@ -432,9 +506,13 @@ exit 99
         self.run_stage("post-fs-data.sh")
         self.assertEqual(self.trace(), [])
         self.assertTrue((self.state / "pending").is_file())
+        self.run_stage("late-load.sh")  # The host rescans while activation is pending.
+        self.run_stage("post-fs-data.sh")
         self.stop_runtime()
         self.run_stage("post-fs-data.sh")
+        self.run_stage("late-load.sh")  # The host also rescans after activation.
         self.assertEqual(self.start_count(), 1)
+        self.assertEqual((self.root / "policy-scans").read_text().splitlines(), ["scan"] * 5)
 
     def test_original_late_startup_argument_cannot_bypass_deferral(self) -> None:
         self.stop_runtime()

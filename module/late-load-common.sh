@@ -7,6 +7,8 @@
 LATE_LOAD_STATE_DIR="/dev/yukizygisk-late-load"
 LATE_LOAD_PENDING="$LATE_LOAD_STATE_DIR/pending"
 LATE_LOAD_ACTIVE="$LATE_LOAD_STATE_DIR/active"
+LATE_LOAD_POLICY_ERROR="$LATE_LOAD_STATE_DIR/policy-error"
+LATE_LOAD_LAUNCH_POLICY_ERROR="$LATE_LOAD_STATE_DIR/launch-policy-error"
 
 late_load_mode() {
 	[ "${KSU_LATE_LOAD:-}" = 1 ] ||
@@ -20,18 +22,31 @@ late_load_lock() {
 	[ -d "$LATE_LOAD_STATE_DIR" ] && [ ! -L "$LATE_LOAD_STATE_DIR" ] &&
 		[ "$(stat -c %u "$LATE_LOAD_STATE_DIR")" = 0 ] || return 1
 	chmod 0700 "$LATE_LOAD_STATE_DIR" || return 1
-	for name in pending active logs-prepared startup.lock; do
+	for name in pending active logs-prepared startup.lock policy-error launch-policy-error; do
 		path="$LATE_LOAD_STATE_DIR/$name"
 		[ ! -L "$path" ] && { [ ! -e "$path" ] || [ -f "$path" ]; } || return 1
 	done
 	exec 9>>"$LATE_LOAD_STATE_DIR/startup.lock"
 	flock -x 9 || return 1
 	# An interrupted launch keeps pending; only a successful launch consumes it.
-	[ -f "$LATE_LOAD_ACTIVE" ] || : >"$LATE_LOAD_PENDING"
+	if [ ! -f "$LATE_LOAD_ACTIVE" ] && [ ! -f "$LATE_LOAD_PENDING" ]; then
+		: >"$LATE_LOAD_PENDING" || return 1
+	fi
+	# Both host stages follow a rule scan, including repeated late-loads.
+	"$MODDIR/bin/yzctl" policy-boot || {
+		echo "late-load: cannot record the selected boot policy" >&2
+		"$MODDIR/bin/yzctl" description startup-failed --module-dir "$MODDIR"
+		return 1
+	}
 }
 
 late_load_notice() {
-	"$MODDIR/bin/yzctl" description late-load-pending --module-dir "$MODDIR"
+	if [ -f "$LATE_LOAD_POLICY_ERROR" ] || [ -f "$LATE_LOAD_LAUNCH_POLICY_ERROR" ]; then
+		"$MODDIR/bin/yzctl" description startup-failed --module-dir "$MODDIR"
+	else
+		"$MODDIR/bin/yzctl" description late-load-pending --module-dir "$MODDIR" || return 1
+		echo "late-load: activation deferred; after late-load finishes, manually soft-reboot from KernelSU"
+	fi
 }
 
 late_load_runtime_stopped() {

@@ -19,6 +19,7 @@
 #include <linux/string.h>
 
 #include "internal.h"
+#include "fixed_policy.h"
 #include "klog.h"
 #include "host/host.h"
 #include "host/runtime.h"
@@ -360,7 +361,7 @@ static int yz_install_packet_fd(const void *buf, size_t size)
 	struct file *mfd;
 	loff_t pos = 0;
 	ssize_t w;
-	int fd;
+	int fd, ret;
 
 	mfd = shmem_file_setup(YZ_VMA_NAME, size, 0);
 	if (IS_ERR(mfd))
@@ -374,6 +375,11 @@ static int yz_install_packet_fd(const void *buf, size_t size)
 		return w < 0 ? (int)w : -EIO;
 	}
 
+	ret = yz_fixed_policy_label(mfd, NULL);
+	if (ret) {
+		fput(mfd);
+		return ret;
+	}
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
 		fput(mfd);

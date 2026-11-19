@@ -34,7 +34,6 @@ ROLLOVER_RUNTIME_LOG="$RUNTIME_LOG_DIR/zygiskd64.1.log"
 PREVIOUS_RUNTIME_LOG="$RUNTIME_LOG_DIR/zygiskd64.old.log"
 PREVIOUS_ROLLOVER_LOG="$RUNTIME_LOG_DIR/zygiskd64.1.old.log"
 LOG_FILE="$BASE_DIR/zygiskd.log"
-CONFIG_FILE="$BASE_DIR/yzconfig.json"
 LATE_LOAD_LOGS_PREPARED="$LATE_LOAD_STATE_DIR/logs-prepared"
 
 mkdir -p "$BASE_DIR" "$LIB_DIR" "$RUN_DIR" "$RUNTIME_LOG_DIR"
@@ -109,12 +108,6 @@ if $LATE_LOAD; then
 	: >"$LATE_LOAD_LOGS_PREPARED" || exit 1
 fi
 
-if [ ! -f "$CONFIG_FILE" ]; then
-	printf '%s\n' '{"yukilinker":true,"denylist_mode":0,"dmesg_log":false}' \
-		>"$CONFIG_FILE"
-fi
-chmod 0600 "$CONFIG_FILE" 2>/dev/null || true
-
 log() {
 	echo "$STAGE: $*" >>"$LOG_FILE"
 }
@@ -138,6 +131,13 @@ if [ ! -x "$MODDIR/bin/viola" ]; then
 	exit 1
 fi
 
+# Late-load recorded the host's scan while acquiring the startup lock.
+if ! $LATE_LOAD && ! "$MODDIR/bin/yzctl" policy-boot; then
+	log "cannot confirm the selected boot policy"
+	set_description startup-failed
+	exit 1
+fi
+
 log "starting authenticated YukiZygisk core"
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_CONFIG_FILE LD_DEBUG LD_DEBUG_OUTPUT
 set -- launch --module-dir "$MODDIR"
@@ -149,10 +149,9 @@ fi
 # The bootstrap shell owns FD 9; the daemon must not inherit its startup lock.
 if ! /system/bin/env -i PATH=/system/bin:/system/xbin "$MODDIR/bin/viola" "$@" 9>&- >>"$LOG_FILE" 2>&1; then
 	log "Viola refused startup; see verification error above"
-	if $LATE_LOAD && [ -f "$LATE_LOAD_PENDING" ]; then
-		# This script can outlive boot-completed.sh after KernelSU's deadline.
-		# Preserve its activation reminder; the failure details stay in the log.
-		set_description late-load-pending
+	if $LATE_LOAD && [ -f "$LATE_LOAD_PENDING" ] &&
+		"$MODDIR/bin/yzctl" policy-launch-failed >>"$LOG_FILE" 2>&1; then
+		late_load_notice >>"$LOG_FILE" 2>&1 || log "failed to update module description"
 	else
 		set_description startup-failed
 	fi
@@ -160,5 +159,8 @@ if ! /system/bin/env -i PATH=/system/bin:/system/xbin "$MODDIR/bin/viola" "$@" 9
 fi
 if $LATE_LOAD && [ -f "$LATE_LOAD_PENDING" ]; then
 	mv -f "$LATE_LOAD_PENDING" "$LATE_LOAD_ACTIVE" || exit 1
+	rm -f "$LATE_LOAD_LAUNCH_POLICY_ERROR" || log "could not clear the launch policy error"
 fi
+"$MODDIR/bin/yzctl" policy-refresh >>"$LOG_FILE" 2>&1 ||
+	log "could not refresh the fixed policy for the next boot"
 exit 0

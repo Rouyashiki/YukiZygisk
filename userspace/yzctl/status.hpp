@@ -8,6 +8,8 @@
  */
 #pragma once
 
+#include "uapi/fixed_policy.h"
+
 #include <cstddef>
 #include <string>
 
@@ -21,12 +23,15 @@ struct StatusOptions {
 };
 
 struct StatusDocument {
+  yz_fixed_policy_status policy{};
+  bool policy_supported = false;
   std::string json;
   std::string abi;
   std::string root_impl;
   bool safe_mode = false;
   bool late_load = false;
   bool late_load_pending = false;
+  std::string late_load_error;
   size_t injected = 0;
   size_t zygotes = 0;
   size_t zygisk_modules = 0;

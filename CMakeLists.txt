@@ -41,6 +41,18 @@ function(yz_viola_identity target role)
     VIOLA_IMAGE_ROLE=${role} VIOLA_IMAGE_ABI=${viola_abi})
 endfunction()
 
+if(YZ_BUILD_YZCTL OR YZ_BUILD_ZYGISKD)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(policy_source "${PROJECT_SOURCE_DIR}/kernel/feature/policy")
+  set(policy_lines "${PROJECT_BINARY_DIR}/module_rules.inc")
+  add_custom_command(OUTPUT "${policy_lines}"
+    COMMAND "${Python3_EXECUTABLE}" "${policy_source}/generate.py"
+            "${policy_source}/sepolicy.rule" "${policy_lines}" --native
+    DEPENDS "${policy_source}/generate.py" "${policy_source}/sepolicy.rule"
+    VERBATIM)
+  add_custom_target(yz_policy_rules DEPENDS "${policy_lines}")
+endif()
+
 if(YZ_BUILD_VIOLA AND NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
   add_subdirectory(userspace/viola)
 endif()

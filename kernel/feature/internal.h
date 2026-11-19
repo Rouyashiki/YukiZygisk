@@ -77,7 +77,8 @@ void yz_config_fill_linker_offsets(u64 dlopen, u64 dlsym, u64 dlopen32,
 u64 yz_config_dlopen_offset(bool compat);
 u64 yz_config_dlsym_offset(bool compat);
 bool yz_config_first_stage_loader(void);
-/* A successful begin is consumed exactly once by publish or restore. */
+/* NULL carries no lease or admission reference.
+ * Owned states are consumed by publish or restore. */
 struct yz_file_load_policy *yz_load_policy_begin(void);
 void yz_load_policy_restore_state(struct yz_file_load_policy *state);
 void yz_load_policy_publish_native(struct yz_file_load_policy *state);

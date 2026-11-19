@@ -30,6 +30,7 @@
 
 #include "api.h"
 #include "internal.h"
+#include "fixed_policy.h"
 #include "host/host.h"
 #include "klog.h" // IWYU pragma: keep
 
@@ -480,6 +481,11 @@ struct yz_file_load_policy *yz_load_policy_begin(void)
 		ret = -ESHUTDOWN;
 		goto fail;
 	}
+	if (yz_fixed_policy_active()) {
+		up_read(&yz_policy_admission);
+		return NULL;
+	}
+
 	ret = yz_policy_reserve();
 	if (ret)
 		goto fail;
@@ -502,6 +508,9 @@ fail:
 
 void yz_load_policy_restore_state(struct yz_file_load_policy *state)
 {
+	if (!state)
+		return;
+
 	struct yz_policy_state *policy =
 	    container_of(state, struct yz_policy_state, state);
 
@@ -511,6 +520,9 @@ void yz_load_policy_restore_state(struct yz_file_load_policy *state)
 
 void yz_load_policy_publish_native(struct yz_file_load_policy *state)
 {
+	if (!state)
+		return;
+
 	struct yz_native_policy_pending *entry =
 	    container_of(state, struct yz_native_policy_pending, policy.state);
 	struct yz_native_policy_pending *cur;
@@ -717,6 +729,17 @@ int yz_load_policy_allow_module(struct task_struct *task, struct file *dir,
 		ret = -ESRCH;
 		goto out;
 	}
+	if (yz_fixed_policy_active()) {
+		if (S_ISDIR(file_inode(dir)->i_mode)) {
+			ret = yz_fixed_policy_check(dir, cred, true);
+			if (!ret)
+				ret = yz_fixed_policy_check_execmem(cred);
+		} else {
+			ret = yz_fixed_policy_label(dir, cred);
+		}
+		goto out;
+	}
+
 	ret = yz_policy_reserve();
 	if (ret)
 		goto out;
@@ -873,6 +896,8 @@ int yz_load_policy_restore_native(pid_t tgid)
 
 	if (tgid <= 0)
 		return -EINVAL;
+	if (yz_fixed_policy_active())
+		return 0;
 	owner = yz_policy_get_owner(tgid);
 	if (owner) {
 		yz_restore_owner_policies(owner);

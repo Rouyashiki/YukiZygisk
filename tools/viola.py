@@ -309,12 +309,13 @@ def source_digest():
     names.update(run(["git", "-C", ROOT, "ls-files", "-z", "--recurse-submodules"]).split(b"\0"))
     extensions = {".c", ".cc", ".cpp", ".h", ".hpp", ".S", ".s", ".asm", ".inc",
                   ".cmake", ".ld", ".lds", ".asc", ".pgp"}
-    exact = {"CMakeLists.txt", "build.sh", "build.ps1", "tools/viola.py", "tools/requirements-viola.txt"}
+    exact = {"CMakeLists.txt", "build.sh", "build.ps1", "tools/viola.py", "tools/requirements-viola.txt",
+             "kernel/feature/policy/generate.py", "kernel/feature/policy/sepolicy.rule"}
     digest = hashlib.sha512(b"YukiZygisk Viola source inputs v1\0")
     for raw in sorted(name for name in names if name):
         name = raw.decode("utf-8")
-        if name == "kernel/yukizygisk.lds":
-            continue  # DDK-generated CFI linker output, not a source input.
+        if name in ("kernel/yukizygisk.lds", "kernel/feature/policy/rules.h"):
+            continue  # Generated during the kernel build.
         path = ROOT / name
         source = (name.startswith(("kernel/", "userspace/", "shared/viola/", "uapi/")) and
                   (path.suffix in extensions or path.name in ("Makefile", "Kbuild", "CMakeLists.txt")))

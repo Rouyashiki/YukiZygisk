@@ -16,7 +16,12 @@ done
 # KernelSU runs this stage during late-load too, before any manual soft reboot.
 # An intentionally absent LKM is not a health failure or an unload request.
 if [ -f "$LATE_LOAD_PENDING" ]; then
-	late_load_notice
+	# An in-flight startup owns the next description and can outlive this stage.
+	lock="$LATE_LOAD_STATE_DIR/startup.lock"
+	[ ! -L "$lock" ] && [ -f "$lock" ] || exit 0
+	exec 9<"$lock" || exit 0
+	flock -s -n 9 || exit 0
+	[ ! -f "$LATE_LOAD_PENDING" ] || late_load_notice
 	exit 0
 fi
 BASE_DIR="/data/adb/yukizygisk"

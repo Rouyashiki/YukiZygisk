@@ -660,25 +660,30 @@ class ViolaTests(unittest.TestCase):
             V.prepare(args)
         self.assertNotEqual(first["release_id"], V.read_context(args.out)["release_id"])
 
-    def test_source_digest_ignores_generated_linker_output_but_tracks_sources(self):
+    def test_source_digest_tracks_linker_and_policy_inputs_across_build(self):
         root = self.base / "source-fixture"
         (root / "kernel/core").mkdir(parents=True)
+        policy = root / "kernel/feature/policy"
+        policy.mkdir(parents=True)
         source = root / "kernel/core/module.c"
         script = root / "kernel/core/viola_notes.lds"
         generated = root / "kernel/yukizygisk.lds"
+        generator, rules, header = (policy / name for name in ("generate.py", "sepolicy.rule", "rules.h"))
         source.write_bytes(b"int source;\n")
         script.write_bytes(b"KEEP(*(.note.viola))\n")
-        generated.write_bytes(b"old output")
-        listing = b"kernel/core/module.c\0kernel/core/viola_notes.lds\0kernel/yukizygisk.lds\0"
-        with patch.object(V, "ROOT", root), patch.object(V, "run", return_value=listing):
+        generator.write_bytes(b"# rule generator\n")
+        rules.write_bytes(b"# rule template\n")
+        subprocess.run(["git", "init", "--quiet", root], check=True)
+        with patch.object(V, "ROOT", root):
             first = type(self).real_source_digest()
             generated.write_bytes(b"new generated output")
+            header.write_bytes(b"new generated rules")
             self.assertEqual(first, type(self).real_source_digest())
-            script.write_bytes(b"changed real linker fragment")
-            self.assertNotEqual(first, type(self).real_source_digest())
-            changed = type(self).real_source_digest()
-            source.write_bytes(b"int changed_source;\n")
-            self.assertNotEqual(changed, type(self).real_source_digest())
+            for path in (script, source, generator, rules):
+                with self.subTest(path=path.name):
+                    before = type(self).real_source_digest()
+                    path.write_bytes(path.read_bytes() + b"\n")
+                    self.assertNotEqual(before, type(self).real_source_digest())
 
     def test_sign_command_uses_production_verifier_and_rejects_changed_payload(self):
         args = argparse.Namespace(context=str(self.context_dir), module_dir=str(self.module),

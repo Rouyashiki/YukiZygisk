@@ -17,6 +17,7 @@ export const PATHS = {
 export const DEFAULT_CONFIG = {
   yukilinker: true,
   anonymous_memory: true,
+  fixed_sepolicy: false,
   denylist_mode: 0,
   dmesg_log: false,
   crash_protection: true,
@@ -82,6 +83,7 @@ function normalizeConfig(value = {}) {
   return {
     yukilinker: value.yukilinker !== false,
     anonymous_memory: value.anonymous_memory !== false,
+    fixed_sepolicy: value.fixed_sepolicy === true,
     denylist_mode: [0, 1, 2].includes(mode) ? mode : 0,
     dmesg_log: value.dmesg_log === true,
     crash_protection: value.crash_protection !== false,
@@ -126,15 +128,13 @@ function parseModuleProp(text) {
   return meta;
 }
 
-async function writeConfig(config) {
-  const normalized = normalizeConfig(config);
-  const args = Object.entries(normalized).flatMap(([key, value]) => [key, String(value)]);
+async function writeConfig(changes) {
+  const args = Object.entries(changes).flatMap(([key, value]) => [key, Array.isArray(value) ? JSON.stringify(value) : String(value)]);
   const command = [PATHS.CONTROL, "config", "set", ...args]
     .map((value) => "'" + shellEscape(value) + "'").join(" ");
   const result = await exec(command);
   if (result.errno !== 0)
     throw commandError(result, "failed to write yzconfig.json");
-  return normalized;
 }
 
 const mockState = {
@@ -185,10 +185,10 @@ const mockApi = {
     return clone(mockState.status);
   },
   async loadConfig() {
-    return clone(mockState.config);
+    return normalizeConfig(mockState.config);
   },
-  async saveConfig(config) {
-    mockState.config = normalizeConfig(config);
+  async saveConfig(changes) {
+    mockState.config = normalizeConfig({ ...mockState.config, ...changes });
     Object.assign(mockState.status, mockState.config);
     return clone(mockState.config);
   },
@@ -219,13 +219,24 @@ const mockApi = {
 
 async function queryStatus() {
   const result = await exec(`'${shellEscape(PATHS.CONTROL)}' status --json`);
-  const text = output(result);
-  if (result.errno !== 0 || !text)
-    return { status: null, error: text || "kernel status unavailable" };
+  const text = String(result.stdout || "").trim();
+  const stderr = String(result.stderr || "").trim();
+  if (!text)
+    return normalizeStatus({ error: stderr || "kernel status unavailable" });
   try {
-    return { status: normalizeStatus(JSON.parse(text)), error: "" };
+    const value = JSON.parse(text);
+    if (result.errno === 0)
+      return normalizeStatus(value);
+    return normalizeStatus({
+      late_load: value?.late_load,
+      late_load_pending: value?.late_load_error && value.late_load_pending,
+      late_load_error: value?.late_load_error,
+      policy: value?.policy,
+      error: value?.error || stderr || "kernel status unavailable",
+    });
   } catch (error) {
-    return { status: null, error: `invalid status JSON from yzctl: ${error.message}` };
+    return normalizeStatus({ error: result.errno === 0
+      ? `invalid status JSON from yzctl: ${error.message}` : stderr || text });
   }
 }
 
@@ -236,10 +247,7 @@ async function reloadRuntime() {
 }
 
 const realApi = {
-  async getStatus() {
-    const result = await queryStatus();
-    return result.status || normalizeStatus({ error: result.error });
-  },
+  getStatus: queryStatus,
 
   async loadConfig() {
     const result = await exec("'" + shellEscape(PATHS.CONTROL) + "' config get");
@@ -255,9 +263,9 @@ const realApi = {
     }
   },
 
-  async saveConfig(config) {
-    const normalized = await writeConfig(config);
-    return normalized;
+  async saveConfig(changes) {
+    await writeConfig(changes);
+    return this.loadConfig();
   },
 
   async reload() {
@@ -342,8 +350,9 @@ export const api = {
       return backend.loadConfig();
     });
   },
-  saveConfig(config) {
-    const snapshot = normalizeConfig(config);
+  saveConfig(changes) {
+    const snapshot = Object.fromEntries(Object.entries(normalizeConfig(changes))
+      .filter(([key]) => Object.prototype.hasOwnProperty.call(changes, key)));
     return mutate(() => backend.saveConfig(snapshot));
   },
   reload() {

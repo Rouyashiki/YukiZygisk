@@ -13,14 +13,17 @@ add_executable(yzctl
   ${PROJECT_SOURCE_DIR}/userspace/zygisk/endpoint.cpp
   health.cpp
   main.cpp
+  policy.cpp
   status.cpp
 )
 
+add_dependencies(yzctl yz_policy_rules)
 target_compile_features(yzctl PRIVATE cxx_std_17)
 target_compile_definitions(yzctl PRIVATE _GNU_SOURCE)
 target_include_directories(
   yzctl
   PRIVATE
+    ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/userspace/common
     ${PROJECT_SOURCE_DIR}/userspace/zygisk/daemon

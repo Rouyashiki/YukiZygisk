@@ -28,11 +28,13 @@ if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
 endif()
 
 add_executable(${ZYGISKD_TARGET} ${ZYGISKD_SOURCES})
+add_dependencies(${ZYGISKD_TARGET} yz_policy_rules)
 
 target_compile_features(${ZYGISKD_TARGET} PRIVATE cxx_std_17)
 target_include_directories(
   ${ZYGISKD_TARGET}
   PRIVATE
+    ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/userspace/common
 )
