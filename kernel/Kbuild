@@ -60,6 +60,7 @@ ccflags-y += -Wno-declaration-after-statement
 ccflags-y += -Wno-missing-braces
 ccflags-y += -Wno-unused-function
 ccflags-y += -Wno-unused-variable
+CFLAGS_host/policy.o += -DDYNAMIC_DEBUG_MODULE
 
 # Module sysfs metadata is private to the target kernel. Probe its allocation
 # layout so backports use the matching cleanup, independently of the version.

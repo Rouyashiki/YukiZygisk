@@ -14,9 +14,11 @@
 #include <linux/fs.h>
 #include <linux/lsm_hooks.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/overflow.h>
 #include <linux/printk.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -41,6 +43,8 @@
 #define YZ_POLICY_PERM_BITS 32
 /* avtab_write_item(): four 16-bit key fields and a 32-bit access vector. */
 #define YZ_POLICY_AVTAB_ALLOWED_SIZE (4 * sizeof(u16) + sizeof(u32))
+/* Audited ACK layouts from android12-5.10 through android17-6.18. */
+#define YZ_POLICY_AVTAB_KMI (VIOLA_KMI_ID >= 1 && VIOLA_KMI_ID <= 8)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 extern int avc_ss_reset(u32 seqno);
@@ -48,13 +52,19 @@ extern int avc_ss_reset(u32 seqno);
 extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 #endif
 
+enum yz_policy_edit_scope {
+	YZ_POLICY_FULL,
+	YZ_POLICY_AVTAB,
+};
+
 struct yz_policy_edit {
 	struct selinux_policy *old_policy;
 	struct selinux_policy *policy;
+	enum yz_policy_edit_scope scope;
 };
 
-static int
-yz_policy_begin_edit_locked(struct yz_policy_edit *edit);
+static int yz_policy_begin_edit_locked(struct yz_policy_edit *edit,
+				       enum yz_policy_edit_scope scope);
 static void
 yz_policy_cancel_edit_locked(struct yz_policy_edit *edit);
 static void
@@ -62,6 +72,12 @@ yz_policy_commit_edit_locked(struct yz_policy_edit *edit);
 
 static DEFINE_MUTEX(yz_policy_lock);
 static struct selinux_state *yz_selinux_state;
+/* Only our last AV-only publication has a known serialized length. */
+static struct selinux_policy *yz_sized_policy;
+static u32 yz_sized_seqno;
+static u32 yz_sized_nel;
+static u32 yz_sized_types;
+static typeof(&unregister_blocking_lsm_notifier) yz_unregister_policy_notifier;
 static struct lsm_blob_sizes *yz_selinux_blob_sizes;
 static typeof(&policydb_write) yz_policydb_write;
 static typeof(&policydb_read) yz_policydb_read;
@@ -367,8 +383,8 @@ yz_policy_get_avtab_node(struct policydb *db,
 	return node;
 }
 
-static bool
-yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
+static int yz_policy_remove_avtab_node(struct policydb *db,
+				       struct avtab_node *node)
 {
 	struct avtab removed = {};
 	struct avtab_node *cur;
@@ -377,8 +393,11 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 	size_t i;
 
 	ret = yz_call_avtab_alloc(&removed, 1);
+	/* An empty allow node grants nothing and retains its serialized size. */
+	if (ret == -ENOMEM)
+		return 0;
 	if (ret < 0)
-		return false;
+		return ret;
 
 	for (i = 0; i < db->te_avtab.nslot; i++) {
 		prev = NULL;
@@ -397,12 +416,12 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 			removed.nel = 1;
 			yz_call_avtab_destroy(&removed);
 			db->len -= YZ_POLICY_AVTAB_ALLOWED_SIZE;
-			return true;
+			return 0;
 		}
 	}
 
 	yz_call_avtab_destroy(&removed);
-	return false;
+	return -ENOENT;
 }
 
 static int
@@ -439,7 +458,7 @@ yz_policy_apply_av(struct policydb *db, const struct yz_policy_key *key,
 
 	node->datum.u.data &= ~av;
 	if (node->datum.u.data == 0)
-		yz_policy_remove_avtab_node(db, node);
+		return yz_policy_remove_avtab_node(db, node);
 
 	return 0;
 }
@@ -553,7 +572,7 @@ int yz_host_policy_prepare_runtime_current(void)
 	yz_policy_copy_type_name(target_name, sizeof(target_name),
 				 &policy->policydb, target_type);
 
-	ret = yz_policy_begin_edit_locked(&edit);
+	ret = yz_policy_begin_edit_locked(&edit, YZ_POLICY_AVTAB);
 	if (ret)
 		goto out_unlock;
 
@@ -585,11 +604,15 @@ out_unlock:
 	return ret;
 }
 
-static void yz_policy_destroy(struct selinux_policy *policy)
+static void yz_policy_destroy(struct selinux_policy *policy,
+			      enum yz_policy_edit_scope scope)
 {
 	if (!policy)
 		return;
-	yz_call_policydb_destroy(&policy->policydb);
+	if (scope == YZ_POLICY_AVTAB)
+		yz_call_avtab_destroy(&policy->policydb.te_avtab);
+	else
+		yz_call_policydb_destroy(&policy->policydb);
 	kfree(policy);
 }
 
@@ -598,18 +621,10 @@ static struct selinux_policy *yz_policy_dup(struct selinux_policy *old_policy)
 	struct selinux_policy *policy;
 	struct policy_file fp;
 	void *data;
-	size_t ebitmap_extra;
 	size_t len;
 	int ret;
 
-	/*
-	 * policydb_read() adds every type to its own attribute map, so the
-	 * serialized copy can grow by one ebitmap node per type (KernelSU
-	 * #3680).
-	 */
-	if (check_mul_overflow((size_t)old_policy->policydb.p_types.nprim,
-			       sizeof(u32) + sizeof(u64), &ebitmap_extra) ||
-	    check_add_overflow(old_policy->policydb.len, ebitmap_extra, &len)) {
+	if (!policydb_snapshot_capacity(&old_policy->policydb, &len)) {
 		pr_err("yukizygisk: SELinux policy buffer length overflow\n");
 		return ERR_PTR(-EOVERFLOW);
 	}
@@ -672,6 +687,101 @@ out_free_data:
 	return ERR_PTR(ret);
 }
 
+static int yz_policy_serialized_len(struct selinux_policy *old, size_t *len)
+{
+	struct policy_file fp;
+	size_t capacity;
+	void *data;
+	int ret;
+
+	if (old == READ_ONCE(yz_sized_policy) &&
+	    old->latest_granting == yz_sized_seqno &&
+	    old->policydb.te_avtab.nel == yz_sized_nel &&
+	    old->policydb.p_types.nprim == yz_sized_types) {
+		*len = old->policydb.len;
+		return 0;
+	}
+	if (!policydb_snapshot_capacity(&old->policydb, &capacity))
+		return -EOVERFLOW;
+	data = vmalloc(capacity);
+	if (!data)
+		return -ENOMEM;
+	fp.data = data;
+	fp.len = capacity;
+	ret = yz_call_policydb_write(&old->policydb, &fp);
+	if (!ret)
+		*len = capacity - fp.len;
+	vfree(data);
+	return ret;
+}
+
+static struct selinux_policy *yz_policy_dup_avtab(struct selinux_policy *old)
+{
+	struct avtab *src = &old->policydb.te_avtab;
+	struct selinux_policy *policy;
+	struct avtab *dst;
+	size_t len;
+	u32 i;
+	int ret;
+
+	ret = yz_policy_serialized_len(old, &len);
+	if (ret)
+		return ERR_PTR(ret);
+	policy = kmemdup(old, sizeof(*old), GFP_KERNEL);
+	if (!policy)
+		return ERR_PTR(-ENOMEM);
+	policy->policydb.len = len;
+	dst = &policy->policydb.te_avtab;
+	memset(dst, 0, sizeof(*dst));
+	ret = yz_call_avtab_alloc(dst, max(src->nel, 1U));
+	if (ret)
+		goto free_policy;
+
+	for (i = 0; i < src->nslot; i++) {
+		struct avtab_node *prev = NULL, *node;
+
+		if (!(i & 63))
+			cond_resched();
+		for (node = src->htable[i]; node; node = node->next) {
+			struct avtab tail = {.nslot = 1};
+			struct avtab *table = dst;
+
+			if ((node->key.specified & AVTAB_XPERMS) &&
+			    !node->datum.u.xperms) {
+				ret = -EINVAL;
+				goto free_table;
+			}
+			/* Rehash distinct triples when the bucket count
+			 * changes. Append siblings in source order, including
+			 * equal xperms. */
+			if (src->nslot == dst->nslot ||
+			    (prev &&
+			     prev->key.source_type == node->key.source_type &&
+			     prev->key.target_type == node->key.target_type &&
+			     prev->key.target_class ==
+				 node->key.target_class)) {
+				tail.htable =
+				    prev ? &prev->next : &dst->htable[i];
+				table = &tail;
+			}
+			prev = yz_call_avtab_insert_nonunique(table, &node->key,
+							      &node->datum);
+			if (!prev) {
+				ret = -ENOMEM;
+				goto free_table;
+			}
+			dst->nel += tail.nel;
+		}
+	}
+	return policy;
+
+free_table:
+	yz_call_avtab_destroy(dst);
+free_policy:
+	kfree(policy);
+	return ERR_PTR(ret);
+}
+
 static YZ_LEGACY_INDIRECT_CALL void yz_policy_reset_avc(u32 seqno)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
@@ -686,8 +796,8 @@ static YZ_LEGACY_INDIRECT_CALL void yz_policy_reset_avc(u32 seqno)
 	selinux_xfrm_notify_policyload();
 }
 
-static int
-yz_policy_begin_edit_locked(struct yz_policy_edit *edit)
+static int yz_policy_begin_edit_locked(struct yz_policy_edit *edit,
+				       enum yz_policy_edit_scope scope)
 {
 	struct selinux_policy *old_policy;
 
@@ -703,7 +813,13 @@ yz_policy_begin_edit_locked(struct yz_policy_edit *edit)
 	if (!old_policy)
 		return -ENOENT;
 
-	edit->policy = yz_policy_dup(old_policy);
+	edit->scope = YZ_POLICY_AVTAB_KMI ? scope : YZ_POLICY_FULL;
+	pr_debug("yukizygisk: SELinux %s copy at generation %u\n",
+		 edit->scope == YZ_POLICY_AVTAB ? "AVTAB" : "full",
+		 old_policy->latest_granting);
+	edit->policy = edit->scope == YZ_POLICY_AVTAB
+			   ? yz_policy_dup_avtab(old_policy)
+			   : yz_policy_dup(old_policy);
 	if (IS_ERR(edit->policy)) {
 		int ret = PTR_ERR(edit->policy);
 
@@ -717,7 +833,7 @@ yz_policy_begin_edit_locked(struct yz_policy_edit *edit)
 static void
 yz_policy_cancel_edit_locked(struct yz_policy_edit *edit)
 {
-	yz_policy_destroy(edit->policy);
+	yz_policy_destroy(edit->policy, edit->scope);
 	memset(edit, 0, sizeof(*edit));
 }
 
@@ -727,8 +843,16 @@ yz_policy_commit_edit_locked(struct yz_policy_edit *edit)
 	edit->policy->latest_granting = edit->old_policy->latest_granting + 1;
 	rcu_assign_pointer(yz_selinux_state->policy, edit->policy);
 	synchronize_rcu();
-	yz_policy_destroy(edit->old_policy);
+	yz_policy_destroy(edit->old_policy, edit->scope);
 	yz_policy_reset_avc(edit->policy->latest_granting);
+	/* Our synchronous reset invalidated the old entry. The policy mutex
+	 * still excludes a host replacement while we record the new one. */
+	if (yz_unregister_policy_notifier && edit->scope == YZ_POLICY_AVTAB) {
+		yz_sized_seqno = edit->policy->latest_granting;
+		yz_sized_nel = edit->policy->policydb.te_avtab.nel;
+		yz_sized_types = edit->policy->policydb.p_types.nprim;
+		WRITE_ONCE(yz_sized_policy, edit->policy);
+	}
 	memset(edit, 0, sizeof(*edit));
 }
 
@@ -744,10 +868,13 @@ int yz_policy_base_commit_allow_locked(const struct yz_policy_key *file_key,
 	struct yz_policy_edit edit;
 	int ret;
 
-	if (!file_av && !dir_av && !tmpfs_av && !process_av)
+	if (!file_av && !dir_av && !tmpfs_av && !process_av) {
+		pr_debug(
+		    "yukizygisk: SELinux grant skipped (no new permissions)\n");
 		return 0;
+	}
 
-	ret = yz_policy_begin_edit_locked(&edit);
+	ret = yz_policy_begin_edit_locked(&edit, YZ_POLICY_AVTAB);
 	if (ret)
 		return ret;
 
@@ -793,10 +920,13 @@ int yz_policy_base_commit_restore_locked(
 	struct yz_policy_edit edit;
 	int ret;
 
-	if (!file_av && !dir_av && !tmpfs_av && !process_av)
+	if (!file_av && !dir_av && !tmpfs_av && !process_av) {
+		pr_debug("yukizygisk: SELinux restore skipped (no permissions "
+			 "to remove)\n");
 		return 0;
+	}
 
-	ret = yz_policy_begin_edit_locked(&edit);
+	ret = yz_policy_begin_edit_locked(&edit, YZ_POLICY_AVTAB);
 	if (ret)
 		return ret;
 
@@ -1014,6 +1144,38 @@ yz_policy_base_get_execmem_key(const struct cred *cred,
 	return 0;
 }
 
+static int yz_policy_changed(struct notifier_block *nb, unsigned long event,
+			     void *data)
+{
+	if (event == LSM_POLICY_CHANGE)
+		WRITE_ONCE(yz_sized_policy, NULL);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block yz_policy_notifier = {
+	.notifier_call = yz_policy_changed,
+};
+
+static YZ_LEGACY_INDIRECT_CALL void yz_policy_cache_init(void)
+{
+	typeof(&register_blocking_lsm_notifier) subscribe =
+	    (void *)yz_lookup_callable_quiet("register_blocking_lsm_notifier");
+	typeof(&unregister_blocking_lsm_notifier) unsubscribe =
+	    (void *)yz_lookup_callable_quiet("unregister_blocking_lsm_notifier");
+
+	if (subscribe && unsubscribe && !subscribe(&yz_policy_notifier))
+		yz_unregister_policy_notifier = unsubscribe;
+}
+
+static YZ_LEGACY_INDIRECT_CALL void yz_policy_cache_exit(void)
+{
+	if (yz_unregister_policy_notifier) {
+		yz_unregister_policy_notifier(&yz_policy_notifier);
+		yz_unregister_policy_notifier = NULL;
+	}
+	WRITE_ONCE(yz_sized_policy, NULL);
+}
+
 int yz_host_policy_init(void)
 {
 	int ret;
@@ -1056,12 +1218,14 @@ int yz_host_policy_init(void)
 	if (ret)
 		return ret;
 
+	yz_policy_cache_init();
 	pr_info("yukizygisk: KernelSU-style SELinux policy backend available\n");
 	return 0;
 }
 
 void yz_host_policy_exit(void)
 {
+	yz_policy_cache_exit();
 	yz_policy_temp_reset();
 
 	yz_selinux_state = NULL;
@@ -1073,6 +1237,9 @@ void yz_host_policy_exit(void)
 	yz_avtab_search_node = NULL;
 	yz_avtab_insert_nonunique = NULL;
 	yz_avtab_alloc = NULL;
+	yz_sized_seqno = 0;
+	yz_sized_nel = 0;
+	yz_sized_types = 0;
 	yz_avtab_destroy = NULL;
 	yz_sidtab_search_entry = NULL;
 	yz_avc_ss_reset = NULL;
