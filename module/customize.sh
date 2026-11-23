@@ -99,7 +99,9 @@ chmod 0755 "$MODPATH/bin/zygiskd64" "$MODPATH/bin/zygiskd32" "$MODPATH/bin/yzctl
 	"$MODPATH/cleanup.sh" "$MODPATH/uninstall.sh"
 
 BASE_DIR="/data/adb/yukizygisk"
-if [ -L "$BASE_DIR" ] || ! mkdir -p "$BASE_DIR" || [ ! -O "$BASE_DIR" ]; then
+if [ -L "$BASE_DIR" ] || ! mkdir -p "$BASE_DIR" ||
+	! YZ_BASE_OWNER="$(stat -c '%u' "$BASE_DIR")" ||
+	! YZ_INSTALL_UID="$(id -u)" || [ "$YZ_BASE_OWNER" != "$YZ_INSTALL_UID" ]; then
 	abort "! Unsafe module data directory"
 fi
 if [ -L "$BASE_DIR/lib" ] || ! mkdir -p "$BASE_DIR/lib" ||
