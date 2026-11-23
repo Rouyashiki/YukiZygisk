@@ -210,7 +210,7 @@ const mockApi = {
     return {
       id: "yukizygisk",
       name: "YukiZygisk",
-      version: "v0.4.0-10075",
+      version: "v0.5.0-10075",
       versionCode: "10075",
       author: "Rouyashiki Developers",
     };

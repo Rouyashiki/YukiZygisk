@@ -7,7 +7,7 @@
 # Author: Rouyashiki Developers
 
 cmake_minimum_required(VERSION 3.24)
-project(YukiZygisk VERSION 0.4.0 LANGUAGES C CXX ASM)
+project(YukiZygisk VERSION 0.5.0 LANGUAGES C CXX ASM)
 
 # Drop package artifacts left by releases from before filenames became
 # ABI-explicit. The build script also performs this cleanup before staging.
