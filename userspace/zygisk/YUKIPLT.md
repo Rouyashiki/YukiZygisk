@@ -21,9 +21,15 @@ replacements remain resident without an explicit quiescence contract.
 Zygisk and ZygiskNext API layouts are unchanged. The ZN pltHook boundary can
 reuse an identical live binding after checking its handle and slot. Competing
 replacements fail. Use `zygisk::loadPltOriginal` or `zn_plt_load_original` to
-read published originals. Targets must expose unique, publicly enumerable
-JUMP_SLOT imports; their image, replacement and original storage must remain
-alive through recovery and callback completion.
+read published originals. Each request must match a unique JUMP_SLOT. System
+images must be publicly enumerable. The image, replacement and original storage
+must remain alive through recovery and callback completion.
+
+For a leased private image, the Core uses `find_function_imports()` to select
+multiple imports and keeps their metadata alive through installation. A
+scan-wide error, including an exhausted batch budget, stops the transaction. If
+a later selector fails, the Core checks the earlier slots in request order
+before returning the error.
 
 ## Fork and cache lifetime
 
