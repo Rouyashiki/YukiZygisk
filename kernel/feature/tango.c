@@ -21,7 +21,6 @@
 #include <linux/spinlock.h>
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
-#include <asm/cacheflush.h>
 
 #include "core/auth.h"
 #include "host/lsm.h"
@@ -447,11 +446,11 @@ static void yz_tango_inject(struct callback_head *cb)
 			   work->linker.bias + dlsym_off, fd, core_fd, &packet);
 	if (!yz_auth_injection_ticket_alive(&work->ticket))
 		goto finish;
+	/* Writing to the executable VMA also syncs its instruction cache. */
 	n = access_process_vm(current, stub, bytes, sizeof(bytes),
 			      FOLL_FORCE | FOLL_WRITE);
 	if (n != sizeof(bytes))
 		goto restore;
-	flush_icache_range(stub, stub + sizeof(bytes));
 	if (!yz_auth_injection_ticket_alive(&work->ticket))
 		goto restore;
 	redirect = stub | 1;
