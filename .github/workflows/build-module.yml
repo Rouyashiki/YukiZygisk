@@ -67,6 +67,9 @@ jobs:
           cache: pip
           cache-dependency-path: tools/requirements-viola.txt
 
+      - name: Test kernel policy callback binding and publication
+        run: python3 kernel/tests/test_policy_publish.py -v
+
       - name: Install certificate verification dependencies
         run: python3 -m pip install -r tools/requirements-viola.txt
 

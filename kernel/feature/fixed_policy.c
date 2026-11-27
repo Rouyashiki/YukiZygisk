@@ -9,6 +9,7 @@
 #include "fixed_policy.h"
 
 #include "host/host.h"
+#include "host/policy.h"
 #include "host/runtime.h"
 #define yz_policy_open(path)                                                   \
 	yz_file_open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, 0)
@@ -101,8 +102,10 @@ int yz_fixed_policy_latch(void)
 		yz_fixed_status.error = ret;
 		if (!ret) {
 			yz_fixed_status.requested = yz_fixed_config.enabled;
-			if (!yz_fixed_status.requested)
+			if (!yz_fixed_status.requested) {
+				yz_host_policy_select_temporary();
 				smp_store_release(&yz_fixed_status.initialized, 1);
+			}
 			yz_fixed_latched = true;
 		}
 	}

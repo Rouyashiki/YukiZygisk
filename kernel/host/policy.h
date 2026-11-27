@@ -18,6 +18,7 @@ struct file;
 
 int yz_host_policy_init(void);
 void yz_host_policy_exit(void);
+void yz_host_policy_select_temporary(void);
 
 bool yz_host_policy_cred_has_type(const struct cred *cred,
 				  const char *type_name);

@@ -42,6 +42,7 @@
 #include "host/inode.h"
 #include "host/policy_base.h"
 #include "host/policy.h"
+#include "host/policy_ksu.h"
 #include "host/policy_temp.h"
 #include "host/runtime.h"
 
@@ -867,7 +868,14 @@ yz_policy_cancel_edit_locked(struct yz_policy_edit *edit)
 static void
 yz_policy_commit_edit_locked(struct yz_policy_edit *edit)
 {
+	lockdep_assert_held(&yz_selinux_state->policy_mutex);
 	edit->policy->latest_granting = edit->old_policy->latest_granting + 1;
+	/* KernelSU invalidates stale metadata on false. The edit still commits. */
+	if (!yz_ksu_policy_advance(&edit->policy->policydb, &edit->old_policy->policydb,
+				   edit->old_policy->latest_granting,
+				   edit->policy->latest_granting))
+		pr_warn_ratelimited("yukizygisk: KernelSU using backup type lookups at SELinux generation %u\n",
+				    edit->policy->latest_granting);
 	rcu_assign_pointer(yz_selinux_state->policy, edit->policy);
 	synchronize_rcu();
 	yz_policy_destroy(edit->old_policy, edit->scope);
@@ -1261,11 +1269,21 @@ int yz_host_policy_init(void)
 	return 0;
 }
 
+void yz_host_policy_select_temporary(void)
+{
+	mutex_lock(&yz_policy_lock);
+	if (yz_policy_base_ready())
+		yz_ksu_policy_bind();
+	mutex_unlock(&yz_policy_lock);
+}
+
 void yz_host_policy_exit(void)
 {
 	yz_policy_cache_exit();
 	yz_policy_temp_reset();
 
+	mutex_lock(&yz_policy_lock);
+	yz_ksu_policy_unbind();
 	yz_fp_compute_fn = NULL;
 	yz_fp_context_fn = NULL;
 	yz_memfd_fcntl = NULL;
@@ -1288,6 +1306,7 @@ void yz_host_policy_exit(void)
 	yz_avc_ss_reset = NULL;
 	yz_selnl_notify_policyload = NULL;
 	yz_selinux_status_update_policyload = NULL;
+	mutex_unlock(&yz_policy_lock);
 }
 
 static bool yz_policy_sid_has_type(struct selinux_policy *policy, u32 sid,
