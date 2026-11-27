@@ -138,8 +138,15 @@ if ! $LATE_LOAD && ! "$MODDIR/bin/yzctl" policy-boot; then
 	exit 1
 fi
 
-log "starting authenticated YukiZygisk core"
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_CONFIG_FILE LD_DEBUG LD_DEBUG_OUTPUT
+# Prepare the boot marker before the crash monitor starts. The diagnostics
+# helper uses its own FD 9, so it must not inherit the late-load startup lock.
+if ! YZ_STATE_DIR="$BASE_DIR" sh "$MODDIR/diagnostics.sh" prepare-startup \
+	9>&- >>"$LOG_FILE" 2>&1; then
+	log "could not prepare crash diagnostics"
+fi
+
+log "starting authenticated YukiZygisk core"
 set -- launch --module-dir "$MODDIR"
 if $LATE_LOAD; then
 	# Keep the stop condition through hashing, LKM relocation and daemon ready.

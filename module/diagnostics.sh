@@ -268,9 +268,11 @@ yz_diag_initialize_generation() {
 	yz_diag_ensure_dir "$generation" 0700 || return 1
 	yz_diag_ensure_dir "$generation/logs" 0700 || return 1
 	printf '%s\n' "$boot_id" | yz_diag_atomic_write "$generation/boot_id" || return 1
-	yz_diag_inventory "$YZ_TOMBSTONES_DIR" "$generation/.tombstones.baseline" false || true
-	yz_diag_inventory "$YZ_PSTORE_DIR" "$generation/.pstore.baseline" true || true
-	yz_diag_copy_config "$generation" || true
+	if [ "${3:-}" != prepare-startup ]; then
+		yz_diag_inventory "$YZ_TOMBSTONES_DIR" "$generation/.tombstones.baseline" false || true
+		yz_diag_inventory "$YZ_PSTORE_DIR" "$generation/.pstore.baseline" true || true
+		yz_diag_copy_config "$generation" || true
+	fi
 	yz_diag_write_boot_state "$generation" early || return 1
 }
 
@@ -334,7 +336,12 @@ yz_diag_unlock() {
 yz_diagnostics_prepare() {
 	boot_id="$(tr -d '\r\n' <"$YZ_BOOT_ID_FILE" 2>/dev/null)"
 	[ -n "$boot_id" ] || return 1
-	yz_diag_ensure_dir "$YZ_STATE_DIR" 0700 || return 1
+	if [ "${1:-}" = prepare-startup ]; then
+		# post-fs-data has set the mode of the shared runtime directory.
+		yz_diag_safe_dir "$YZ_STATE_DIR" || return 1
+	else
+		yz_diag_ensure_dir "$YZ_STATE_DIR" 0700 || return 1
+	fi
 	yz_diag_ensure_dir "$YZ_DIAGNOSTICS_DIR" 0700 || return 1
 	yz_diag_lock || return 1
 
@@ -348,8 +355,10 @@ yz_diagnostics_prepare() {
 			yz_diag_unlock
 			return 1
 		}
-		yz_diag_copy_config "$YZ_CURRENT_DIAGNOSTICS_DIR" || true
-		printf '%s\n' 'module-started' | yz_diag_atomic_write "$YZ_CURRENT_DIAGNOSTICS_DIR/evidence" || true
+		if [ "${1:-}" != prepare-startup ]; then
+			yz_diag_copy_config "$YZ_CURRENT_DIAGNOSTICS_DIR" || true
+			printf '%s\n' 'module-started' | yz_diag_atomic_write "$YZ_CURRENT_DIAGNOSTICS_DIR/evidence" || true
+		fi
 		yz_diag_unlock
 		return 0
 	fi
@@ -359,7 +368,10 @@ yz_diagnostics_prepare() {
 			yz_diag_unlock
 			return 1
 		}
-		yz_diag_capture_previous "$YZ_CURRENT_DIAGNOSTICS_DIR"
+		# Report capture can scan and copy large files outside startup.
+		if [ "${1:-}" != prepare-startup ]; then
+			yz_diag_capture_previous "$YZ_CURRENT_DIAGNOSTICS_DIR"
+		fi
 		yz_diag_remove_generation "$YZ_OLD_DIAGNOSTICS_DIR" || {
 			yz_diag_unlock
 			return 1
@@ -368,7 +380,7 @@ yz_diagnostics_prepare() {
 			yz_diag_unlock
 			return 1
 		}
-	else
+	elif [ "${1:-}" != prepare-startup ]; then
 		yz_diag_import_legacy || {
 			yz_diag_unlock
 			return 1
@@ -384,7 +396,7 @@ yz_diagnostics_prepare() {
 		yz_diag_unlock
 		return 1
 	}
-	if ! yz_diag_initialize_generation "$staging" "$boot_id" ||
+	if ! yz_diag_initialize_generation "$staging" "$boot_id" "${1:-}" ||
 		! mv "$staging" "$YZ_CURRENT_DIAGNOSTICS_DIR"; then
 		yz_diag_remove_generation "$staging" || true
 		yz_diag_unlock
@@ -562,8 +574,8 @@ yz_diagnostics_export() {
 
 yz_diagnostics_main() {
 	case "${1:-}" in
-	prepare)
-		yz_diagnostics_prepare
+	prepare | prepare-startup)
+		yz_diagnostics_prepare "$1"
 		;;
 	phase)
 		YZ_DIAGNOSTICS_PHASE="${2:-unknown}"
@@ -573,7 +585,7 @@ yz_diagnostics_main() {
 		yz_diagnostics_export
 		;;
 	*)
-		printf '%s\n' 'Usage: diagnostics.sh {prepare|phase NAME|export}' >&2
+		printf '%s\n' 'Usage: diagnostics.sh {prepare|prepare-startup|phase NAME|export}' >&2
 		return 2
 		;;
 	esac

@@ -44,6 +44,9 @@ class LateLoadTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.module = self.root / "module"
         self.base = self.root / "data/adb/yukizygisk"
+        self.diagnostics = self.base / "diagnostics"
+        self.boot_id = self.root / "kernel-boot-id"
+        self.boot_id.write_text("00112233-4455-4677-8899-aabbccddeeff\n")
         self.state = self.root / "dev/yukizygisk-late-load"
         self.commands = self.root / "commands"
         self.events = self.root / "events"
@@ -56,10 +59,11 @@ class LateLoadTests(unittest.TestCase):
         cleanup.touch()
         (self.root / "proc-modules").touch()
         for name in ("post-fs-data.sh", "late-load.sh", "late-load-common.sh",
-                     "boot-completed.sh", "action.sh"):
+                     "boot-completed.sh", "action.sh", "diagnostics.sh"):
             text = (REPO / "module" / name).read_text()
             # Redirect fixed Android locations only; leave control flow intact.
             text = text.replace("/data/adb", str(self.root / "data/adb"))
+            text = text.replace(str(cleanup), shlex.quote(str(cleanup)))
             text = text.replace("/dev/yukizygisk-late-load", str(self.state))
             text = text.replace("/proc/modules", str(self.root / "proc-modules"))
             text = text.replace("/system/bin/env", shutil.which("env"))
@@ -84,6 +88,14 @@ pause_launch() {
     while [ -e "$fixture/pause-$1" ]; do /bin/sleep 0.01; done
 }
 if [ "$1" = launch ]; then
+    if [ ! -f "$fixture/allow-diagnostics-failure" ]; then
+        boot="$fixture/data/adb/yukizygisk/diagnostics/current/boot_id"
+        [ -s "$boot" ] &&
+            [ "$(/bin/cat "$boot")" = "$(/bin/cat "$fixture/kernel-boot-id")" ] || {
+            echo "Viola started without the current diagnostics boot ID" >&2
+            exit 85
+        }
+    fi
     pause_launch before
     # The native guard itself is exercised by tests/viola. This boundary
     # double checks that the script requests it and preserves pending on refusal.
@@ -137,13 +149,16 @@ exit 0
         self.write_command(self.commands / "getprop", r'''
 cat "$fixture/properties/$1" 2>/dev/null || true
 ''')
-        # Model Android ownership without requiring root on the host. Limit
-        # the stub to the state directory's owner query; other calls must fail.
+        # Model root ownership for the fixture directories and diagnostic files.
         (self.root / "state-owner").write_text("0\n")
         self.write_command(self.commands / "stat", r'''
-[ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = %u ] &&
-    [ "$3" = "$fixture/dev/yukizygisk-late-load" ] || exit 84
-cat "$fixture/state-owner"
+[ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = %u ] || exit 84
+case "$3" in
+    "$fixture/dev/yukizygisk-late-load") cat "$fixture/state-owner" ;;
+    "$fixture/data/adb/yukizygisk"|"$fixture/data/adb/yukizygisk/diagnostics"|\
+    "$fixture/data/adb/yukizygisk/diagnostics/"*) printf '0\n' ;;
+    *) exit 84 ;;
+esac
 ''')
         for name in ("setprop", "reboot", "stop", "start", "killall", "rmmod"):
             self.write_command(self.commands / name, r'''
@@ -153,6 +168,9 @@ exit 99
         self.environment = {
             "PATH": str(self.commands) + os.pathsep + os.defpath,
             "KSU_LATE_LOAD": "1",
+            "YZ_BOOT_ID_FILE": str(self.boot_id),
+            "YZ_TOMBSTONES_DIR": str(self.root / "tombstones"),
+            "YZ_PSTORE_DIR": str(self.root / "pstore"),
             "LD_LIBRARY_PATH": str(self.root / "untrusted"),
             "UNTRUSTED_FIXTURE": "must-not-reach-viola",
         }
@@ -180,7 +198,11 @@ exit 99
             [str(self.commands / "sh"), str(self.module / name), *args],
             env=self.environment, capture_output=True, text=True, timeout=15,
         )
-        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        if result.returncode != expected:
+            log = self.base / "zygiskd.log"
+            startup = log.read_text() if log.exists() else ""
+            self.fail(f"{name} exited with {result.returncode}, expected {expected}\n"
+                      f"{result.stdout}{result.stderr}{startup}")
         return result
 
     def trace(self) -> list[str]:
@@ -224,6 +246,10 @@ exit 99
         self.assertEqual(self.trace(), ["viola launch"])
         self.assertFalse(self.state.exists())
         self.assertTrue((self.base / "yzconfig.json").is_file())
+        current = self.diagnostics / "current"
+        self.assertEqual(self.base.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(current.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((current / "boot_id").stat().st_mode & 0o777, 0o600)
 
     def test_initial_late_load_and_zygote_restart_never_start_core(self) -> None:
         log = self.base / "log/zygiskd64.log"
@@ -264,6 +290,7 @@ exit 99
         self.run_stage("late-load.sh")
         self.run_stage("post-fs-data.sh")  # Android is still running: defer.
         self.assertEqual(self.trace(), [])
+        self.assertFalse(self.diagnostics.exists())
         self.stop_runtime()
         self.run_stage("post-fs-data.sh")
         self.assertEqual(self.trace(), ["viola launch"])
@@ -282,6 +309,55 @@ exit 99
         self.assertFalse((self.state / "pending").exists())
         self.assert_no_restart()
 
+    def test_soft_reboot_preserves_current_crash_records(self) -> None:
+        self.run_stage("late-load.sh")
+        self.stop_runtime()
+        self.run_stage("post-fs-data.sh")
+        current = self.diagnostics / "current"
+        inode = current.stat().st_ino
+        evidence = current / "crash64.json"
+        evidence.write_text("same-boot evidence")
+
+        self.start_runtime()
+        self.stop_runtime()
+        self.run_stage("post-fs-data.sh")
+
+        self.assertEqual(current.stat().st_ino, inode)
+        self.assertEqual(evidence.read_text(), "same-boot evidence")
+        self.assertFalse((self.diagnostics / "old").exists())
+
+    def test_cold_boot_moves_stale_crash_records_to_previous_generation(self) -> None:
+        self.environment.pop("KSU_LATE_LOAD")
+        current = self.diagnostics / "current"
+        current.mkdir(parents=True)
+        (current / "boot_id").write_text("previous-boot\n")
+        (current / "crash64.json").write_text("previous-boot evidence")
+
+        self.run_stage("post-fs-data.sh")
+
+        old = self.diagnostics / "old"
+        self.assertEqual((old / "boot_id").read_text(), "previous-boot\n")
+        self.assertEqual((old / "crash64.json").read_text(), "previous-boot evidence")
+        self.assertFalse((current / "crash64.json").exists())
+
+    def test_unsafe_diagnostics_directory_does_not_block_late_load(self) -> None:
+        self.diagnostics.mkdir(parents=True)
+        target = self.root / "unexpected-target"
+        target.mkdir()
+        current = self.diagnostics / "current"
+        current.symlink_to(target, target_is_directory=True)
+        (self.root / "allow-diagnostics-failure").touch()
+        self.run_stage("late-load.sh")
+        self.stop_runtime()
+
+        self.run_stage("post-fs-data.sh")
+
+        self.assertTrue((self.state / "active").is_file())
+        self.assertTrue(current.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertIn("could not prepare crash diagnostics",
+                      (self.base / "zygiskd.log").read_text())
+
     def test_runtime_resume_during_launch_keeps_pending_and_can_retry(self) -> None:
         self.run_stage("late-load.sh")
         self.stop_runtime()
@@ -289,6 +365,10 @@ exit 99
         pause.touch()
         process = self.start_stage()
         self.wait_for_launch(process)
+        lock = subprocess.run(
+            ["flock", "-n", str(self.state / "startup.lock"), "true"], timeout=5,
+        )
+        self.assertEqual(lock.returncode, 1)
         # KSU's shared deadline leaves this script alive, then starts Android.
         self.start_runtime()
         self.run_stage("boot-completed.sh")
